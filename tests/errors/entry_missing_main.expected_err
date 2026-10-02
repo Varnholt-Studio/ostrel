@@ -1,0 +1,1 @@
+tests/errors/entry_missing_main.ostl:1:1: error[E0400]: missing `fn main()`; `ostrel run` starts a script program there

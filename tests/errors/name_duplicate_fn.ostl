@@ -1,0 +1,8 @@
+fn f() -> Int
+  return 1
+
+fn f() -> Int
+  return 2
+
+fn main()
+  print("ok")

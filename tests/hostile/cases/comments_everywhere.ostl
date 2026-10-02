@@ -1,0 +1,3 @@
+fn main()
+  print(1) // trailing comment
+// last line comment without newline

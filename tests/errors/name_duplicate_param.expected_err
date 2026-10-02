@@ -1,0 +1,1 @@
+tests/errors/name_duplicate_param.ostl:1:16: error[E0202]: parameter `a` is already declared

@@ -1,0 +1,14 @@
+{
+  "strategy": "map",
+  "description": "A put with a higher Hlc than a concurrent remove wins and the key is visible again.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "put": ["ana", "admin"] } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568010000000000000000000b", "op": { "remove": "ana" } },
+    { "id": "000000000000000c00000001", "hlc": "018bcfe568010001000000000000000c", "op": { "put": ["ana", "viewer"] } }
+  ],
+  "deliveries": [[0, 1, 2], [2, 1, 0], [1, 2, 0]],
+  "expect": {
+    "value": [["ana", "viewer"]],
+    "state": [["ana", { "hlc": "018bcfe568010001000000000000000c", "value": "viewer" }]]
+  }
+}

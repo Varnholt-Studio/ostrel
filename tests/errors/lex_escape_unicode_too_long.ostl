@@ -1,0 +1,2 @@
+fn main()
+  print("a \u{0000041} b")

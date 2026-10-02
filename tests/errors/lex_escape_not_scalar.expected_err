@@ -1,0 +1,1 @@
+tests/errors/lex_escape_not_scalar.ostl:2:14: error[E0005]: `\u{110000}` is not a Unicode scalar value

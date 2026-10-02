@@ -1,0 +1,13 @@
+{
+  "strategy": "lww",
+  "description": "Two replicas write at the same wall time and counter; the higher replica id wins the tie.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "set": "draft" } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568000000000000000000000b", "op": { "set": "done" } }
+  ],
+  "deliveries": [[0, 1], [1, 0]],
+  "expect": {
+    "value": "done",
+    "state": { "hlc": "018bcfe568000000000000000000000b", "value": "done" }
+  }
+}

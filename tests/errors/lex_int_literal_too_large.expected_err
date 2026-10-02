@@ -1,0 +1,1 @@
+tests/errors/lex_int_literal_too_large.ostl:2:11: error[E0010]: integer literal is outside the `Int` range of -9007199254740991 to 9007199254740991
