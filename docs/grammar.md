@@ -12,12 +12,14 @@ Fenced code blocks in `docs/` are part of the test suite:
 
 | Tag | Meaning |
 |---|---|
-| `ostl` | The block is a complete program and must pass `ostrel check`. |
-| `ostl-error` | The block must fail `ostrel check` with at least one diagnostic. |
+| `ostl` | The block is a complete script program with `fn main()` and must exit with code 0. |
+| `ostl-error` | The block must exit with code 1 and at least one diagnostic. |
 | `ebnf` | Grammar notation, not checked. |
+| `text` | Plain listing (keywords, tokens), not checked. |
 
-Each block is checked on its own, as if it were a single `.ostl` file. Every `ostl` block in this
-document is a script program with a `fn main()`, so it can also be run with `ostrel run`.
+Each block is checked on its own, as if it were a single `.ostl` file (SPEC 12.2). An `ostl` block
+without `fn main()` is reported with `E0400`. For an `ostl-error` block, exit code 0, 2, 101 or a
+signal is a failure.
 
 ## 1. Notation
 
@@ -36,13 +38,16 @@ The grammar uses ISO style EBNF:
 
 `INDENT`, `DEDENT` and `NL` are produced by the lexer (section 2.2). `Name` is an identifier
 written in UpperCamel case, `name` one in lowerCamel case; the parser treats both as identifier
-tokens, the case convention is enforced by the formatter and a lint, not by the parser.
+tokens, the case convention is enforced by the formatter and a lint, not by the parser (SYNTAX 3).
+In the v0.1 subset the distinction never changes how a line is parsed. For the later grammar see
+the open point at the end of the appendix.
 
 ## 2. Lexical structure
 
 ### 2.1 Source text
 
-Source files are UTF 8 and use the extension `.ostl`.
+Source files are UTF 8 and use the extension `.ostl`. Lines are separated by LF (SPEC 12.1).
+Diagnostic columns count Unicode scalar values, and a tab counts as one column.
 
 ### 2.2 Lines and indentation
 
@@ -51,10 +56,18 @@ indentation of exactly two spaces per level.
 
 * The lexer emits `NL` at the end of every logical line, `INDENT` when a line is indented one
   level deeper than the previous one, and one `DEDENT` per level when indentation decreases.
-* Blank lines and lines that contain only a comment do not produce `NL`, `INDENT` or `DEDENT`.
+* Blank lines and lines that contain only a comment do not produce `NL`, `INDENT` or `DEDENT`,
+  and their leading whitespace is not checked (SPEC 12.2).
 * A tab character in indentation is a lexical error.
-* A line continues onto the next physical line only while a `(` is open. Inside parentheses,
-  line breaks and indentation are ignored.
+* A line continues onto the next physical line while a `(`, `[` or `{` is open (SYNTAX 3). The
+  v0.1 subset has no list, set or map literals, so in v0.1 only an open `(` continues a line;
+  `[` and `{` continue lines from v0.2 on (SPEC 12.2). Inside an open bracket, line breaks and
+  indentation are ignored.
+
+Not decided yet (QUESTION #136 in `#arch`): indentation by an odd number of spaces, an indent of
+more than one level at once, a dedent to a column that was never an indentation level, a CR
+before the LF, a byte order mark at the start of the file, and the tokens emitted at the end of
+the file. No example in this document depends on these cases.
 
 ### 2.3 Comments
 
@@ -64,8 +77,10 @@ exists only inside `style` bodies, which are not part of v0.1).
 
 ### 2.4 Identifiers and keywords
 
-An identifier starts with an ASCII letter, followed by ASCII letters, digits and underscores.
-Values, parameters and functions are written in `lowerCamel`, types in `UpperCamel`.
+An identifier starts with an ASCII letter, followed by ASCII letters, digits and underscores
+(SPEC 12.2, binding for v0.1 to v0.3). Any other character where a token is expected is reported
+with `E0008`. Values, parameters and functions are written in `lowerCamel`, types in
+`UpperCamel`.
 
 The following 45 words are keywords. All of them are reserved from v0.1 on, even though most of
 them are only meaningful in later milestones:
@@ -95,18 +110,30 @@ A negative number is written with the unary `-` operator.
 
 ```ebnf
 String        = '"' { char | escape | "{" interpolation "}" } '"' ;
-escape        = "\{" | "\}" | '\"' | "\\" | "\n" | "\t" | "\u{" hexDigit { hexDigit } "}" ;
+char          = (* any Unicode scalar value except '"', "\", "{", "}" and a line end *) ;
+escape        = "\{" | "\}" | '\"' | "\\" | "\n" | "\t"
+              | "\u{" hex [ hex ] [ hex ] [ hex ] [ hex ] [ hex ] "}" ;
+hex           = digit | "a" | "b" | "c" | "d" | "e" | "f" | "A" | "B" | "C" | "D" | "E" | "F" ;
 interpolation = (* the tokens of one expr, containing no string literal *) ;
 ```
 
-* A string literal is enclosed in double quotes.
+* A string literal is enclosed in double quotes and does not span lines: a line end before the
+  closing quote is an unterminated string (`E0003`), reported at the opening quote (SPEC 12.1).
+* The escapes are exactly the ones listed above. `\u{h}` takes 1 to 6 hex digits in either
+  case; a value that is not a Unicode scalar value (a surrogate or above 10FFFF) is `E0005`.
+  Every other escape, including `\r`, `\0`, an empty `\u{}`, more than 6 digits or a missing
+  `}`, is `E0004` (SPEC 12.4).
 * `{expr}` inserts the text form of the expression. `Int` values are written in decimal, `Bool`
   values as `true` or `false`.
 * A string literal inside an interpolation is a lexical error. Bind the inner text with `let`
   first and interpolate the name.
-* Inside an interpolation the lexer counts braces up to a nesting depth of 32.
+* Inside an interpolation the lexer counts braces up to a nesting depth of 32. The opening
+  brace is depth 1; the brace that would reach depth 33 is `E0007`. Escaped braces do not count
+  (SPEC 12.1).
 * To write a literal brace, use `\{` or `\}`. The sequence `{{` has no special meaning.
 * Text values are joined by interpolation, not by `+`.
+* Not decided yet (QUESTION #136): an unescaped `}` outside an interpolation. The grammar above
+  does not produce it; write `\}`.
 
 ### 2.7 Operators and punctuation
 
@@ -189,8 +216,10 @@ and `%` takes the sign of the dividend. All `Int` arithmetic is checked: a resul
   missing `main` or one with parameters or a result type is a compile error.
 * `print(x)` accepts an `Int`, `Text` or `Bool` and writes its text form followed by a newline
   to standard output.
-* Runtime errors are `IntOverflow`, `DivisionByZero`, `CallDepth` (more than 10 000 nested calls)
-  and `StepLimit` (more than 100 000 000 steps, adjustable with `--max-steps`). Each one prints
+* Runtime errors are `IntOverflow`, `DivisionByZero`, `CallDepth` (the call that would create
+  frame 10 001; `main` is frame 1), `StepLimit` (more than 100 000 000 steps, adjustable with
+  `--max-steps`), `TextLimit` (a `Text` longer than 16 777 216 UTF 8 bytes) and `HeapLimit`
+  (a VM heap above 256 MiB) (SPEC 12.4). Each one prints
   `file:line:column: runtime error[Kind]: message` to standard error and ends the program with
   exit code 1. Output already printed is kept.
 * Exit codes of the command line tool: 0 for success, 1 for any diagnostic or runtime error,
@@ -219,7 +248,8 @@ fn main()
   let b = -2
   print(a / b) // -3, division truncates toward zero
   print(a % b) // 1, the remainder has the sign of the dividend
-  print(-a % 3) // -1, unary minus binds tighter than %
+  print(-a + 3) // -4, unary minus binds tighter than +
+  print(2 * -3) // -6, a unary minus may follow a binary operator
   print(1 + 2 * 3) // 7
   print((1 + 2) * 3) // 9
 ```
@@ -348,7 +378,8 @@ fn main()
   print(clamp(5))
 ```
 
-A construct from a later milestone (here a `for` loop over a list) is rejected with `E0100`:
+A construct from a later milestone (here a `for` loop over a list) is rejected with `E0100`.
+This block has to be replaced when `for` and list literals become available (AC-13):
 
 ```ostl-error
 fn main()
@@ -423,3 +454,7 @@ In the full grammar, `{` starts a set literal everywhere except after `make Name
 a record value. Lists and maps use square brackets, and `[:]` is the empty map. Type arguments are
 bracketed, as in `Set[User]`. Inside a `(`, `[` or `{` a line continues onto the next physical
 line.
+
+Open point (QUESTION #136): the rule `source` chooses `query` when the first token is a `Name`,
+but section 1 and SYNTAX 3 say that the parser does not tell `Name` from `name`. Until this is
+decided, the appendix does not define how a parser makes that choice.
