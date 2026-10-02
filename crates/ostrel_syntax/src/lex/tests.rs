@@ -711,15 +711,17 @@ fn hostile_inputs_end_with_eof_and_valid_spans() {
     }
 }
 
+/// Lexing time must grow linearly with the input (AC-04). The check compares
+/// two input sizes instead of using a time limit, so it holds under any
+/// machine load (D74).
 #[test]
 fn large_input_is_linear() {
     let line = "  let x = add(1, 2) + \"v {y} w\" // c\n";
-    let src = format!("fn main()\n{}", line.repeat(200_000));
-    let start = std::time::Instant::now();
-    let (tokens, diags) = lex(&src);
+    let source = |lines: usize| format!("fn main()\n{}", line.repeat(lines));
+    let (tokens, diags) = lex(&source(20_000));
     assert!(diags.is_empty());
-    assert!(tokens.len() > 3_000_000);
-    assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
+    assert!(tokens.len() > 300_000);
+    crate::test_support::assert_linear(4_000, source, |src| lex(src));
 }
 
 macro_rules! golden {

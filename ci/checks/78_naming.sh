@@ -6,9 +6,10 @@
 #      (DOMAIN_CONFIRMED=1), this includes ostrel-lang.org; the project address is the GitHub
 #      repository. Afterwards only ostrel-lang.org and its subdomains are allowed.
 #   3. No tracked file uses "Ostrel" as the name of a company or organisation.
-# A self test (ac_53_naming_selftest) runs first: every forbidden phrase and address in the
-# fixture below must be caught, and the clean fixture must pass. This file is the fixture and
-# is therefore excluded from the repository scan.
+# A self test (ac_53_naming_selftest) runs first, in both domain modes: every forbidden phrase
+# (also with other separators, case or a line break) and address in the fixture below must be
+# caught, and the clean fixture must pass. This file is the fixture and is therefore excluded
+# from the repository scan.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -21,7 +22,9 @@ PHRASES=(
   "Ostrel organisation" "Ostrel organization"
 )
 
-# Hosts that mention the project, from URLs and from bare domain names.
+# Hosts that mention the project, from URLs and from bare domain names. Bare names are only
+# matched for the TLDs below; .rs, .sh and similar are left out on purpose because they are
+# file extensions. A host under any other TLD is caught only when written with a scheme.
 hosts() {
   grep -oiE 'https?://[^/[:space:]"'"'"'<>)`]+' "$1" | sed -E 's#^[a-zA-Z]+://##; s#^.*@##; s#:[0-9]+$##'
   grep -oiE '[a-z0-9.-]*ostrel[a-z0-9.-]*\.(org|com|net|dev|io|app|ai|co|de|eu|info|page|site|xyz|tech|cloud)\b' "$1"
@@ -29,9 +32,11 @@ hosts() {
 
 # scan FILE: prints one line per violation, returns 1 if any.
 scan() {
-  local f=$1 bad=0 p h
+  local f=$1 bad=0 p h words
+  # Phrases match whole words, ignoring case and any run of spaces, punctuation or line breaks.
+  words=" $(tr -cs '[:alnum:]' ' ' < "$f" | tr '[:upper:]' '[:lower:]') "
   for p in "${PHRASES[@]}"; do
-    if grep -qiwF -- "$p" "$f"; then echo "$f: forbidden phrase \"$p\""; bad=1; fi
+    case $words in *" ${p,,} "*) echo "$f: forbidden phrase \"$p\""; bad=1 ;; esac
   done
   while IFS= read -r h; do
     h=${h,,}
@@ -55,17 +60,25 @@ readme_ok() {
 }
 
 ac_53_naming_selftest() {
-  local tmp ok=0 p a
+  local tmp ok=0 p a v DOMAIN_CONFIRMED
   tmp=$(mktemp -d) || return 1
   trap 'rm -rf "$tmp"' RETURN
   for p in "${PHRASES[@]}"; do
-    printf 'Made by the %s.\n' "$p" > "$tmp/f"
-    scan "$tmp/f" > /dev/null && { echo "selftest: phrase not caught: $p"; ok=1; }
+    for v in "$p" "${p/ /, }." "${p/ /  }" "${p/ /-}" "${p/ /$'\n'}" "${p^^}"; do
+      printf 'Made by the %s.\n' "$v" > "$tmp/f"
+      scan "$tmp/f" > /dev/null && { echo "selftest: phrase not caught: $v"; ok=1; }
+    done
   done
-  for a in "https://ostrel-lang.org/docs" "docs.ostrel-lang.org" "www.ostrel.dev" \
-    "https://Ostrel.io" "see ostrel-lang.com for more" "http://user@ostrel.app:8080/x"; do
-    printf 'Visit %s now.\n' "$a" > "$tmp/f"
-    scan "$tmp/f" > /dev/null && { echo "selftest: address not caught: $a"; ok=1; }
+  for DOMAIN_CONFIRMED in 0 1; do
+    for a in "https://ostrel-lang.org/docs" "docs.ostrel-lang.org" "www.ostrel.dev" \
+      "https://Ostrel.io" "see ostrel-lang.com for more" "http://user@ostrel.app:8080/x"; do
+      printf 'Visit %s now.\n' "$a" > "$tmp/f"
+      case $DOMAIN_CONFIRMED:$a in
+        1:*ostrel-lang.org*)
+          scan "$tmp/f" > /dev/null || { echo "selftest: confirmed domain rejected: $a"; ok=1; } ;;
+        *) scan "$tmp/f" > /dev/null && { echo "selftest: address not caught: $a"; ok=1; } ;;
+      esac
+    done
   done
   cat > "$tmp/clean" <<'EOF'
 # Ostrel programming language

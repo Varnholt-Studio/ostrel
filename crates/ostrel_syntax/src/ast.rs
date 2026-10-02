@@ -1179,16 +1179,13 @@ mod tests {
         Ok(())
     }
 
-    /// Wide nodes must be linear in their number of children (AC-04). With
-    /// the old quadratic check 200 000 children took several seconds.
-    #[test]
-    fn wide_call_and_block_are_linear() -> R {
-        const WIDE: usize = 200_000;
-        let start = std::time::Instant::now();
+    /// Builds a `main` whose body has `wide` statements and ends in a call
+    /// with `wide` arguments, and returns the module.
+    fn wide_module(wide: usize) -> Result<Module, AstError> {
         let mut m = Module::new();
-        let args = (0..WIDE).map(|_| m.int(1)).collect::<Result<Vec<_>, _>>()?;
+        let args = (0..wide).map(|_| m.int(1)).collect::<Result<Vec<_>, _>>()?;
         let call = m.call("f", args)?;
-        let stmts = (0..WIDE)
+        let stmts = (0..wide)
             .map(|i| {
                 let e = m.int(i as i64)?;
                 m.expr_stmt(e)
@@ -1199,13 +1196,27 @@ mod tests {
         all.push(last);
         let body = m.block_of(all)?;
         m.fn_item("main", &[], None, body)?;
+        Ok(m)
+    }
+
+    #[test]
+    fn wide_call_and_block_count_their_nodes() -> R {
+        const WIDE: usize = 200_000;
+        let m = wide_module(WIDE)?;
         assert_eq!(
             m.node_count(),
             1 + 2 * WIDE as u32 + 2 + WIDE as u32 + 1 + 1 + 1
         );
-        // Generous bound for unoptimised builds on a loaded machine.
-        assert!(start.elapsed() < std::time::Duration::from_secs(5));
         Ok(())
+    }
+
+    /// Wide nodes must be linear in their number of children (AC-04). With
+    /// the old quadratic check 200 000 children took several seconds. The
+    /// check compares two sizes instead of using a time limit, so it holds
+    /// under any machine load (D74).
+    #[test]
+    fn wide_call_and_block_are_linear() {
+        crate::test_support::assert_linear(8_000, |n| n, |&n| wide_module(n).ok());
     }
 
     #[test]

@@ -102,7 +102,8 @@ body {
 /* Controls */
 
 button,
-input {
+input,
+select {
   font: inherit;
   border-radius: var(--ostrel-radius);
   border: 1px solid var(--ostrel-line);
@@ -120,7 +121,9 @@ button:hover {
   border-color: var(--ostrel-accent);
 }
 
-button:disabled {
+button:disabled,
+input:disabled,
+select:disabled {
   cursor: default;
   opacity: var(--ostrel-pending-opacity);
 }
@@ -130,8 +133,27 @@ input {
   min-width: 0;
 }
 
+/* pick: a native select with option children, so keyboard and screen readers work as usual */
+
+select {
+  background: var(--ostrel-bg);
+  min-width: 0;
+  max-width: 100%;
+  cursor: pointer;
+}
+
+select:hover {
+  border-color: var(--ostrel-accent);
+}
+
+option {
+  background: var(--ostrel-bg);
+  color: var(--ostrel-text);
+}
+
 button:focus-visible,
 input:focus-visible,
+select:focus-visible,
 a:focus-visible {
   outline: 2px solid var(--ostrel-accent);
   outline-offset: 1px;

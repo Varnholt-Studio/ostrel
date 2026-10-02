@@ -1,3 +1,5 @@
+import { compareText } from './text.mjs';
+
 // Observed remove set with add tags (D49). An add creates one tag (its OpId), a remove
 // names the tags it observed. At most one live tag per (element, replica). Delivery is in
 // server order per row, so a remove never arrives before the add it observed.
@@ -49,7 +51,9 @@ export class OrSet {
     return live ? [...live.values()] : [];
   }
 
+  // Iteration order of a Set is code point order of its elements (D50, D61), never the
+  // UTF-16 order of a bare sort().
   values() {
-    return [...this.tags.keys()].sort();
+    return [...this.tags.keys()].sort(compareText);
   }
 }
