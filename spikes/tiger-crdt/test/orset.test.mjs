@@ -32,3 +32,11 @@ test('at most one live tag per element and replica, replays are no-ops', () => {
   assert.equal(s.remove('x', [opId(A, 1)]), false);
   assert.ok(s.has('x'));
 });
+
+test('values are in code point order, not UTF-16 order (D50, D61)', () => {
+  const s = new OrSet();
+  s.add('\u{ff01}', opId(A, 1));
+  s.add('\u{1f600}', opId(A, 2));
+  s.add('b', opId(A, 3));
+  assert.deepEqual(s.values(), ['b', '\u{ff01}', '\u{1f600}']);
+});

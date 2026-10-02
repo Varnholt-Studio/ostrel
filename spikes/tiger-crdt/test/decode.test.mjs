@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { decodeOps, DecodeError } from '../src/decode.mjs';
 import { hex, seqId } from '../src/ids.mjs';
-import { Editor, message } from '../src/workload.mjs';
+import { Editor, message, relay } from '../src/workload.mjs';
 
 const ROW = hex(5, 32);
 const ed = new Editor(2);
@@ -45,4 +45,18 @@ test('rejects hostile messages', () => {
   rejects([{ ...good(), f: 'desc', k: 'set', v: 'x' }]);
   rejects([{ ...good(), f: 'labels', k: 'srem', e: 'bug', tags: Array(65).fill(hex(1, 24)) }]);
   rejects([{ ...good(), f: 'labels', k: 'srem', e: 'bug', tags: [] }]);
+  rejects([{ ...good(), f: 'rank', v: 'a0' }]);
+  // Lamport condition: counter must be above the origin's counter.
+  rejects([{ ...good(), f: 'desc', k: 'ins', after: seqId(9, hex(1, 16)), c: 9, s: 'a' }]);
+});
+
+test('rejects missing, malformed and non increasing ServerSeq', () => {
+  const [x, y] = relay([good(), good()]);
+  const raw = (ops) => JSON.stringify({ v: 0, t: 'Ops', ops });
+  assert.equal(decodeOps(raw([x, y])).length, 2);
+  rejects(null, raw([{ ...x, ss: undefined }]));
+  rejects(null, raw([{ ...x, ss: 7 }]));
+  rejects(null, raw([{ ...x, ss: x.ss.toUpperCase() + 'A' }]));
+  rejects(null, raw([y, x]));
+  rejects(null, raw([x, x]));
 });
