@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>KPI A budget spike</title>
+<style>
+  body { font: 13px sans-serif; display: flex; gap: 8px; margin: 8px; }
+  ol { list-style: none; margin: 0; padding: 0; width: 200px; }
+  li { height: 22px; overflow: hidden; white-space: nowrap; border-bottom: 1px solid #ddd; }
+  li span { margin-right: 6px; }
+  section { width: 360px; }
+  p { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<script type="module">
+  import { runSpike } from './src/harness.mjs';
+
+  const env = {
+    doc: document,
+    root: document.body,
+    now: () => performance.now(),
+    // t1 per MEASUREMENT 2.5: the requestAnimationFrame callback after the DOM matches.
+    nextFrame: () => new Promise((resolve) => requestAnimationFrame(() => resolve())),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  };
+  window.runSpike = (options) => runSpike(env, options);
+  window.spikeReady = true;
+</script>
+</body>
+</html>

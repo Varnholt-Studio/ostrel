@@ -1,0 +1,4 @@
+/findings/
+/target/
+# No dependencies (std only): the lock file carries no information, see README.md.
+/Cargo.lock

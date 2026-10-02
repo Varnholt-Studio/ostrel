@@ -1,14 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
-    "crates/ostrel_core",
-    "crates/ostrel_syntax",
-    "crates/ostrel_sema",
-    "crates/ostrel_ir",
-    "crates/ostrel_vm",
-    "crates/ostrel_cli",
-    "crates/ostrel_db",
-]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.0.0"

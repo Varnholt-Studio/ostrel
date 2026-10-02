@@ -1,0 +1,64 @@
+# Acceptance criteria tracked by the gate (MEASUREMENT 5.2 `70_ac_coverage.sh`, SPEC 3).
+# Maintained by QA from the registered criteria in SPEC section 5. Withdrawn criteria are
+# never listed (SPEC 3, gap G-5).
+#
+# Format: one criterion per line, `AC-NN vX.Y`, sorted by number. The milestone is the tag of
+# the registered criterion; a check covers every criterion of the current and earlier
+# milestones. Lines starting with `#` and blank lines are ignored.
+AC-01 v0.1
+AC-02 v0.1
+AC-03 v0.1
+AC-04 v0.1
+AC-05 v0.1
+AC-06 v0.1
+AC-07 v0.1
+AC-09 v0.2
+AC-10 v0.2
+AC-11 v0.2
+AC-12 v0.2
+AC-13 v0.3
+AC-14 v0.3
+AC-16 v0.3
+AC-17 v0.3
+AC-18 v0.3
+AC-20 v0.3
+AC-21 v0.3
+AC-22 v0.3
+AC-23 v0.3
+AC-24 v0.3
+AC-27 v0.3
+AC-28 v0.3
+AC-29 v0.2
+AC-30 v0.2
+AC-31 v0.2
+AC-32 v0.2
+AC-33 v0.2
+AC-34 v0.3
+AC-35 v0.3
+AC-36 v0.3
+AC-37 v0.3
+AC-38 v0.3
+AC-39 v0.3
+AC-40 v0.3
+AC-41 v0.3
+AC-42 v0.3
+AC-43 v0.3
+AC-44 v0.3
+AC-46 v0.3
+AC-47 v0.3
+AC-48 v0.3
+AC-51 v0.3
+AC-52 v0.1
+AC-53 v0.1
+AC-54 v0.2
+AC-55 v0.2
+AC-56 v0.2
+AC-57 v0.3
+AC-58 v0.3
+AC-59 v0.3
+AC-60 v0.3
+AC-61 v0.3
+AC-62 v0.3
+AC-63 v0.3
+AC-64 v0.3
+AC-65 v0.3

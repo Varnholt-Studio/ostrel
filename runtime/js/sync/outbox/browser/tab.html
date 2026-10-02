@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>outbox tab</title>
+<script type="module">
+  // One simulated tab: opens its own IndexedDB connection and appends ops as fast as it can.
+  import { openOutbox } from '../outbox.mjs';
+
+  const params = new URLSearchParams(location.search);
+  const count = Number(params.get('count'));
+  const outbox = await openOutbox({ indexedDB, IDBKeyRange, name: params.get('db') });
+  const appends = [];
+  for (let i = 0; i < count; i += 1) {
+    appends.push(
+      outbox.append({
+        user: 'user-alice',
+        replica: '00000000000000a1',
+        op: { kind: 'set', row: 'r1', field: 'title', value: `${params.get('tab')}-${i}` },
+      }),
+    );
+  }
+  try {
+    const entries = await Promise.all(appends);
+    parent.postMessage({ tab: params.get('tab'), opIds: entries.map((e) => e.opId) }, '*');
+  } catch (error) {
+    parent.postMessage({ tab: params.get('tab'), error: String(error) }, '*');
+  } finally {
+    outbox.close();
+  }
+</script>
