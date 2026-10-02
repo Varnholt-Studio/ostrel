@@ -1,0 +1,3 @@
+# Files that may contain key material on purpose, used only by 00_sanity.sh.
+# One entry per line: exact repository path, whitespace, reason (decision or task id).
+# Directories and patterns are not supported, so every exempt file is named here.
