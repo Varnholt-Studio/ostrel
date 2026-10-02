@@ -299,14 +299,23 @@ fn crlf_is_a_line_end() {
 
 #[test]
 fn dedent_by_several_levels_and_multi_level_indent() {
+    // D68: a dedent may close several blocks at once, but a line more than one
+    // level deeper is E0013 on its leading spaces and opens exactly one block.
     let src = "a\n  b\n    c\nd\n      e\n";
+    let (tokens, diags) = lex(src);
+    let kinds: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
     assert_eq!(
-        kinds(src),
+        kinds,
         vec![
             Ident, Nl, Indent, Ident, Nl, Indent, Ident, Nl, Dedent, Dedent, Ident, Nl, Indent,
-            Indent, Indent, Ident, Nl, Dedent, Dedent, Dedent, Eof,
+            Ident, Nl, Dedent, Eof,
         ]
     );
+    let found: Vec<(Code, u32, u32)> = diags
+        .iter()
+        .map(|d| (d.code, d.span.start, d.span.end))
+        .collect();
+    assert_eq!(found, vec![(codes::DEEP_INDENT, 14, 20)]);
 }
 
 #[test]
