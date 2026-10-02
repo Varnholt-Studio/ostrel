@@ -12,7 +12,7 @@
 //   { "remove": key }         removes `key`
 // Keys are strings, numbers or booleans.
 
-import { compareCodePoints, encode, InvalidValue } from '../canon/canon.mjs';
+import { compareKey, encode, InvalidValue } from '../canon/canon.mjs';
 
 const OP_ID = /^[0-9a-f]{24}$/;
 const HLC = /^[0-9a-f]{32}$/;
@@ -43,7 +43,7 @@ export class LwwMap {
     }
   }
 
-  /** The visible value: `[key, value]` pairs of live keys, ordered by canonical key encoding. */
+  /** The visible value: `[key, value]` pairs of live keys, in key order (`compareKey`, D61). */
   value() {
     return this.#sortedEntries()
       .filter((entry) => !entry.removed)
@@ -60,9 +60,7 @@ export class LwwMap {
   }
 
   #sortedEntries() {
-    return [...this.#entries.entries()]
-      .sort(([left], [right]) => compareCodePoints(left, right))
-      .map(([, entry]) => entry);
+    return [...this.#entries.values()].sort((left, right) => compareKey(left.key, right.key));
   }
 }
 

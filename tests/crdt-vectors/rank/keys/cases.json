@@ -1,0 +1,26 @@
+{
+  "cases": [
+    { "name": "empty list", "before": null, "after": null, "key": "V" },
+    { "name": "after the last key", "before": "V", "after": null, "key": "W" },
+    { "name": "before the first key", "before": null, "after": "V", "key": "U" },
+    { "name": "middle digit of a gap", "before": "a", "after": "c", "key": "b" },
+    { "name": "adjacent digits add a digit", "before": "V", "after": "W", "key": "VV" },
+    { "name": "after the top digit starts the next level", "before": "z", "after": null, "key": "z01" },
+    { "name": "before the smallest one digit key starts the next level", "before": null, "after": "1", "key": "0z" },
+    { "name": "shared prefix is kept", "before": "a", "after": "a1", "key": "a0V" },
+    { "name": "longer upper bound leaves room at its first digit", "before": "V", "after": "W1", "key": "W" },
+    { "name": "longer lower bound", "before": "Vz", "after": "W", "key": "VzV" },
+    { "name": "after a long key only its counter counts", "before": "Vabc", "after": null, "key": "W" },
+    { "name": "append carries into the counter", "before": "z0z", "after": null, "key": "z1" },
+    { "name": "append at the end of a level", "before": "zyz", "after": null, "key": "zz" },
+    { "name": "append after a full level", "before": "zz", "after": null, "key": "zz001" },
+    { "name": "prepend borrows from the counter", "before": null, "after": "0z", "key": "0yz" },
+    { "name": "prepend crossing into the next level", "before": null, "after": "01", "key": "00z" },
+    { "name": "long lower bound of top digits", "before": "Vzzz", "after": "W", "key": "VzzzV" },
+    { "name": "equal bounds", "before": "a", "after": "a", "error": "InvalidRank" },
+    { "name": "bounds in the wrong order", "before": "b", "after": "a", "error": "InvalidRank" },
+    { "name": "trailing zero", "before": "a0", "after": null, "error": "InvalidRank" },
+    { "name": "empty key", "before": null, "after": "", "error": "InvalidRank" },
+    { "name": "character outside the digits", "before": "a-", "after": null, "error": "InvalidRank" }
+  ]
+}

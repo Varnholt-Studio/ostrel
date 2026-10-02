@@ -1,0 +1,15 @@
+{
+  "strategy": "rank",
+  "description": "An older move that arrives late or again does not undo the newer move of the same row.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "set": ["018bcfe5600000000000000000000001", "V"] } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568010000000000000000000b", "op": { "set": ["018bcfe5600000000000000000000001", "l"] } }
+  ],
+  "deliveries": [[0, 1, 0], [1, 0, 1, 0], [1, 1, 0]],
+  "expect": {
+    "value": ["018bcfe5600000000000000000000001"],
+    "state": [
+      ["018bcfe5600000000000000000000001", { "hlc": "018bcfe568010000000000000000000b", "rank": "l" }]
+    ]
+  }
+}
