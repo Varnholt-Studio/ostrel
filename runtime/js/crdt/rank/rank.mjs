@@ -20,10 +20,21 @@ import { compareText } from '../canon/canon.mjs';
 /** The digits of a key, in ascending order. Their code points ascend as well. */
 export const DIGITS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
+/**
+ * The longest valid key. A peer can send any key, so the length is bounded like every other
+ * hostile input (SPEC 2, ARCHITECTURE 5.9). Keys made by `keyBetween` stay far below it unless
+ * one gap is split thousands of times; see `RankLimit`.
+ */
+export const MAX_RANK_DIGITS = 1024;
+
 const KEY_PATTERN = /^[0-9A-Za-z]*[1-9A-Za-z]$/;
 const ROW_ID = /^[0-9a-f]{32}$/;
 const OP_ID = /^[0-9a-f]{24}$/;
 const HLC = /^[0-9a-f]{32}$/;
+
+const ZERO = DIGITS[0];
+const TOP = DIGITS[DIGITS.length - 1];
+const BASE = DIGITS.length;
 
 export class InvalidRank extends Error {
   constructor(message) {
@@ -32,20 +43,33 @@ export class InvalidRank extends Error {
   }
 }
 
-/** True when `key` is a valid `Rank` key: base 62 digits, not empty, no trailing `0`. */
+/**
+ * Thrown by `keyBetween` when both bounds are valid but the new key would be longer than
+ * `MAX_RANK_DIGITS`. This happens only after about 6 000 inserts into the same gap; the list
+ * then needs new keys for its rows (rebalancing), which is not part of this module.
+ */
+export class RankLimit extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'RankLimit';
+  }
+}
+
+/** True when `key` is a valid `Rank` key: 1 to 1024 base 62 digits, no trailing `0`. */
 export function isValidRank(key) {
-  return typeof key === 'string' && KEY_PATTERN.test(key);
+  return typeof key === 'string' && key.length <= MAX_RANK_DIGITS && KEY_PATTERN.test(key);
 }
 
 /**
  * Returns a new key that sorts strictly between `before` and `after`. `null` stands for the
  * start of the list (`before`) or its end (`after`), so `keyBetween(null, null)` is the key of
  * the first row of an empty list. Throws `InvalidRank` for an invalid key or when `before` does
- * not sort before `after`.
+ * not sort before `after`, and `RankLimit` when the new key would be too long.
  *
  * The result is deterministic, so the Rust implementation can return the same keys
- * (cases in tests/crdt-vectors/rank/keys/cases.json). It is the shortest key with the middle
- * digit of the gap; appending at one end grows the key by one digit every few moves.
+ * (cases in tests/crdt-vectors/rank/keys/cases.json). Between two keys it is the shortest key
+ * with the middle digit of the gap. At either end of the list it is a small step away from the
+ * outermost key, so appending n rows at one end gives keys of about 2 * log62(n) digits.
  */
 export function keyBetween(before, after) {
   if (before !== null && !isValidRank(before)) throw new InvalidRank(`invalid key: ${before}`);
@@ -53,30 +77,96 @@ export function keyBetween(before, after) {
   if (before !== null && after !== null && compareText(before, after) >= 0) {
     throw new InvalidRank(`"${before}" does not sort before "${after}"`);
   }
-  return midpoint(before ?? '', after);
+  let key;
+  if (before === null && after === null) key = DIGITS[BASE >> 1];
+  else if (after === null) key = keyAfter(before);
+  else if (before === null) key = keyBefore(after);
+  else key = midpoint(before, after);
+  if (key.length > MAX_RANK_DIGITS) {
+    throw new RankLimit(`a key between "${before}" and "${after}" needs ${key.length} digits`);
+  }
+  return key;
 }
 
-// The key between the fractions `low` (digits, may be empty for 0) and `high` (digits, or null
-// for 1). Requires low < high; neither ends in `0`.
+// The key between the fractions `low` and `high` (both valid keys, low < high). All loops below
+// are iterative, so a long key never deepens the call stack.
 function midpoint(low, high) {
-  if (high !== null) {
-    // Keep the digits both bounds share; `low` reads as 0 beyond its end.
-    let shared = 0;
-    while ((low[shared] ?? DIGITS[0]) === high[shared]) shared += 1;
-    if (shared > 0) {
-      return high.slice(0, shared) + midpoint(low.slice(shared), high.slice(shared));
-    }
-  }
-  const lowDigit = low === '' ? 0 : DIGITS.indexOf(low[0]);
-  const highDigit = high === null ? DIGITS.length : DIGITS.indexOf(high[0]);
+  // Keep the digits both bounds share; `low` reads as 0 beyond its end.
+  let shared = 0;
+  while ((low[shared] ?? ZERO) === high[shared]) shared += 1;
+  const lowDigit = digitAt(low, shared);
+  const highDigit = digitAt(high, shared);
+  const prefix = high.slice(0, shared);
   if (highDigit - lowDigit > 1) {
     // A digit fits strictly between the two: take the middle one, rounding up.
-    return DIGITS[(lowDigit + highDigit + 1) >> 1];
+    return prefix + DIGITS[(lowDigit + highDigit + 1) >> 1];
   }
-  // Adjacent first digits. A longer `high` leaves room right below it at its first digit alone;
-  // otherwise keep the first digit of `low` and look for room after it.
-  if (high !== null && high.length > 1) return high[0];
-  return DIGITS[lowDigit] + midpoint(low.slice(1), null);
+  // Adjacent digits. A longer `high` leaves room right below it at this digit alone.
+  if (high.length > shared + 1) return prefix + DIGITS[highDigit];
+  // Otherwise keep the digit of `low` and go up from the rest of `low` towards 1: skip its
+  // leading top digits, then take the middle digit between the next one and the top.
+  let end = shared + 1;
+  while (low[end] === TOP) end += 1;
+  return prefix + DIGITS[lowDigit] + low.slice(shared + 1, end) + middleAbove(digitAt(low, end));
+}
+
+// The middle digit strictly between `digit` (not the top digit) and 1, rounding up.
+function middleAbove(digit) {
+  return DIGITS[(digit + BASE + 1) >> 1];
+}
+
+// A key after `key` with nothing behind it. The key is read as a level, the number k of its
+// leading top digits, and a counter of k + 1 digits after them. The new key is that counter plus
+// one; at the end of a level it carries into the next level. Level k holds about 62^(k + 1)
+// keys, so the length grows with the logarithm of the number of appends.
+function keyAfter(key) {
+  let level = 0;
+  while (key[level] === TOP) level += 1;
+  const counter = digitsOf(key, level, level + 1);
+  let at = counter.length - 1;
+  // The first counter digit is below the top digit (or 0 if `key` is all top digits), so the
+  // carry stops inside the counter.
+  while (counter[at] === BASE - 1) {
+    counter[at] = 0;
+    at -= 1;
+  }
+  counter[at] += 1;
+  return trimZeros(TOP.repeat(level) + counter.map((d) => DIGITS[d]).join(''));
+}
+
+// A key before `key` with nothing in front of it: the mirror of `keyAfter`, counting down with
+// leading `0` digits as the level.
+function keyBefore(key) {
+  let level = 0;
+  while (key[level] === ZERO) level += 1;
+  const counter = digitsOf(key, level, level + 1);
+  let at = counter.length - 1;
+  // The first counter digit is at least 1, so the borrow stops inside the counter.
+  while (counter[at] === 0) {
+    counter[at] = BASE - 1;
+    at -= 1;
+  }
+  counter[at] -= 1;
+  const result = trimZeros(ZERO.repeat(level) + counter.map((d) => DIGITS[d]).join(''));
+  // Only `key` = 0...01... at level 0 counts down to nothing; the next level starts below it.
+  return result === '' ? ZERO.repeat(level + 1) + TOP : result;
+}
+
+// The `count` digit values of `key` from `start`, reading 0 beyond its end.
+function digitsOf(key, start, count) {
+  const digits = [];
+  for (let i = start; i < start + count; i += 1) digits.push(digitAt(key, i));
+  return digits;
+}
+
+function digitAt(key, index) {
+  return index < key.length ? DIGITS.indexOf(key[index]) : 0;
+}
+
+function trimZeros(key) {
+  let end = key.length;
+  while (end > 0 && key[end - 1] === ZERO) end -= 1;
+  return key.slice(0, end);
 }
 
 /**

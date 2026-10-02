@@ -55,7 +55,7 @@ test('compareKey compares strings by code point, not by their escaped encoding',
 });
 
 test('compareKey rejects values that cannot be keys', () => {
-  for (const value of [null, undefined, [1], { a: 1 }, 1n]) {
+  for (const value of [null, undefined, [1], { a: 1 }, 1n, Symbol('s')]) {
     assert.throws(() => compareKey(value, 'a'), InvalidValue);
     assert.throws(() => compareKey('a', value), InvalidValue);
   }

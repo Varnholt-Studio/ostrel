@@ -69,7 +69,7 @@ U+1F600, unlike the default JavaScript sort.
 
 ### Rules for `rank` vectors
 
-A `Rank` key is a non empty string of the base 62 digits `0-9A-Za-z` that does not end in `0`,
+A `Rank` key is a string of 1 to 1024 base 62 digits `0-9A-Za-z` that does not end in `0`,
 read as a fraction (`runtime/js/crdt/rank/rank.mjs`). Rows are ordered by key, compared by code
 point, and rows with equal keys by row id (`RowId`, 32 lowercase hex digits). Per row, the
 write with the highest `Hlc` wins. The validator refuses an op that is not
@@ -110,8 +110,10 @@ lands, it runs next to the oracle, so both are checked against the same expectat
 ## Open points
 
 * The `rank` op body and the list model are assumed: the wire form of a `Rank` field write
-  comes from the protocol stub (T25), and the vectors follow it. Keys grow by about one digit every
-  five appends at the same end of a list; a length limit or rebalancing is not decided.
+  comes from the protocol stub (T25), and the vectors follow it. Appends at one end of a list
+  grow keys with the logarithm of the number of rows (10 000 appends: 5 digits); inserts into
+  one gap grow them by about one digit every six inserts. The limit of 1024 digits is an
+  assumption until it is in the limits table (ARCHITECTURE 5.9); rebalancing is not decided.
 
 * The op body shapes above follow the wire forms in ARCHITECTURE 5.1 and 6.2. The protocol stub
   (T25, `ostrel_sync::protocol`) is the authority; if it differs, the vectors follow it.

@@ -75,10 +75,15 @@ export function compareKey(a, b) {
   return a < b ? -1 : 1;
 }
 
+// Names a value for an error message. `${value}` itself throws a TypeError for a Symbol.
+function describe(value) {
+  return value === null ? 'null' : typeof value;
+}
+
 function keyKind(value) {
   const kind = KEY_KIND_ORDER[typeof value];
   if (kind === undefined) {
-    throw new InvalidValue(`a set element or map key is a boolean, number or string, not ${value}`);
+    throw new InvalidValue(`a set element or map key is a boolean, number or string, not ${describe(value)}`);
   }
   return kind;
 }

@@ -15,7 +15,7 @@ export const STRATEGIES = ['lww', 'set', 'map', 'rank'];
 const OP_ID = /^[0-9a-f]{24}$/;
 const HLC = /^[0-9a-f]{32}$/;
 const ROW_ID = /^[0-9a-f]{32}$/;
-const RANK_KEY = /^[0-9A-Za-z]*[1-9A-Za-z]$/; // runtime/js/crdt/rank/rank.mjs
+const RANK_KEY = /^[0-9A-Za-z]{0,1023}[1-9A-Za-z]$/; // runtime/js/crdt/rank/rank.mjs, 1 to 1024 digits
 const MAX_TAGS_PER_REMOVE = 64; // ARCHITECTURE 5.9
 const VECTOR_FIELDS = ['deliveries', 'description', 'expect', 'ops', 'strategy'];
 
@@ -154,7 +154,7 @@ function checkRankOps(ops) {
       throw new Error(`${where}: row is not a 32 digit lowercase hex RowId`);
     }
     if (typeof key !== 'string' || !RANK_KEY.test(key)) {
-      throw new Error(`${where}: "${key}" is not a rank key (base 62 digits, no trailing 0)`);
+      throw new Error(`${where}: "${key}" is not a rank key (1 to 1024 base 62 digits, no trailing 0)`);
     }
   });
 }
