@@ -1,0 +1,1 @@
+tests/errors/name_unknown.ostl:3:9: error[E0200]: unknown name `y`

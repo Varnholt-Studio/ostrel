@@ -1,0 +1,1 @@
+tests/errors/type_arity.ostl:5:9: error[E0302]: `inc` takes 1 argument, found 2

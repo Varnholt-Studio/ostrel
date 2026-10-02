@@ -1,0 +1,1 @@
+tests/errors/lex_interpolation_too_deep.ostl:3:42: error[E0007]: interpolation nests braces deeper than 32

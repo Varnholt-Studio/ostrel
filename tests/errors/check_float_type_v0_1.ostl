@@ -1,0 +1,5 @@
+fn unused(n: Float) -> Int
+  return 1
+
+fn main()
+  print("ok")

@@ -1,0 +1,13 @@
+{
+  "strategy": "lww",
+  "description": "An optional field set to null is an ordinary write and wins by Hlc like any other value.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "set": "assigned" } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568010000000000000000000b", "op": { "set": null } }
+  ],
+  "deliveries": [[0, 1], [1, 0]],
+  "expect": {
+    "value": null,
+    "state": { "hlc": "018bcfe568010000000000000000000b", "value": null }
+  }
+}
