@@ -493,7 +493,9 @@ impl<'a> Cx<'a> {
             StmtKind::Return { value } => {
                 let found = self.check_expr(*value);
                 if self.result == Ty::Unit && found != Ty::Error {
-                    let range = self.expr_range(*value);
+                    // SPEC 12.6: reported at the `return` keyword.
+                    let start = stmt.range.start();
+                    let range = TextRange::new(start, start + 6).unwrap_or(stmt.range);
                     self.error(
                         codes::MISMATCH,
                         range,
