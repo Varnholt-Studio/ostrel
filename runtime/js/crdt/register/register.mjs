@@ -8,7 +8,8 @@
 // `value` is the field's wire value (JSON: null, boolean, number, string or array).
 // `hlc` is the hybrid logical clock of the write that produced the value, encoded
 // as the 32 character lowercase hex string of ARCHITECTURE 5.3, or `null` for a
-// register that has never been written.
+// register that has never been written. A register without an HLC therefore always
+// holds `null`: `{ value: 5, hlc: null }` is not a register and is rejected.
 //
 // A write op and a register state have the same shape, so applying an op and
 // merging two replicas are the same function: `merge`. The write with the higher
@@ -48,9 +49,13 @@ export function compareHlc(a, b) {
 /**
  * Creates the register state written by one op. Throws a TypeError when the HLC
  * is not a valid encoding, because an op without a valid clock can never be merged
- * deterministically.
+ * deterministically, and when the value is `undefined`, which has no wire form
+ * (JSON drops the field, so the register would not survive a round trip).
  */
 export function write(value, hlc) {
+  if (value === undefined) {
+    throw new TypeError("invalid value: undefined is not a wire value, use null");
+  }
   if (!isValidHlc(hlc)) {
     throw new TypeError(`invalid HLC: expected ${HLC_HEX_LENGTH} lowercase hex characters`);
   }
@@ -93,12 +98,67 @@ export function mergeAll(registers) {
   return result;
 }
 
+/**
+ * Creates a replica in the model shape of the shared CRDT vectors
+ * (tests/crdt-vectors/README.md): `apply` takes one op envelope
+ * `{ id, hlc, op: { set: value } }` as it travels on the wire, `value` returns what
+ * a program reads and `state` the full register `{ hlc, value }`.
+ *
+ * A malformed envelope throws a TypeError and leaves the replica unchanged.
+ */
+export function createReplica() {
+  let current = EMPTY;
+  return {
+    apply(envelope) {
+      const { hlc, op } = checkEnvelope(envelope);
+      current = merge(current, write(op.set, hlc));
+    },
+    value: () => current.value,
+    state: () => ({ hlc: current.hlc, value: current.value }),
+  };
+}
+
+const OP_ID_PATTERN = /^[0-9a-f]{24}$/;
+
+function checkEnvelope(envelope) {
+  if (!isPlainObject(envelope)) throw new TypeError("an op must be an object");
+  const { id, hlc, op } = envelope;
+  if (typeof id !== "string" || !OP_ID_PATTERN.test(id)) {
+    throw new TypeError("invalid op id: expected 24 lowercase hex characters");
+  }
+  if (!isValidHlc(hlc)) {
+    throw new TypeError(`invalid HLC: expected ${HLC_HEX_LENGTH} lowercase hex characters`);
+  }
+  const fields = isPlainObject(op) ? Object.keys(op) : [];
+  if (fields.length !== 1 || fields[0] !== "set") {
+    throw new TypeError('a register op body is exactly { "set": value }');
+  }
+  return { hlc, op };
+}
+
+function isPlainObject(candidate) {
+  return candidate !== null && typeof candidate === "object" && !Array.isArray(candidate);
+}
+
+// A register is valid when it has both fields, a valid HLC or none, and a value
+// that can travel on the wire. An unwritten register (no HLC) must hold null:
+// otherwise `merge(x, EMPTY)` and `merge(EMPTY, x)` would disagree and replicas
+// holding such a state would diverge silently instead of failing.
 function checkRegister(register, position) {
   const isObject = register !== null && typeof register === "object";
   if (!isObject || !("value" in register) || !("hlc" in register)) {
     throw new TypeError(`${position} argument is not a register`);
   }
-  if (register.hlc !== null && !isValidHlc(register.hlc)) {
+  if (register.value === undefined) {
+    throw new TypeError(`${position} argument has the value undefined, which is not a wire value`);
+  }
+  if (register.hlc === null) {
+    if (register.value !== null) {
+      throw new TypeError(`${position} argument has a value but no HLC`);
+    }
+    return;
+  }
+  if (!isValidHlc(register.hlc)) {
     throw new TypeError(`${position} argument has an invalid HLC`);
   }
 }

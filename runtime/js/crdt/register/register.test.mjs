@@ -5,6 +5,7 @@ import {
   EMPTY,
   HLC_HEX_LENGTH,
   compareHlc,
+  createReplica,
   isValidHlc,
   merge,
   mergeAll,
@@ -65,6 +66,11 @@ test("compareHlc handles the full 48 bit wall time and 64 bit replica", () => {
 test("write rejects an invalid HLC", () => {
   assert.throws(() => write("x", "not a clock"), TypeError);
   assert.throws(() => write("x", null), TypeError);
+});
+
+test("write rejects undefined, which has no wire form", () => {
+  assert.throws(() => write(undefined, hlc(1, 0, 1)), TypeError);
+  assert.deepEqual(write(null, hlc(1, 0, 1)), { value: null, hlc: hlc(1, 0, 1) });
 });
 
 test("write returns a frozen register", () => {
@@ -155,6 +161,22 @@ test("merge rejects arguments that are not registers", () => {
   assert.throws(() => merge(register, { value: 1, hlc: "XYZ" }), TypeError);
 });
 
+test("merge rejects a register that holds a value but has no HLC", () => {
+  // Accepting it would break commutativity: merge(x, EMPTY) would keep 5 while
+  // merge(EMPTY, x) would return EMPTY, so replicas would diverge silently.
+  const broken = { value: 5, hlc: null };
+  assert.throws(() => merge(broken, EMPTY), TypeError);
+  assert.throws(() => merge(EMPTY, broken), TypeError);
+  assert.throws(() => merge(broken, { value: 7, hlc: null }), TypeError);
+  assert.throws(() => merge(write(1, hlc(1, 0, 1)), broken), TypeError);
+});
+
+test("merge rejects a register whose value is undefined", () => {
+  const register = write(1, hlc(1, 0, 1));
+  assert.throws(() => merge(register, { value: undefined, hlc: hlc(2, 0, 1) }), TypeError);
+  assert.throws(() => merge({ value: undefined, hlc: null }, register), TypeError);
+});
+
 test("merge is associative", () => {
   const a = write("a", hlc(3, 0, 1));
   const b = write("b", hlc(3, 1, 1));
@@ -178,4 +200,64 @@ test("three editors converge on the same register in every arrival order", () =>
 
 test("mergeAll of nothing is EMPTY", () => {
   assert.deepEqual(mergeAll([]), EMPTY);
+});
+
+// Op envelope as in tests/crdt-vectors: `id` is replica (16 hex) then seq (8 hex).
+function op(replica, seq, clock, value) {
+  const id = replica.toString(16).padStart(16, "0") + seq.toString(16).padStart(8, "0");
+  return { id, hlc: clock, op: { set: value } };
+}
+
+test("createReplica starts empty", () => {
+  const replica = createReplica();
+  assert.equal(replica.value(), null);
+  assert.deepEqual(replica.state(), { hlc: null, value: null });
+});
+
+test("createReplica converges in every delivery order, replays included", () => {
+  const ops = [
+    op(0xa, 1, hlc(100, 0, 0xa), "a"),
+    op(0xb, 1, hlc(100, 0, 0xb), "b"),
+    op(0xa, 2, hlc(90, 3, 0xa), "late"),
+  ];
+  const deliveries = [...permutations(ops), [ops[1], ops[0], ops[1], ops[2], ops[0]]];
+  for (const delivery of deliveries) {
+    const replica = createReplica();
+    for (const envelope of delivery) replica.apply(envelope);
+    assert.equal(replica.value(), "b");
+    assert.deepEqual(replica.state(), { hlc: hlc(100, 0, 0xb), value: "b" });
+  }
+});
+
+test("createReplica treats a null write like any other value", () => {
+  const replica = createReplica();
+  replica.apply(op(0xb, 1, hlc(2, 0, 0xb), null));
+  replica.apply(op(0xa, 1, hlc(1, 0, 0xa), "assigned"));
+  assert.deepEqual(replica.state(), { hlc: hlc(2, 0, 0xb), value: null });
+});
+
+test("createReplica rejects malformed ops and keeps its state", () => {
+  const replica = createReplica();
+  replica.apply(op(1, 1, hlc(5, 0, 1), "kept"));
+  const malformed = [
+    null,
+    [],
+    { ...op(1, 2, hlc(6, 0, 1), "x"), id: "XYZ" },
+    { ...op(1, 2, hlc(6, 0, 1), "x"), hlc: "not a clock" },
+    { ...op(1, 2, hlc(6, 0, 1), "x"), op: { put: ["k", "v"] } },
+    { ...op(1, 2, hlc(6, 0, 1), "x"), op: { set: "x", extra: 1 } },
+    { ...op(1, 2, hlc(6, 0, 1), "x"), op: { set: undefined } },
+    { ...op(1, 2, hlc(6, 0, 1), "x"), op: null },
+  ];
+  for (const envelope of malformed) {
+    assert.throws(() => replica.apply(envelope), TypeError);
+  }
+  assert.deepEqual(replica.state(), { hlc: hlc(5, 0, 1), value: "kept" });
+});
+
+test("createReplica rejects a conflicting value under a known HLC and keeps its state", () => {
+  const replica = createReplica();
+  replica.apply(op(1, 1, hlc(5, 0, 1), "first"));
+  assert.throws(() => replica.apply(op(1, 1, hlc(5, 0, 1), "other")), RangeError);
+  assert.equal(replica.value(), "first");
 });
