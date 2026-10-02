@@ -1,0 +1,28 @@
+[package]
+name = "ostrel_fuzz"
+description = "Seeded, std only input generator and crash finder for the Ostrel CLI (AC-36)."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "ostrel-fuzz"
+path = "src/main.rs"
+
+# Std only by design (architect decision #46): no dependencies, no cargo-fuzz.
+[dependencies]
+
+# Own workspace until the root workspace lists this crate as a member; see README.md.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

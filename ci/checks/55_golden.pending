@@ -1,0 +1,4 @@
+The compiler pipeline is not implemented yet: crates/ostrel_cli is the workspace placeholder.
+Golden suite failures stay visible but do not block until T1 and T2 deliver `ostrel run` and
+`ostrel check`. This exception needs a decision of the QA lead (Refs #19).
+Remove this file in the change that makes every golden suite pass.
