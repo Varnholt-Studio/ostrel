@@ -30,6 +30,8 @@ pub const INT_OUT_OF_RANGE: Code = Code::new(10);
 pub const BIDI_CONTROL: Code = Code::new(11);
 /// `}` in string text outside an interpolation (D68).
 pub const LONE_CLOSE_BRACE: Code = Code::new(12);
+/// Indentation more than one level deeper than the line above (D68).
+pub const DEEP_INDENT: Code = Code::new(13);
 
 /// Deepest accepted interpolation brace depth (G1, SPEC 12.1).
 pub const MAX_INTERPOLATION_DEPTH: u32 = 32;
@@ -53,6 +55,9 @@ pub const MSG_INT_OUT_OF_RANGE: &str =
 
 /// Message of [`LONE_CLOSE_BRACE`] (ARCHITECTURE 3.5).
 pub const MSG_LONE_CLOSE_BRACE: &str = "`}` in a string literal must be written as `\\}`";
+/// Message of [`DEEP_INDENT`] (ARCHITECTURE 3.5).
+pub const MSG_DEEP_INDENT: &str =
+    "indentation is more than one level deeper than the line above; indent a block by two spaces";
 
 /// Message of [`UNEXPECTED_CHAR`] for the character `c`.
 ///
