@@ -1,6 +1,6 @@
 {
   "strategy": "map",
-  "description": "Entries are ordered by code point of the canonical key encoding, not by UTF-16 units: U+FF01 comes before U+1F600.",
+  "description": "Text keys are ordered by code point (D50, D61), not by UTF-16 units: U+FF01 comes before U+1F600.",
   "ops": [
     { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "put": ["😀", 1] } },
     { "id": "000000000000000a00000002", "hlc": "018bcfe568010000000000000000000a", "op": { "put": ["！", 2] } },

@@ -1,19 +1,35 @@
 // Runs every op vector (README.md) against every JavaScript model of its strategy.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { encode } from '../../runtime/js/crdt/canon/canon.mjs';
 import * as map from '../../runtime/js/crdt/map/map.mjs';
+import * as rank from '../../runtime/js/crdt/rank/rank.mjs';
+import * as register from '../../runtime/js/crdt/register/register.mjs';
+import { AddWinsSet } from '../../runtime/js/crdt/set/add_wins_set.mjs';
 import { loadVectors, STRATEGIES, validateVector } from './format.mjs';
-import { createLwwReplica, createSetReplica } from './oracle.mjs';
+import { createLwwReplica, createRankReplica, createSetReplica } from './oracle.mjs';
 
-// Strategy -> named replica factories. A runtime module joins its list when it lands
-// (runtime/js/crdt/register/ for lww, runtime/js/crdt/set/ for set).
+// The set module has its own interface (`apply(op, opId)`, `values()`, `tagsOf(e)`); this
+// adapter gives it the model shape of README.md without changing the module.
+function createAddWinsSetReplica() {
+  const set = new AddWinsSet();
+  return {
+    apply: ({ id, op }) => set.apply(op, id),
+    value: () => set.values(),
+    state: () => set.values().map((element) => [element, set.tagsOf(element)]),
+  };
+}
+
+// Strategy -> named replica factories. Every runtime module runs next to the oracle (if the
+// strategy has one), so both are checked against the same hand written expectations.
 const MODELS = {
-  lww: { 'oracle.mjs': createLwwReplica },
-  set: { 'oracle.mjs': createSetReplica },
+  lww: { 'oracle.mjs': createLwwReplica, 'runtime/js/crdt/register': register.createReplica },
+  set: { 'oracle.mjs': createSetReplica, 'runtime/js/crdt/set': createAddWinsSetReplica },
   map: { 'runtime/js/crdt/map': map.createReplica },
+  rank: { 'oracle.mjs': createRankReplica, 'runtime/js/crdt/rank': rank.createReplica },
 };
 
 test('every strategy directory has vectors and at least one model', () => {
@@ -37,6 +53,21 @@ for (const strategy of STRATEGIES) {
       });
     }
   }
+}
+
+// Fixed keys of keyBetween, so the Rust implementation can return the same keys.
+const { cases: rankKeyCases } = JSON.parse(
+  readFileSync(new URL('rank/keys/cases.json', import.meta.url), 'utf8'),
+);
+
+for (const { name, before, after, key, error } of rankKeyCases) {
+  test(`ac_41_crdt_vectors_js rank/keys ${name}`, () => {
+    if (error !== undefined) {
+      assert.throws(() => rank.keyBetween(before, after), rank.InvalidRank);
+      return;
+    }
+    assert.equal(rank.keyBetween(before, after), key);
+  });
 }
 
 // The validator itself: a few broken vectors must be refused with a reason.
