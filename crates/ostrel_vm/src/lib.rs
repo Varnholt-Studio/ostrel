@@ -87,6 +87,24 @@ impl RuntimeErrorKind {
             RuntimeErrorKind::TextLimit => "TextLimit",
         }
     }
+
+    /// The fixed message printed after `runtime error[Kind]: ` (ARCHITECTURE 3.4,
+    /// D83). One text per kind; no text depends on [`Limits`] or a CLI flag, and the
+    /// numbers are the fixed limits of ARCHITECTURE 5.9.
+    pub fn message(self) -> &'static str {
+        match self {
+            RuntimeErrorKind::IntOverflow => {
+                "`Int` result is outside the range of -9007199254740991 to 9007199254740991"
+            }
+            RuntimeErrorKind::DivisionByZero => "division or remainder by zero",
+            RuntimeErrorKind::CallDepth => "call would exceed the limit of 10000 frames",
+            RuntimeErrorKind::StepLimit => {
+                "program exceeded its step limit; raise it with `--max-steps`"
+            }
+            RuntimeErrorKind::HeapLimit => "VM heap would grow beyond 268435456 bytes",
+            RuntimeErrorKind::TextLimit => "`Text` value would be longer than 16777216 bytes",
+        }
+    }
 }
 
 impl fmt::Display for RuntimeErrorKind {
@@ -101,7 +119,10 @@ impl fmt::Display for RuntimeErrorKind {
 pub struct RuntimeError {
     /// What went wrong.
     pub kind: RuntimeErrorKind,
-    /// Where: the failing instruction, or the call expression for `CallDepth`.
+    /// Where (ARCHITECTURE 3.4, D83): the failing instruction, the call expression
+    /// for `CallDepth`, and for `StepLimit` the call expression in `main` that is
+    /// running when the limit is reached (the instruction only while `main` itself
+    /// is the running frame).
     pub span: Span,
 }
 
@@ -178,6 +199,62 @@ mod tests {
                 "HeapLimit",
                 "TextLimit"
             ]
+        );
+    }
+
+    #[test]
+    fn kind_messages_are_fixed() {
+        let messages: Vec<&str> = [
+            RuntimeErrorKind::IntOverflow,
+            RuntimeErrorKind::DivisionByZero,
+            RuntimeErrorKind::CallDepth,
+            RuntimeErrorKind::StepLimit,
+            RuntimeErrorKind::HeapLimit,
+            RuntimeErrorKind::TextLimit,
+        ]
+        .iter()
+        .map(|kind| kind.message())
+        .collect();
+        assert_eq!(
+            messages,
+            [
+                "`Int` result is outside the range of -9007199254740991 to 9007199254740991",
+                "division or remainder by zero",
+                "call would exceed the limit of 10000 frames",
+                "program exceeded its step limit; raise it with `--max-steps`",
+                "VM heap would grow beyond 268435456 bytes",
+                "`Text` value would be longer than 16777216 bytes",
+            ]
+        );
+    }
+
+    #[test]
+    fn messages_name_the_fixed_limits() {
+        let limits = Limits::default();
+        assert!(
+            RuntimeErrorKind::IntOverflow
+                .message()
+                .contains(&ostrel_ir::INT_MAX.to_string())
+        );
+        assert!(
+            RuntimeErrorKind::IntOverflow
+                .message()
+                .contains(&ostrel_ir::INT_MIN.to_string())
+        );
+        assert!(
+            RuntimeErrorKind::CallDepth
+                .message()
+                .ends_with(&format!(" {} frames", limits.max_frames))
+        );
+        assert!(
+            RuntimeErrorKind::HeapLimit
+                .message()
+                .ends_with(&format!(" {} bytes", limits.max_heap_bytes))
+        );
+        assert!(
+            RuntimeErrorKind::TextLimit
+                .message()
+                .ends_with(&format!(" {} bytes", limits.max_text_bytes))
         );
     }
 
