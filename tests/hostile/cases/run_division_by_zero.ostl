@@ -1,0 +1,5 @@
+fn zero() -> Int
+  return 0
+
+fn main()
+  print(1 / zero())

@@ -1,0 +1,117 @@
+# Expected exit codes per hostile case, derived from the spec, never from compiler output.
+#
+# Format: <case> <check> <run> [stderr text for run]
+#   <case>   file name in cases/ (committed) or in the generated corpus
+#   <check>  exit code of `ostrel check <case>`: 0, 1, or * (0 or 1)
+#   <run>    exit code of `ostrel run <case>`: 0, 1, or * (0 or 1)
+#   rest     optional text that stderr of `ostrel run` must contain
+# Cases not listed here must exit with 0 or 1 for both commands (AC-04).
+# Every strict value names its source. Expectations hold for the milestone in README.
+
+# AC-04 named cases. Source is UTF-8 (SYNTAX 3); no main means run fails (SYNTAX 4.11).
+empty.ostl * 1
+random_1mib.ostl 1 1
+invalid_utf8.ostl 1 1
+invalid_utf8_ident.ostl 1 1
+invalid_utf8_overlong.ostl 1 1
+invalid_utf8_surrogate.ostl 1 1
+invalid_utf8_truncated_eof.ostl 1 1
+invalid_utf8_in_comment.ostl 1 1
+nul_bytes.ostl 1 1
+nul_only_64kib.ostl * 1
+unterminated_string_eof.ostl 1 1
+unterminated_string_quote_eof.ostl 1 1
+unterminated_interp_eof.ostl 1 1
+backslash_eof.ostl 1 1
+long_line_10mib_comment.ostl * 1
+long_line_10mib_ident.ostl 1 1
+long_line_10mib_string.ostl 0 0
+long_line_10mib_add_chain.ostl 0 0
+
+# Nesting: satisfied by a diagnostic from the parser depth limit 256 (SPEC 5.0, ARCH 3.4).
+nest_paren_100k.ostl 1 1
+nest_paren_100k_unclosed.ostl 1 1
+nest_brace_100k.ostl 1 1
+nest_bracket_100k.ostl 1 1
+nest_call_100k.ostl 1 1
+nest_unary_minus_100k.ostl 1 1
+nest_unary_minus_spaced_100k.ostl 1 1
+nest_not_100k.ostl 1 1
+nest_interp_brace_100k.ostl 1 1
+nest_interp_open_100k.ostl 1 1
+nest_indent_2000.ostl 1 1
+
+# Long flat chains are not nesting: iterative parsing (D43), valid v0.1 programs.
+chain_add_100k.ostl 0 0
+chain_and_100k.ostl 0 0
+many_lets_100k.ostl 0 0
+many_fns_100k.ostl 0 0
+# Comparison is not associative (SYNTAX 7, cmpExpr).
+chain_compare_100k.ostl 1 1
+chained_compare.ostl 1 1
+# Integer literal range plus or minus (2^53 minus 1) is a compile error (G9).
+long_int_literal_1mib.ostl 1 1
+int_max.ostl 0 0
+int_min.ostl 0 0
+int_literal_over_max.ostl 1 1
+int_literal_under_min.ostl 1 1
+int_literal_over_u64.ostl 1 1
+
+# Strings (G1, RED-B F17): no string literal inside interpolation, `{{` has no meaning.
+string_literal_in_interp.ostl 1 1
+nested_interp.ostl 1 1
+interp_unclosed_before_quote.ostl 1 1
+double_brace.ostl 1 1
+empty_interp.ostl 1 1
+escaped_braces.ostl 0 0
+
+# Tabs in indentation are a lex error (SYNTAX 3).
+tab_indent.ostl 1 1
+space_tab_indent.ostl 1 1
+dedent_to_unknown_level.ostl 1 1
+
+# Grammar errors (SYNTAX 7) and checker errors of the v0.1 subset (SYNTAX 4.11).
+dangling_operator.ostl 1 1
+open_paren_eof.ostl 1 1
+extra_close_parens.ostl 1 1
+fn_header_eof.ostl 1 1
+fn_keyword_only.ostl 1 1
+main_without_body.ostl 1 1
+return_without_value.ostl 1 1
+let_without_name.ostl 1 1
+let_self_reference.ostl 1 1
+keyword_as_name.ostl 1 1
+print_two_args.ostl 1 1
+print_no_args.ostl 1 1
+print_of_print.ostl 1 1
+text_plus.ostl 1 1
+compare_int_bool.ostl 1 1
+set_literal_not_in_v0_1.ostl 1 1
+data_not_in_v0_1.ostl 1 1
+comments_everywhere.ostl 0 0
+trailing_blank_lines.ostl 0 0
+
+# Entry point: a missing or differently typed main is a compile error for run (G15).
+only_newlines.ostl * 1
+only_spaces.ostl * 1
+only_comment_no_newline.ostl * 1
+missing_main.ostl * 1
+main_with_param.ostl * 1
+main_returns_int.ostl * 1
+
+# `ostrel run` cases (A2-16, G15, D44): runtime errors print
+# `file:line:column: runtime error[Kind]: message` and exit 1.
+run_deep_recursion.ostl 0 1 runtime error[CallDepth]
+run_deep_recursion_bounded.ostl 0 1 runtime error[CallDepth]
+run_mutual_recursion.ostl 0 1 runtime error[CallDepth]
+run_main_calls_main.ostl 0 1 runtime error[CallDepth]
+run_recursion_within_limit.ostl 0 0
+run_overflow_add.ostl 0 1 runtime error[IntOverflow]
+run_overflow_sub.ostl 0 1 runtime error[IntOverflow]
+run_overflow_mul.ostl 0 1 runtime error[IntOverflow]
+run_overflow_by_recursion.ostl 0 1 runtime error[IntOverflow]
+run_division_by_zero.ostl 0 1 runtime error[DivisionByZero]
+run_modulo_by_zero.ostl 0 1 runtime error[DivisionByZero]
+run_long_loop_by_recursion.ostl 0 1 runtime error[StepLimit]
+run_text_growth.ostl 0 1 runtime error[
+run_print_many_lines.ostl 0 0
