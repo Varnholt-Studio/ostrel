@@ -329,6 +329,25 @@ fn ac_03_golden_type_implicit_return_in_branch() {
 }
 
 #[test]
+fn ac_03_golden_type_return_value_without_result() {
+    golden!("type_return_value_without_result", |b| {
+        let n = b.name("n", 1);
+        let p = b.call("print", 0, vec![n], "print(n)");
+        let p = b.stmt(StmtKind::Expr(p));
+        let value = b.name("n", 2);
+        let range = b.r("return n", 0);
+        let r = b.m.add_stmt(StmtKind::Return { value }, range).unwrap();
+        let body = b.block(vec![p, r]);
+        b.func(("log", 0), &[(("n", 0), ("Int", 0))], None, body);
+        let one = b.int("1", 0);
+        let c = b.call("log", 1, vec![one], "log(1)");
+        let s = b.stmt(StmtKind::Expr(c));
+        let body = b.block(vec![s]);
+        b.func(("main", 0), &[], None, body);
+    });
+}
+
+#[test]
 fn ac_03_golden_type_text_plus() {
     golden!("type_text_plus", |b| {
         let a = b.text("a", 0);
