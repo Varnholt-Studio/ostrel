@@ -49,6 +49,17 @@ the open point at the end of the appendix.
 Source files are UTF 8 and use the extension `.ostl`. Lines are separated by LF (SPEC 12.1).
 Diagnostic columns count Unicode scalar values, and a tab counts as one column.
 
+Bidirectional control characters are not allowed anywhere in the source text (D53, ARCHITECTURE
+3.1). The nine characters U+202A to U+202E and U+2066 to U+2069 are rejected wherever they appear
+raw: in code, comments, doc comments, string literals and `style` bodies. Each occurrence is
+reported with the lexer diagnostic for bidirectional control characters, whose code is registered
+in `tests/errors/README.md` (D53). The span is the character itself, and the lexer continues
+after it, so every occurrence is reported. The same characters written as an escape in a string
+(for example `\u{202E}`) stay valid, because the escape is visible. Other invisible characters
+(U+200B to U+200F, U+061C and U+2060) stay allowed in strings and comments; they cannot reverse
+the reading order, and joiners are needed for emoji. The reason is Trojan Source
+(CVE-2021-42574): a reviewer must read the same code the compiler runs.
+
 ### 2.2 Lines and indentation
 
 Ostrel is line based. A statement ends at the end of its line, and nesting is expressed by
@@ -72,15 +83,18 @@ the file. No example in this document depends on these cases.
 ### 2.3 Comments
 
 A comment starts with `//` and runs to the end of the line. Comments are kept as trivia for the
-formatter and have no effect on the program. There are no block comments in Ostrel code (`/* */`
+formatter and have no effect on the program. A comment may contain any character except the
+bidirectional control characters of section 2.1, which are rejected inside comments as well
+(D53). There are no block comments in Ostrel code (`/* */`
 exists only inside `style` bodies, which are not part of v0.1).
 
 ### 2.4 Identifiers and keywords
 
 An identifier starts with an ASCII letter, followed by ASCII letters, digits and underscores
 (SPEC 12.2, binding for v0.1 to v0.3). Any other character where a token is expected is reported
-with `E0008`. Values, parameters and functions are written in `lowerCamel`, types in
-`UpperCamel`.
+with `E0008`, except a bidirectional control character, which gets only the D53 diagnostic of
+section 2.1 (one diagnostic per error, SPEC 12.1). Values, parameters and functions are
+written in `lowerCamel`, types in `UpperCamel`.
 
 The following 45 words are keywords. All of them are reserved from v0.1 on, even though most of
 them are only meaningful in later milestones:
@@ -110,7 +124,8 @@ A negative number is written with the unary `-` operator.
 
 ```ebnf
 String        = '"' { char | escape | "{" interpolation "}" } '"' ;
-char          = (* any Unicode scalar value except '"', "\", "{", "}" and a line end *) ;
+char          = (* any Unicode scalar value except '"', "\", "{", "}", a line end and the
+                   bidirectional control characters U+202A to U+202E and U+2066 to U+2069 *) ;
 escape        = "\{" | "\}" | '\"' | "\\" | "\n" | "\t"
               | "\u{" hex [ hex ] [ hex ] [ hex ] [ hex ] [ hex ] "}" ;
 hex           = digit | "a" | "b" | "c" | "d" | "e" | "f" | "A" | "B" | "C" | "D" | "E" | "F" ;
@@ -123,6 +138,9 @@ interpolation = (* the tokens of one expr, containing no string literal *) ;
   case; a value that is not a Unicode scalar value (a surrogate or above 10FFFF) is `E0005`.
   Every other escape, including `\r`, `\0`, an empty `\u{}`, more than 6 digits or a missing
   `}`, is `E0004` (SPEC 12.4).
+* A raw bidirectional control character (U+202A to U+202E, U+2066 to U+2069) inside a string
+  literal is rejected with the D53 lexer diagnostic of section 2.1. Written as an escape, for
+  example `\u{202E}`, it is valid. U+200B to U+200F, U+061C and U+2060 are allowed raw.
 * `{expr}` inserts the text form of the expression. `Int` values are written in decimal, `Bool`
   values as `true` or `false`.
 * A string literal inside an interpolation is a lexical error. Bind the inner text with `let`
@@ -184,6 +202,19 @@ Notes:
 * In the full grammar the expression levels between `cmpExpr` and `addExpr` (`??`, `catch`,
   `..`) and the postfix forms `.name` and `[expr]` exist as well (see the appendix). In v0.1
   they are rejected by the checker with `E0100`.
+
+Parser limits (D43, D54, ARCHITECTURE 3.4). Each limit has its own parser diagnostic, whose code
+is registered in `tests/errors/README.md`; the values are also listed in `tests/hostile/README`:
+
+* Nesting depth 256: brackets and blocks as written in the source.
+* AST height 2 048: the longest path from the root of the syntax tree to a leaf. Operator chains
+  are parsed iteratively, but `1 + 1 + 1 ...` still builds a left leaning tree whose height grows
+  with the number of operands, so a chain of about 2 100 operands exceeds the limit.
+* AST nodes 1 000 000 per file: every node the parser creates counts, tokens and trivia do not.
+  On overflow there is one diagnostic at the triggering token, the rest of the file is abandoned
+  without follow up diagnostics, and the exit code is 1.
+
+None of the limits can be changed from the command line in v0.1.
 
 ## 4. Operator precedence
 
