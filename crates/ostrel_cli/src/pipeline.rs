@@ -57,12 +57,18 @@ pub enum Mode {
     Run(Limits),
 }
 
-/// The code reported for a source file that is not valid UTF 8.
+/// The code reported for a source file that is not valid UTF 8: E0014
+/// (SPEC 12.6, ARCHITECTURE 3.4).
 ///
-/// ASSUMPTION: the catalog `tests/errors/README.md` has no code for invalid
-/// UTF 8 yet. E0008 (unexpected character, SPEC 12.2) is the nearest lexer code
-/// until T1 registers one.
-const INVALID_UTF8: Code = Code::new(8);
+/// ASSUMPTION: `ostrel_syntax::lex::codes` has no constant for E0014 yet; the
+/// catalog entry belongs to the lexer. Replace this constant and
+/// [`invalid_utf8_message`] with the lexer's once it has them.
+const INVALID_UTF8: Code = Code::new(14);
+
+/// The message of [`INVALID_UTF8`] for the first invalid byte (SPEC 12.6).
+fn invalid_utf8_message(byte: u8) -> String {
+    format!("source is not valid UTF-8 (byte 0x{byte:02X})")
+}
 
 /// Compiles the file `path` with content `bytes` and, for [`Mode::Run`], runs it.
 pub fn execute(
@@ -98,7 +104,7 @@ pub fn execute(
         let diag = Diagnostic::error(
             INVALID_UTF8,
             Span::point(file, offset),
-            format!("source is not valid UTF-8 (byte 0x{byte:02X})"),
+            invalid_utf8_message(byte),
         );
         report(&map, &[diag], err);
         return Exit::Failure;
@@ -106,23 +112,8 @@ pub fn execute(
     let src = map.text(file).unwrap_or_default();
 
     let (tokens, mut diags) = ostrel_syntax::lex::lex(src, file);
-    let module = match frontend::parse(src, file, &tokens, &diags) {
-        Ok((module, parsed)) => {
-            diags.extend(parsed);
-            module
-        }
-        Err(frontend::ParserMissing) => {
-            if has_error(&diags) {
-                report(&map, &diags, err);
-                return Exit::Failure;
-            }
-            let _ = writeln!(
-                err,
-                "ostrel: internal error: the parser is not part of this build"
-            );
-            return Exit::Internal;
-        }
-    };
+    let (module, parsed) = frontend::parse(src, file, &tokens, &diags);
+    diags.extend(parsed);
     if has_error(&diags) {
         report(&map, &diags, err);
         return Exit::Failure;
