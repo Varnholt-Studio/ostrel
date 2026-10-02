@@ -21,6 +21,15 @@ export const MAX_MESSAGE_BYTES = 1024 * 1024;
 export const MAX_IN_FLIGHT = 64;
 /** Maximum nesting depth of a result value. */
 export const MAX_DEPTH = 256;
+/**
+ * Maximum number of values visited when checking a result. Every value takes
+ * at least one byte on the wire, so a larger result cannot fit into one
+ * message anyway. The budget also bounds results that share references,
+ * which would otherwise be visited once per path.
+ */
+export const MAX_NODES = MAX_MESSAGE_BYTES;
+/** Version of the host protocol, announced in `ready` (D60). */
+export const PROTOCOL_VERSION = 1;
 
 /** JSON-RPC error codes used by the host. */
 export const Codes = Object.freeze({
@@ -42,15 +51,29 @@ function clip(text) {
   return s.length > MAX_ECHO ? `${s.slice(0, MAX_ECHO)}...` : s;
 }
 
-class WireError extends Error {}
+/** A result that cannot cross the bridge; `kind` is Type or TooLarge. */
+class WireError extends Error {
+  constructor(message, kind = "Type") {
+    super(message);
+    this.kind = kind;
+  }
+}
 
 /**
- * Checks that `value` is a JSON value that survives a round trip unchanged:
- * null, booleans, finite numbers, well formed strings, arrays and plain
- * objects. Throws WireError with a path otherwise.
+ * Checks that `value` is a JSON value that survives a round trip: null,
+ * booleans, finite numbers, well formed strings, arrays and plain objects.
+ * The round trip is exact except for negative zero, which JSON.stringify
+ * writes as 0. Throws WireError with a path otherwise: kind TooLarge when
+ * the value has more than MAX_NODES values counted per path, Type for
+ * everything else.
  */
-export function checkWireValue(value, path = "$", depth = 0, seen = new Set()) {
+export function checkWireValue(value) {
+  checkNode(value, "$", 0, new Set(), { left: MAX_NODES });
+}
+
+function checkNode(value, path, depth, seen, budget) {
   if (depth > MAX_DEPTH) throw new WireError(`${path}: nested deeper than ${MAX_DEPTH}`);
+  if (--budget.left < 0) throw new WireError(`${path}: more than ${MAX_NODES} values`, "TooLarge");
   switch (typeof value) {
     case "boolean":
       return;
@@ -71,7 +94,7 @@ export function checkWireValue(value, path = "$", depth = 0, seen = new Set()) {
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
       if (!Object.hasOwn(value, i)) throw new WireError(`${path}[${i}]: sparse array`);
-      checkWireValue(value[i], `${path}[${i}]`, depth + 1, seen);
+      checkNode(value[i], `${path}[${i}]`, depth + 1, seen, budget);
     }
   } else {
     const proto = Object.getPrototypeOf(value);
@@ -85,7 +108,7 @@ export function checkWireValue(value, path = "$", depth = 0, seen = new Set()) {
       if (!key.isWellFormed()) throw new WireError(`${path}: key has a lone surrogate`);
       const desc = Object.getOwnPropertyDescriptor(value, key);
       if (!("value" in desc)) throw new WireError(`${path}.${key}: accessor property`);
-      checkWireValue(desc.value, `${path}.${key}`, depth + 1, seen);
+      checkNode(desc.value, `${path}.${key}`, depth + 1, seen, budget);
     }
   }
   seen.delete(value);
@@ -114,7 +137,7 @@ export function parseArgs(argv) {
 function send(message) {
   const line = JSON.stringify(message);
   if (Buffer.byteLength(line) > MAX_MESSAGE_BYTES) {
-    throw new WireError(`response exceeds ${MAX_MESSAGE_BYTES} bytes`);
+    throw new WireError(`response exceeds ${MAX_MESSAGE_BYTES} bytes`, "TooLarge");
   }
   protocolWrite(line + "\n");
 }
@@ -141,7 +164,8 @@ function validId(id) {
   return (typeof id === "string" && id.isWellFormed()) || Number.isSafeInteger(id);
 }
 
-let inFlight = 0;
+/** Release functions of the running calls, by request id. */
+const running = new Map();
 
 async function handle(modules, line) {
   let req;
@@ -158,8 +182,15 @@ async function handle(modules, line) {
     return sendError(null, Codes.INVALID_REQUEST, "id must be a string or a safe integer");
   }
   const id = notification ? null : req.id;
-  // The host defines no notifications from the server and never answers one.
-  if (notification) return;
+  // The host never answers a notification. The only one it acts on is
+  // cancel, which frees the slot of a running call without an answer.
+  if (notification) {
+    if (req.method === "cancel" && req.params !== null && typeof req.params === "object" &&
+        validId(req.params.id)) {
+      running.get(req.params.id)?.();
+    }
+    return;
+  }
   if (typeof req.method !== "string") {
     return sendError(id, Codes.INVALID_REQUEST, "method must be a string");
   }
@@ -183,20 +214,30 @@ async function handle(modules, line) {
   if (typeof fn !== "function") {
     return sendError(id, Codes.INVALID_PARAMS, `unknown function: ${clip(p.module)}.${clip(p.fn)}`);
   }
-  if (inFlight >= MAX_IN_FLIGHT) {
+  if (running.has(id)) {
+    return sendError(id, Codes.INVALID_REQUEST, "a call with this id is still running");
+  }
+  if (running.size >= MAX_IN_FLIGHT) {
     return externError(id, "Busy", `more than ${MAX_IN_FLIGHT} calls in flight`);
   }
 
-  inFlight++;
+  // A call holds its slot until it settles or the server cancels it. The
+  // server is the only clock (D60): when its deadline passes it sends
+  // cancel. A cancelled call is never answered, also when it settles later.
+  const release = () => {
+    if (running.get(id) !== release) return false;
+    running.delete(id);
+    return true;
+  };
+  running.set(id, release);
   let result;
   try {
     result = await fn(...p.args);
   } catch (err) {
-    externError(id, "Threw", describeThrown(err));
+    if (release()) externError(id, "Threw", describeThrown(err));
     return;
-  } finally {
-    inFlight--;
   }
+  if (!release()) return;
   if (result === undefined) {
     return externError(id, "Undefined", `${p.module}.${p.fn} returned undefined`);
   }
@@ -205,7 +246,7 @@ async function handle(modules, line) {
     send({ jsonrpc: "2.0", id, result });
   } catch (err) {
     if (!(err instanceof WireError)) throw err;
-    externError(id, "Type", clip(`${p.module}.${p.fn}: ${err.message}`));
+    externError(id, err.kind, clip(`${p.module}.${p.fn}: ${err.message}`));
   }
 }
 
@@ -284,7 +325,7 @@ async function main() {
   process.stdin.on("data", lineSplitter(onLine, onOversized));
   // The server owns the host. When it closes the pipe, the host stops.
   process.stdin.on("end", () => process.exit(0));
-  send({ jsonrpc: "2.0", method: "ready", params: { modules: exports } });
+  send({ jsonrpc: "2.0", method: "ready", params: { protocol: PROTOCOL_VERSION, modules: exports } });
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

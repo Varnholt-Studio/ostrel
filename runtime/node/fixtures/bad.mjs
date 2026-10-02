@@ -65,3 +65,13 @@ export function shared() {
   const leaf = { x: 1 };
   return { a: leaf, b: leaf };
 }
+
+export function hang() {
+  return new Promise(() => {});
+}
+
+export function dag(levels) {
+  let v = [];
+  for (let i = 0; i < levels; i++) v = [v, v];
+  return v;
+}

@@ -12,6 +12,8 @@ import {
   Codes,
   MAX_IN_FLIGHT,
   MAX_MESSAGE_BYTES,
+  MAX_NODES,
+  PROTOCOL_VERSION,
   checkWireValue,
   lineSplitter,
   parseArgs,
@@ -100,6 +102,8 @@ async function readyHost(modules) {
 test("announces ready with the exported functions of each module", async () => {
   const host = startHost();
   const ready = await host.nextMessage();
+  assert.equal(ready.params.protocol, PROTOCOL_VERSION);
+  assert.equal(PROTOCOL_VERSION, 1);
   assert.deepEqual(ready.params.modules.math, ["add", "chatty", "record", "slowEcho"]);
   assert.ok(ready.params.modules.bad.includes("throws"));
   assert.equal(Object.hasOwn(ready, "id"), false);
@@ -162,7 +166,7 @@ test("undefined result becomes Undefined", async () => {
 
 test("results that are not plain JSON become Type errors", async () => {
   const host = await readyHost();
-  const fns = ["nested", "aFunction", "notFinite", "big", "cyclic", "date", "loneSurrogate", "sparse", "tooLarge", "tooDeep"];
+  const fns = ["nested", "aFunction", "notFinite", "big", "cyclic", "date", "loneSurrogate", "sparse", "tooDeep"];
   for (const [i, fn] of fns.entries()) {
     const res = await host.call(i, "bad", fn);
     assert.equal(res.error?.data?.kind, "Type", `${fn}: ${JSON.stringify(res).slice(0, 200)}`);
@@ -251,6 +255,86 @@ test("calls beyond the in-flight limit fail with Busy", async () => {
   assert.equal(ids.size, MAX_IN_FLIGHT);
   assert.deepEqual(await host.call("after", "math", "add", [1, 2]), { jsonrpc: "2.0", id: "after", result: 3 });
   await host.stop();
+});
+
+function callRequest(id, module, fn, args) {
+  return { jsonrpc: "2.0", id, method: "call", params: { module, fn, args } };
+}
+
+test("a response over 1 MiB becomes TooLarge", async () => {
+  const host = await readyHost();
+  const res = await host.call(1, "bad", "tooLarge");
+  assert.equal(res.error.code, Codes.EXTERN_ERROR);
+  assert.equal(res.error.data.kind, "TooLarge");
+  assert.deepEqual(await host.call(2, "math", "add", [1, 1]), { jsonrpc: "2.0", id: 2, result: 2 });
+  await host.stop();
+});
+
+test("cancel frees the slots of calls that never settle", async () => {
+  // Without cancel, 64 promises that never settle would block the host for
+  // good while ping still answers (review of T30 at 92fa0f5).
+  const host = await readyHost();
+  for (let i = 0; i < MAX_IN_FLIGHT; i++) host.send(callRequest(i, "bad", "hang", []));
+  assert.equal((await host.call("full", "math", "add", [1, 2])).error.data.kind, "Busy");
+  for (let i = 0; i < MAX_IN_FLIGHT; i++) host.send({ jsonrpc: "2.0", method: "cancel", params: { id: i } });
+  // Every slot is free again: a full batch of calls runs without Busy.
+  for (let i = 0; i < MAX_IN_FLIGHT; i++) host.send(callRequest(`b${i}`, "math", "add", [i, 1]));
+  for (let i = 0; i < MAX_IN_FLIGHT; i++) assert.equal(typeof (await host.nextMessage()).result, "number");
+  // A cancelled id can be used again.
+  assert.deepEqual(await host.call(0, "math", "add", [2, 2]), { jsonrpc: "2.0", id: 0, result: 4 });
+  assert.equal(host.rawLines.length, 0);
+  await host.stop();
+});
+
+test("a cancelled call is not answered when it settles later", async () => {
+  const host = await readyHost();
+  host.send(callRequest(1, "math", "slowEcho", ["late", 200]));
+  host.send({ jsonrpc: "2.0", method: "cancel", params: { id: 1 } });
+  host.send(callRequest(2, "bad", "throws", []));
+  assert.equal((await host.nextMessage()).id, 2);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.deepEqual(await host.call(3, "math", "add", [1, 1]), { jsonrpc: "2.0", id: 3, result: 2 });
+  assert.equal(host.rawLines.length, 0);
+  await host.stop();
+});
+
+test("cancel with an unknown or malformed id is ignored", async () => {
+  const host = await readyHost();
+  host.send(callRequest(1, "math", "slowEcho", ["kept", 100]));
+  for (const params of [{ id: 2 }, { id: "1" }, { id: 1.5 }, { id: null }, null, [], "1"]) {
+    host.send({ jsonrpc: "2.0", method: "cancel", params });
+  }
+  assert.deepEqual(await host.nextMessage(), { jsonrpc: "2.0", id: 1, result: "kept" });
+  assert.equal(host.rawLines.length, 0);
+  await host.stop();
+});
+
+test("a call id that is still running is rejected", async () => {
+  const host = await readyHost();
+  host.send(callRequest("dup", "math", "slowEcho", [1, 200]));
+  host.send(callRequest("dup", "math", "add", [1, 1]));
+  const first = await host.nextMessage();
+  assert.equal(first.error.code, Codes.INVALID_REQUEST);
+  assert.deepEqual(await host.nextMessage(), { jsonrpc: "2.0", id: "dup", result: 1 });
+  await host.stop();
+});
+
+test("results with many shared references fail fast as TooLarge", async () => {
+  // dag(30) has 2^31 paths: without the value budget the check would not end.
+  let dag = [];
+  for (let i = 0; i < 30; i++) dag = [dag, dag];
+  const started = Date.now();
+  assert.throws(() => checkWireValue(dag), new RegExp(`more than ${MAX_NODES} values`));
+  assert.ok(Date.now() - started < 2000);
+  const host = await readyHost();
+  assert.equal((await host.call(1, "bad", "dag", [30])).error.data.kind, "TooLarge");
+  assert.deepEqual(await host.call(2, "math", "add", [1, 1]), { jsonrpc: "2.0", id: 2, result: 2 });
+  await host.stop();
+});
+
+test("checkWireValue accepts negative zero, which the wire carries as 0", () => {
+  assert.doesNotThrow(() => checkWireValue(-0));
+  assert.equal(JSON.stringify(-0), "0");
 });
 
 test("the host exits when the server closes stdin", async () => {
