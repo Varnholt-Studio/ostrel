@@ -1,0 +1,13 @@
+{
+  "strategy": "map",
+  "description": "A later remove leaves a tombstone, so the older put arriving afterwards does not bring the key back.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "put": ["ana", "admin"] } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568020000000000000000000b", "op": { "remove": "ana" } }
+  ],
+  "deliveries": [[0, 1], [1, 0], [1, 0, 1, 0]],
+  "expect": {
+    "value": [],
+    "state": [["ana", { "hlc": "018bcfe568020000000000000000000b", "removed": true }]]
+  }
+}

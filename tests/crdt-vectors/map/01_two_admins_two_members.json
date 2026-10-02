@@ -1,0 +1,16 @@
+{
+  "strategy": "map",
+  "description": "Two admins change the roles of two different members at the same time; both changes survive (the reason for G6).",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "put": ["ana", "admin"] } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568000000000000000000000b", "op": { "put": ["ben", "viewer"] } }
+  ],
+  "deliveries": [[0, 1], [1, 0], [0, 1, 0, 1]],
+  "expect": {
+    "value": [["ana", "admin"], ["ben", "viewer"]],
+    "state": [
+      ["ana", { "hlc": "018bcfe568000000000000000000000a", "value": "admin" }],
+      ["ben", { "hlc": "018bcfe568000000000000000000000b", "value": "viewer" }]
+    ]
+  }
+}
