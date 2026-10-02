@@ -1,9 +1,11 @@
-import { isHex, WIDTH } from './ids.mjs';
+import { isHex, seqCounter, WIDTH } from './ids.mjs';
+import { isRank } from './rank.mjs';
 import { FIELDS, MAX_OPS_PER_BATCH, MAX_REMOVE_TAGS, MAX_TEXT_BYTES } from './schema.mjs';
 
 // Step 1 of the KPI A budget: parse and validate one incoming `Ops` message. Every
 // message is hostile input; anything malformed throws and nothing is applied.
 // The wire shape is a spike assumption until `ostrel_sync::protocol` is fixed (F1b).
+// Server to client ops carry their log position `ss` (ServerSeq, 16 hex digits).
 export class DecodeError extends Error {}
 
 function fail(msg) {
@@ -28,6 +30,7 @@ function checkText(v) {
 
 function checkOp(op) {
   if (op === null || typeof op !== 'object' || Array.isArray(op)) fail('op object expected');
+  if (!isHex(op.ss, WIDTH.serverSeq)) fail('bad server seq');
   if (!isHex(op.id, WIDTH.opId)) fail('bad op id');
   if (!isHex(op.hlc, WIDTH.hlc)) fail('bad hlc');
   if (op.hlc.slice(16) !== op.id.slice(0, 16)) fail('hlc replica differs from op replica');
@@ -42,7 +45,7 @@ function checkOp(op) {
         if (!field.values.includes(op.v)) fail('bad enum value');
       } else {
         checkText(op.v);
-        if (field.kind === 'rank' && !/^[0-9a-z]+$/.test(op.v)) fail('bad rank');
+        if (field.kind === 'rank' && !isRank(op.v)) fail('bad rank');
       }
       break;
     case 'sadd':
@@ -61,6 +64,9 @@ function checkOp(op) {
       if (field.kind !== 'seq') fail('ins on non text');
       if (op.after !== null && !isHex(op.after, WIDTH.seqId)) fail('bad origin');
       if (!Number.isInteger(op.c) || op.c < 1 || op.c > 0xffffffff) fail('bad counter');
+      // Lamport condition: an element's counter is above its origin's. The RGA order (and
+      // the reference in rga.mjs) relies on it.
+      if (op.after !== null && op.c <= seqCounter(op.after)) fail('counter not above origin');
       if (typeof op.s !== 'string') fail('bad char');
       checkText(op.s);
       if ([...op.s].length !== 1) fail('one code point per ins');
@@ -85,6 +91,13 @@ export function decodeOps(message) {
   if (msg === null || typeof msg !== 'object') fail('object expected');
   if (msg.v !== 0 || msg.t !== 'Ops') fail('unexpected message');
   if (!Array.isArray(msg.ops) || msg.ops.length > MAX_OPS_PER_BATCH) fail('bad batch');
-  for (const op of msg.ops) checkOp(op);
+  let last = '';
+  for (const op of msg.ops) {
+    checkOp(op);
+    // Server to client ops arrive in increasing log position (D62); within one message a
+    // repeated or falling ServerSeq is malformed.
+    if (op.ss <= last) fail('server seq not increasing');
+    last = op.ss;
+  }
   return msg.ops;
 }

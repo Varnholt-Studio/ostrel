@@ -23,16 +23,23 @@ Every probe message goes through the four steps of the 5.8 budget, timed separat
 | View diff and DOM patch | `src/view.mjs` | 20 ms |
 | Wait for the next `requestAnimationFrame` (MEASUREMENT 2.5 t1) | `src/harness.mjs` | headroom |
 
-Each probe is checked against an oracle computed independently of the receiving replica
-(HLC rule for registers, replay in the opposite delivery order for text). A mismatch fails
-the run, as in MEASUREMENT R0.5. Two tests sabotage the merge on purpose and assert that
-the oracle notices.
+Each probe is checked against an oracle computed independently of the receiving replica:
+the HLC rule for registers, and for text a separate tree model (`src/rga.mjs`, no code
+shared with `src/seq.mjs`) built from the snapshot text and every text op the row received,
+with the two editors' ops replayed in the opposite delivery order. A mismatch fails the run,
+as in MEASUREMENT R0.5. Two tests sabotage the merge on purpose and assert that the oracle
+notices.
+
+Ops from the server carry their log position `ss` (ServerSeq). The store drops ops at or
+below its ServerSeq high water mark (D62) and applies a batch as a whole: a text op that
+names an unknown element refuses the batch before anything changes.
 
 ## Run
 
     node measure.mjs                       # Node, stub DOM: steps 1 to 3 are meaningful
     node measure.mjs --browser             # headless Chromium, real DOM and frames
     node measure.mjs --browser --pause 20  # idle page between probes
+    node measure-tags.mjs                  # Set ops with large tag lists (risk 7)
     node --test test/*.test.mjs
 
 Options: `--probes N`, `--warmup N`, `--count N`, `--seed N`, `--out report.json`,
@@ -75,6 +82,23 @@ values come from the `bench/` harness on GitHub Actions.
    length encoding. That expansion is the largest single merge cost seen. The sequence core
    (5.2) should split runs instead of expanding whole documents.
 
+7. **Rank keys must not end in '0'.** No key lies directly below such a key (nothing is
+   between `a` and `a0`), so `rankBetween` cannot place a row in front of it. Generated keys
+   never end in '0'; decode now refuses remote ranks that do, and `rankBetween` refuses
+   such bounds. The runtime `Rank` needs the same rule on both sides.
+8. **Dedupe belongs to the log position, not the sender's seq.** Dropping ops whose
+   replica seq is not above the last one seen loses ops that reach the log out of seq order
+   and lets a redelivered add revive a removed element. The ServerSeq mark of D62 fixes
+   both; `test/store.test.mjs` covers the reconnect overlap case of ARCHITECTURE 5.4.
+9. **Batches need a reference check before merge.** Applying op by op and throwing at the
+   first unknown text origin left half a batch applied. The check costs one set lookup per
+   text op and makes a batch all or nothing.
+10. **Tag lists are cheap in the merge.** `measure-tags.mjs` puts T live tags on one
+    element. Add, re-add and split remove stay at a few hundredths of a millisecond per
+    batch up to 64 tags and well under the merge budget at 256 tags (four remove ops). The
+    larger cost is reading a big set in code point order, which sorts on every call; the
+    runtime should keep the sorted order instead of sorting per render.
+
 ## Not covered (follow up)
 
 * Rust side (`ostrel_crdt`), server merge and the real wire format of
@@ -82,5 +106,5 @@ values come from the `bench/` harness on GitHub Actions.
 * Fugue: the sequence CRDT here is RGA with tombstones, enough for the cost class, not the
   algorithm of 5.2.
 * IndexedDB writes of received ops, WebSocket framing, three browser clients, re-scoping and
-  `Held` diffing (risk 3 of ARCHITECTURE 16), large `Set` tag lists (risk 7).
+  `Held` diffing (risk 3 of ARCHITECTURE 16).
 * CPU throttling and the 4G variant of MEASUREMENT 3.

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { initialRank, rankBetween } from '../src/rank.mjs';
+import { initialRank, isRank, rankBetween } from '../src/rank.mjs';
 import { rng } from '../src/workload.mjs';
 
 test('initial ranks are strictly increasing', () => {
@@ -27,4 +27,12 @@ test('rankBetween returns a key strictly between its bounds', () => {
 test('adjacent and equal bounds still give a key above the lower bound', () => {
   assert.ok(rankBetween('a', 'a1') > 'a' && rankBetween('a', 'a1') < 'a1');
   assert.ok(rankBetween('abc', 'abc') > 'abc');
+});
+
+test('keys ending in 0 are invalid: no key lies directly below them', () => {
+  assert.equal(isRank('a0'), false);
+  assert.equal(isRank(''), false);
+  assert.equal(isRank('a1'), true);
+  assert.throws(() => rankBetween('a', 'a0'), RangeError);
+  assert.throws(() => rankBetween('a0', null), RangeError);
 });

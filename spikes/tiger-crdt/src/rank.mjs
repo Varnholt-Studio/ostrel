@@ -7,9 +7,18 @@ function digit(s, i) {
   return ALPHABET.indexOf(s[i]);
 }
 
+// A valid key is non empty, uses only ALPHABET and does not end in '0'. A key ending in
+// '0' has no key directly below it (nothing lies between 'a' and 'a0'), so it is refused
+// both here and in decode.
+export function isRank(s) {
+  return typeof s === 'string' && /^[0-9a-z]+$/.test(s) && s.at(-1) !== '0';
+}
+
 // Returns a key strictly between `lo` and `hi`. `lo` may be '' (no lower bound) and
 // `hi` may be null (no upper bound). Requires lo < hi.
 export function rankBetween(lo, hi) {
+  if (lo !== '' && !isRank(lo)) throw new RangeError('invalid lower rank ' + lo);
+  if (hi !== null && !isRank(hi)) throw new RangeError('invalid upper rank ' + hi);
   // Two rows may share a key (ties are broken by row id); then any key above `lo` will do.
   if (hi !== null && lo >= hi) hi = null;
   let out = '';

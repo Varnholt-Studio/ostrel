@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { decodeOps } from '../src/decode.mjs';
 import { STATUSES } from '../src/schema.mjs';
-import { Store } from '../src/store.mjs';
-import { backgroundEdit, Editor, makeDataset, message, rng, SEED_HLC, SEED_REPLICA } from '../src/workload.mjs';
+import { BatchError, Store } from '../src/store.mjs';
+import { backgroundEdit, Editor, makeDataset, message, relay, rng, SEED_HLC, SEED_REPLICA } from '../src/workload.mjs';
 
 function setup(count) {
   const store = new Store();
@@ -46,10 +46,64 @@ test('last writer wins by HLC regardless of arrival order, replays are skipped',
   const e3 = new Editor(3);
   const x = e2.op(e2.wall + 5, row, 'status', 'set', { v: 'done' });
   const y = e3.op(e3.wall + 1, row, 'status', 'set', { v: 'review' });
-  a.store.invalidate(a.store.apply([x, y]));
-  b.store.invalidate(b.store.apply([y, x]));
+  const toA = relay([x, y]);
+  a.store.invalidate(a.store.apply(toA));
+  b.store.invalidate(b.store.apply(relay([y, x])));
   assert.equal(a.store.rows.get(row).status.v, 'done');
   assert.equal(b.store.rows.get(row).status.v, 'done');
-  const touched = a.store.apply([x]);
+  const touched = a.store.apply([toA[0]]);
   assert.equal(touched.size, 0);
+});
+
+test('a redelivered add after its remove does not bring the element back (D62)', () => {
+  const { store, rows } = setup(5);
+  const row = rows[0];
+  const ed = new Editor(2);
+  const [add] = relay([ed.op(ed.wall + 1, row.id, 'labels', 'sadd', { e: 'zz' })]);
+  store.apply([add]);
+  assert.ok(row.labels.has('zz'));
+  const [rem] = relay([ed.op(ed.wall + 1, row.id, 'labels', 'srem', { e: 'zz', tags: row.labels.observed('zz') })]);
+  store.apply([rem]);
+  // Reconnect overlap: catch up resends the add with its original ServerSeq.
+  const touched = store.apply(decodeOps(message([add])));
+  assert.equal(touched.size, 0);
+  assert.equal(row.labels.has('zz'), false);
+});
+
+test('ops are deduplicated by ServerSeq, not by the sending replica seq', () => {
+  const { store, rows } = setup(5);
+  const row = rows[1];
+  const ed = new Editor(2);
+  const earlier = ed.op(ed.wall + 1, row.id, 'assignee', 'set', { v: 'user7' });
+  const later = ed.op(ed.wall + 1, row.id, 'title', 'set', { v: 'second title of this row' });
+  // The log may hold a replica's ops out of seq order or with a gap (for example after a
+  // split outbox drain); every log position is applied exactly once.
+  store.apply(relay([later]));
+  const touched = store.apply(relay([earlier]));
+  assert.equal(touched.size, 1);
+  assert.equal(row.assignee.v, 'user7');
+});
+
+test('a batch with an unknown text reference is refused as a whole', () => {
+  const { store, rows } = setup(5);
+  const row = rows[2];
+  const ed = new Editor(2);
+  const before = { status: row.status.v, desc: row.desc.text(), mark: store.appliedServerSeq };
+  const bad = relay([
+    ed.op(ed.wall + 1, row.id, 'status', 'set', { v: before.status === 'done' ? 'todo' : 'done' }),
+    ed.op(ed.wall + 1, row.id, 'desc', 'ins', { after: null, c: 9000, s: 'x' }),
+    ed.op(ed.wall + 1, row.id, 'desc', 'del', { at: 'ffffffff' + ed.replica }),
+  ]);
+  assert.throws(() => store.apply(bad), BatchError);
+  assert.equal(row.status.v, before.status);
+  assert.equal(row.desc.text(), before.desc);
+  assert.equal(store.appliedServerSeq, before.mark);
+  // A delete of an element inserted earlier in the same batch is fine.
+  const ok = relay([
+    ed.op(ed.wall + 1, row.id, 'desc', 'ins', { after: null, c: 9001, s: 'y' }),
+    ed.op(ed.wall + 1, row.id, 'desc', 'del', { at: (9001).toString(16).padStart(8, '0') + ed.replica }),
+  ]);
+  store.apply(ok);
+  assert.equal(row.desc.text(), before.desc);
+  assert.equal(store.appliedServerSeq, ok[1].ss);
 });
