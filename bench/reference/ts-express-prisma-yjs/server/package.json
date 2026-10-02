@@ -1,0 +1,22 @@
+{
+  "name": "ref-a-server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.6" },
+  "scripts": {
+    "generate": "prisma generate",
+    "migrate": "prisma migrate deploy",
+    "start": "node --experimental-strip-types src/main.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "express": "5.2.1",
+    "y-websocket": "1.5.4",
+    "yjs": "13.6.33"
+  },
+  "devDependencies": {
+    "prisma": "6.19.3"
+  }
+}
