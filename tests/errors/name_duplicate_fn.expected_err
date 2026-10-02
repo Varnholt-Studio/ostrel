@@ -1,0 +1,1 @@
+tests/errors/name_duplicate_fn.ostl:4:4: error[E0201]: function `f` is already declared

@@ -1,0 +1,1 @@
+tests/errors/lex_column_counts_scalars.ostl:2:21: error[E0008]: unexpected character `@`

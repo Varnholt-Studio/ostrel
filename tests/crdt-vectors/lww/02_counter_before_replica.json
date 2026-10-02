@@ -1,0 +1,13 @@
+{
+  "strategy": "lww",
+  "description": "At equal wall time the counter decides before the replica id.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000001000000000000000a", "op": { "set": "late" } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568000000000000000000000b", "op": { "set": "early" } }
+  ],
+  "deliveries": [[0, 1], [1, 0]],
+  "expect": {
+    "value": "late",
+    "state": { "hlc": "018bcfe568000001000000000000000a", "value": "late" }
+  }
+}

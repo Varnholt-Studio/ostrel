@@ -1,0 +1,1 @@
+tests/errors/entry_main_result.ostl:1:11: error[E0402]: `fn main` returns nothing; remove the result type

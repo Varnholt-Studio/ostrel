@@ -1,0 +1,1 @@
+tests/errors/parse_colon_block_head.ostl:3:11: error[E0023]: block heads have no `:`; remove it and indent the block

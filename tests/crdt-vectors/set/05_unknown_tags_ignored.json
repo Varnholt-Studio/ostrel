@@ -1,0 +1,16 @@
+{
+  "strategy": "set",
+  "description": "A remove ignores tags the replica never received, including a remove of an element that is not present.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "add": "x" } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568010000000000000000000b",
+      "op": { "remove": "x", "tags": ["000000000000000a00000001", "000000000000000c00000009"] } },
+    { "id": "000000000000000b00000002", "hlc": "018bcfe568010001000000000000000b",
+      "op": { "remove": "z", "tags": ["000000000000000c00000005"] } }
+  ],
+  "deliveries": [[0, 1, 2], [2, 0, 1]],
+  "expect": {
+    "value": [],
+    "state": []
+  }
+}

@@ -18,6 +18,10 @@ name = "ostrel_core"
 version = "0.0.0"
 
 [[package]]
+name = "ostrel_db"
+version = "0.0.0"
+
+[[package]]
 name = "ostrel_ir"
 version = "0.0.0"
 dependencies = [
