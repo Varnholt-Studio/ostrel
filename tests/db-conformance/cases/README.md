@@ -34,8 +34,9 @@ every other character is written as a JSON escape.
 * Rows: `{id, version, fields}`; the fields of a returned row are compared as a map by `FieldId`.
 * `row` and `id` are `RowId` values as decimal strings (u128 does not fit a JSON number). `fields`
   is an object from `FieldId` (as string) to a value.
-* Values: `null` (none), `true` or `false`, `{"int": "<decimal>"}` (i64 as string),
-  `{"text": "..."}`, or `{"text_repeat": ["<unit>", count]}` for the unit repeated `count` times.
+* Values: `null` (none), `true` or `false`, `{"int": "<decimal>"}` (an `Int` as string, at most
+  2^53 - 1 in magnitude, ARCHITECTURE 7.4), `{"text": "..."}`, or
+  `{"text_repeat": ["<unit>", count]}` for the unit repeated `count` times.
 
 ## Not covered yet
 

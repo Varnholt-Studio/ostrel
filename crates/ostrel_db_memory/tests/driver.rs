@@ -2,14 +2,17 @@
 //!
 //! The adapter independent conformance suite lives in `tests/db-conformance/`; these tests cover
 //! the same rules at the Rust level plus what is specific to this driver (URL, shared database,
-//! first committer wins, failed transactions, order of mixed and missing values).
+//! first committer wins, failed transactions, order of mixed and missing values, the applied
+//! schema shared by all connections).
 
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
 use ostrel_db::api::{
-    Connection, DbError, Dir, Driver, FieldId, MigrationPlan, ModelId, Query, RowId, Rows,
-    ServerSeq, StoredOp, Value, Write,
+    AppliedSchema, CmpOp, CollectionChange, CollectionState, Connection, Cursor, DbError, Dir,
+    Driver, EnumColumn, Expr, FieldId, Hlc, Hop, MapEntry, MigrationPlan, ModelId, NewOp, OpId,
+    Path, Query, ReplicaId, RowId, Rows, SchemaHash, ServerSeq, SetChange, SetTag, StoredOp, Value,
+    Write,
 };
 use ostrel_db_memory::MemoryDriver;
 
@@ -34,9 +37,86 @@ fn all(model: ModelId) -> Query {
 
 fn query(model: ModelId, order: Vec<(FieldId, Dir)>, limit: Option<u32>) -> Query {
     Query {
-        model,
         order,
         limit,
+        ..Query::all(model)
+    }
+}
+
+fn filtered(model: ModelId, filter: Expr) -> Query {
+    Query {
+        filter: Some(filter),
+        ..Query::all(model)
+    }
+}
+
+/// The row id with the raw value `n`. Ids have no constructor from a raw `u128`, so the test
+/// goes through the wire form.
+fn rid(n: u128) -> RowId {
+    RowId::from_hex(&format!("{n:032x}")).unwrap()
+}
+
+/// Range of `Int` (ARCHITECTURE 7.4).
+const INT_MAX: i64 = (1 << 53) - 1;
+const INT_MIN: i64 = -INT_MAX;
+
+fn int(v: i64) -> Value {
+    Value::int(v).unwrap()
+}
+
+fn en(name: &str) -> Value {
+    Value::Enum(name.to_string())
+}
+
+fn field(f: FieldId) -> Box<Expr> {
+    Box::new(Expr::Field(Path {
+        hops: vec![],
+        field: f,
+    }))
+}
+
+fn konst(v: Value) -> Box<Expr> {
+    Box::new(Expr::Const(v))
+}
+
+fn plan(from: Option<u8>, to: u8) -> MigrationPlan {
+    MigrationPlan {
+        from: from.map(|b| SchemaHash([b; 32])),
+        to: SchemaHash([to; 32]),
+        schema: format!("{{\"v\":{to}}}"),
+        enums: vec![],
+        steps: vec![],
+    }
+}
+
+fn strings(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| n.to_string()).collect()
+}
+
+/// Model 1 field 0 is an enum (backlog, todo, done) whose declaration order differs from the
+/// name order; model 1 field 3 is a `Map` with enum values (guest, member, admin).
+fn enum_plan() -> MigrationPlan {
+    MigrationPlan {
+        enums: vec![
+            EnumColumn {
+                model: 1,
+                field: 0,
+                variants: strings(&["backlog", "todo", "done"]),
+            },
+            EnumColumn {
+                model: 1,
+                field: 3,
+                variants: strings(&["guest", "member", "admin"]),
+            },
+        ],
+        ..plan(None, 1)
+    }
+}
+
+fn tag(replica: u64, seq: u32) -> OpId {
+    OpId {
+        replica: ReplicaId(replica),
+        seq,
     }
 }
 
@@ -47,30 +127,32 @@ fn text(s: &str) -> Value {
 fn insert(model: ModelId, row: u128, fields: Vec<(FieldId, Value)>) -> Write {
     Write::Insert {
         model,
-        row: RowId(row),
+        row: rid(row),
         fields,
+        collections: vec![],
     }
 }
 
 fn update(model: ModelId, row: u128, v: u64, fields: Vec<(FieldId, Value)>) -> Write {
     Write::Update {
         model,
-        row: RowId(row),
+        row: rid(row),
         expect_version: v,
         fields,
+        collections: vec![],
     }
 }
 
 fn delete(model: ModelId, row: u128, v: u64) -> Write {
     Write::Delete {
         model,
-        row: RowId(row),
+        row: rid(row),
         expect_version: v,
     }
 }
 
 fn ids(rows: Rows) -> Vec<u128> {
-    rows.0.iter().map(|r| r.id.0).collect()
+    rows.0.iter().map(|r| r.id.as_u128()).collect()
 }
 
 /// Commits `writes` in one transaction on `conn`.
@@ -100,7 +182,7 @@ fn name_capabilities_and_url_scheme() {
 #[test]
 fn empty_migration_succeeds() {
     let mut conn = connect();
-    assert_eq!(block_on(conn.migrate(&MigrationPlan::default())), Ok(()));
+    assert_eq!(block_on(conn.migrate(&plan(None, 1))), Ok(()));
 }
 
 #[test]
@@ -192,18 +274,15 @@ fn update_changes_only_listed_fields_and_bumps_version() {
     let mut conn = connect();
     commit(
         &mut conn,
-        &[insert(1, 1, vec![(0, text("a")), (1, Value::Int(1))])],
+        &[insert(1, 1, vec![(0, text("a")), (1, int(1))])],
     );
     commit(
         &mut conn,
-        &[
-            update(1, 1, 1, vec![(1, Value::Int(2))]),
-            update(1, 1, 2, vec![]),
-        ],
+        &[update(1, 1, 1, vec![(1, int(2))]), update(1, 1, 2, vec![])],
     );
     let rows = block_on(conn.query(&all(1))).unwrap().0;
     assert_eq!(rows[0].version, 3);
-    assert_eq!(rows[0].fields, vec![(0, text("a")), (1, Value::Int(2))]);
+    assert_eq!(rows[0].fields, vec![(0, text("a")), (1, int(2))]);
 }
 
 #[test]
@@ -212,14 +291,14 @@ fn values_round_trip_unchanged() {
     let values = vec![
         (0, Value::Null),
         (1, Value::Bool(true)),
-        (2, Value::Int(i64::MIN)),
-        (3, Value::Int(i64::MAX)),
+        (2, int(INT_MIN)),
+        (3, int(INT_MAX)),
         (4, text("\u{0}\u{1}'; DROP TABLE x; --\"\\%_\u{10FFFF}")),
         (5, Value::Text("x".repeat(1 << 20))),
     ];
     commit(&mut conn, &[insert(1, u128::MAX, values.clone())]);
     let rows = block_on(conn.query(&all(1))).unwrap().0;
-    assert_eq!(rows[0].id, RowId(u128::MAX));
+    assert_eq!(rows[0].id, rid(u128::MAX));
     assert_eq!(rows[0].fields, values);
 }
 
@@ -302,10 +381,10 @@ fn query_order_ties_limits_and_models() {
     commit(
         &mut conn,
         &[
-            insert(1, 3, vec![(0, Value::Int(1)), (1, text("b"))]),
-            insert(1, 1, vec![(0, Value::Int(2)), (1, text("a"))]),
-            insert(1, 2, vec![(0, Value::Int(1)), (1, text("a"))]),
-            insert(2, 9, vec![(0, Value::Int(0))]),
+            insert(1, 3, vec![(0, int(1)), (1, text("b"))]),
+            insert(1, 1, vec![(0, int(2)), (1, text("a"))]),
+            insert(1, 2, vec![(0, int(1)), (1, text("a"))]),
+            insert(2, 9, vec![(0, int(0))]),
         ],
     );
     let mut q = |order, limit| block_on(conn.query(&query(1, order, limit))).map(ids);
@@ -354,7 +433,7 @@ fn null_and_missing_sort_first_then_bool_int_text() {
         &mut conn,
         &[
             insert(1, 1, vec![(0, text("a"))]),
-            insert(1, 2, vec![(0, Value::Int(-1))]),
+            insert(1, 2, vec![(0, int(-1))]),
             insert(1, 3, vec![(0, Value::Bool(true))]),
             insert(1, 4, vec![(0, Value::Null)]),
             insert(1, 5, vec![]),
@@ -367,36 +446,29 @@ fn null_and_missing_sort_first_then_bool_int_text() {
 }
 
 #[test]
-fn op_log_positions_boundaries_and_rollback() {
+fn op_log_positions_boundaries_duplicates_and_rollback() {
     let mut conn = connect();
-    let op = |row| StoredOp {
-        seq: None,
+    let op = |seq: u32| NewOp {
+        id: tag(1, seq),
+        hlc: Hlc::new(u64::from(seq), 0, ReplicaId(1)).unwrap(),
         model: 1,
-        row: RowId(row),
-        payload: vec![row as u8],
+        row: rid(u128::from(seq)),
+        body: vec![seq as u8],
     };
     block_on(async {
         let mut tx = conn.begin().await.unwrap();
         assert_eq!(tx.append_ops(&[]).await, Ok(ServerSeq(0)));
         assert_eq!(tx.ops_since(ServerSeq(0), 10).await, Ok(vec![]));
         assert_eq!(tx.append_ops(&[op(1), op(2)]).await, Ok(ServerSeq(2)));
-        // A position given by the caller is replaced by the driver's.
-        let given = StoredOp {
-            seq: Some(ServerSeq(99)),
-            ..op(3)
-        };
-        assert_eq!(tx.append_ops(&[given]).await, Ok(ServerSeq(3)));
+        assert_eq!(tx.append_ops(&[op(3)]).await, Ok(ServerSeq(3)));
         tx.commit().await.unwrap();
 
         let mut tx = conn.begin().await.unwrap();
-        let seqs = |ops: Vec<StoredOp>| ops.iter().map(|o| o.seq.map(|s| s.0)).collect::<Vec<_>>();
+        let seqs = |ops: Vec<StoredOp>| ops.iter().map(|o| o.seq.0).collect::<Vec<_>>();
         let all_ops = tx.ops_since(ServerSeq(0), 10).await.unwrap();
-        assert_eq!(seqs(all_ops.clone()), vec![Some(1), Some(2), Some(3)]);
-        assert_eq!(all_ops[2].payload, vec![3]);
-        assert_eq!(
-            seqs(tx.ops_since(ServerSeq(1), 1).await.unwrap()),
-            vec![Some(2)]
-        );
+        assert_eq!(seqs(all_ops.clone()), vec![1, 2, 3]);
+        assert_eq!(all_ops[2].op, op(3));
+        assert_eq!(seqs(tx.ops_since(ServerSeq(1), 1).await.unwrap()), vec![2]);
         assert_eq!(tx.ops_since(ServerSeq(0), 0).await, Ok(vec![]));
         assert_eq!(tx.ops_since(ServerSeq(3), 10).await, Ok(vec![]));
         assert_eq!(
@@ -406,8 +478,20 @@ fn op_log_positions_boundaries_and_rollback() {
         assert_eq!(tx.append_ops(&[op(4)]).await, Ok(ServerSeq(4)));
         tx.rollback().await.unwrap();
 
+        // An id already in the log, or twice in one call, appends nothing of the call.
+        for ops in [vec![op(5), op(2)], vec![op(5), op(6), op(5)]] {
+            let mut tx = conn.begin().await.unwrap();
+            assert_eq!(tx.append_ops(&ops).await, Err(DbError::Conflict));
+            tx.rollback().await.unwrap();
+        }
         let mut tx = conn.begin().await.unwrap();
         assert_eq!(tx.append_ops(&[]).await, Ok(ServerSeq(3)));
+        // The same seq of another replica is another op.
+        let other = NewOp {
+            id: tag(2, 1),
+            ..op(1)
+        };
+        assert_eq!(tx.append_ops(&[other]).await, Ok(ServerSeq(4)));
         tx.rollback().await.unwrap();
     });
 }
@@ -431,4 +515,442 @@ fn sequences_are_per_key_and_rolled_back_numbers_may_return() {
         assert_eq!(tx.next_in_sequence("Team/1/key").await, Ok(3));
         tx.commit().await.unwrap();
     });
+}
+
+#[test]
+fn applied_schema_and_enum_columns_are_shared_by_all_connections() {
+    let driver = MemoryDriver::new();
+    let mut a = block_on(driver.connect("memory:")).unwrap();
+    block_on(async {
+        assert_eq!(a.applied_schema().await, Ok(None));
+        assert_eq!(
+            a.migrate(&plan(Some(1), 2)).await,
+            Err(DbError::SchemaMismatch)
+        );
+        assert_eq!(a.applied_schema().await, Ok(None));
+        a.migrate(&enum_plan()).await.unwrap();
+        // A plan that breaks the plan rules is refused before the schema is compared.
+        let mut twice = enum_plan();
+        twice.from = Some(SchemaHash([1; 32]));
+        twice.enums.push(twice.enums[0].clone());
+        assert!(matches!(a.migrate(&twice).await, Err(DbError::Invalid(_))));
+    });
+    // A connection opened after the migration sees schema and enum columns (D87).
+    let mut b = block_on(driver.connect("memory:")).unwrap();
+    block_on(async {
+        let applied = AppliedSchema {
+            hash: SchemaHash([1; 32]),
+            schema: "{\"v\":1}".to_string(),
+        };
+        assert_eq!(b.applied_schema().await, Ok(Some(applied.clone())));
+        let mut tx = b.begin().await.unwrap();
+        assert!(matches!(
+            tx.apply(&[insert(1, 1, vec![(0, en("nope"))])]).await,
+            Err(DbError::Invalid(_))
+        ));
+        tx.rollback().await.unwrap();
+
+        // A no op plan changes nothing, not even with other text and no enum columns.
+        let noop = MigrationPlan {
+            schema: "other".to_string(),
+            ..plan(Some(1), 1)
+        };
+        assert_eq!(b.migrate(&noop).await, Ok(()));
+        assert_eq!(a.applied_schema().await, Ok(Some(applied)));
+        let mut tx = a.begin().await.unwrap();
+        assert!(matches!(
+            tx.apply(&[insert(1, 1, vec![(0, en("nope"))])]).await,
+            Err(DbError::Invalid(_))
+        ));
+        tx.rollback().await.unwrap();
+
+        // The next plan replaces the enum columns.
+        b.migrate(&plan(Some(1), 2)).await.unwrap();
+        let mut tx = a.begin().await.unwrap();
+        tx.apply(&[insert(1, 1, vec![(0, en("nope"))])])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn a_migration_ends_open_writing_transactions() {
+    let driver = MemoryDriver::new();
+    let mut a = block_on(driver.connect("memory:")).unwrap();
+    let mut b = block_on(driver.connect("memory:")).unwrap();
+    block_on(async {
+        let mut tx = a.begin().await.unwrap();
+        tx.apply(&[insert(1, 1, vec![])]).await.unwrap();
+        b.migrate(&enum_plan()).await.unwrap();
+        // Committing would write the copied, unmigrated schema back.
+        assert!(matches!(tx.commit().await, Err(DbError::Backend(_))));
+        assert!(b.applied_schema().await.unwrap().is_some());
+        assert!(b.query(&all(1)).await.unwrap().0.is_empty());
+    });
+}
+
+#[test]
+fn rows_sort_enums_by_declaration_and_bytes_bytewise() {
+    let mut conn = connect();
+    block_on(conn.migrate(&enum_plan())).unwrap();
+    commit(
+        &mut conn,
+        &[
+            insert(1, 1, vec![(0, en("done")), (1, Value::Bytes(vec![0xF8]))]),
+            insert(
+                1,
+                2,
+                vec![(0, en("backlog")), (1, Value::Bytes(vec![0x00]))],
+            ),
+            insert(1, 3, vec![(0, en("todo")), (1, Value::Bytes(vec![]))]),
+            insert(1, 4, vec![(0, Value::Null)]),
+        ],
+    );
+    let mut by = |f, d| block_on(conn.query(&query(1, vec![(f, d)], None))).map(ids);
+    assert_eq!(by(0, Dir::Asc), Ok(vec![4, 2, 3, 1]));
+    assert_eq!(by(0, Dir::Desc), Ok(vec![1, 3, 2, 4]));
+    assert_eq!(by(1, Dir::Asc), Ok(vec![4, 3, 2, 1]));
+    assert_eq!(by(1, Dir::Desc), Ok(vec![1, 2, 3, 4]));
+
+    let page = Query {
+        after: Some(Cursor {
+            values: vec![en("todo")],
+            id: rid(3),
+        }),
+        ..query(1, vec![(0, Dir::Asc)], None)
+    };
+    assert_eq!(block_on(conn.query(&page)).map(ids), Ok(vec![1]));
+    let ge = filtered(1, Expr::Cmp(CmpOp::Ge, field(0), konst(en("todo"))));
+    assert_eq!(block_on(conn.query(&ge)).map(ids), Ok(vec![1, 3]));
+    let unknown = filtered(1, Expr::Cmp(CmpOp::Ge, field(0), konst(en("nope"))));
+    assert_eq!(block_on(conn.query(&unknown)).map(ids), Ok(vec![]));
+    // Two enum columns with different variants cannot be compared (D87).
+    let get = Box::new(Expr::MapGet {
+        map: Path {
+            hops: vec![],
+            field: 3,
+        },
+        key: konst(Value::Ref(rid(9))),
+    });
+    let mixed = filtered(1, Expr::Cmp(CmpOp::Lt, field(0), get));
+    assert!(matches!(
+        block_on(conn.query(&mixed)),
+        Err(DbError::Invalid(_))
+    ));
+}
+
+#[test]
+fn cursor_pages_return_every_row_once_also_after_the_cursor_row_is_gone() {
+    let mut conn = connect();
+    // Model 1 is paged ascending, model 2 descending; ids are never reused across models.
+    for (model, base) in [(1, 0), (2, 100)] {
+        let rows: Vec<Write> = (1..=7)
+            .map(|i| insert(model, base + i, vec![(0, int((i % 3) as i64))]))
+            .collect();
+        commit(&mut conn, &rows);
+    }
+    for (model, base, dir) in [(1, 0, Dir::Asc), (2, 100, Dir::Desc)] {
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let q = Query {
+                after: after.clone(),
+                ..query(model, vec![(0, dir)], Some(2))
+            };
+            let page = block_on(conn.query(&q)).unwrap().0;
+            let Some(last) = page.last() else { break };
+            after = Some(Cursor {
+                values: vec![last.fields[0].1.clone()],
+                id: last.id,
+            });
+            seen.extend(page.iter().map(|r| r.id.as_u128()));
+            // Deleting the row the cursor points at must not lose or repeat rows.
+            commit(&mut conn, &[delete(model, last.id.as_u128(), last.version)]);
+        }
+        let mut expect: Vec<u128> = (1..=7).map(|i| base + i).collect();
+        expect.sort_by_key(|i| ((i - base) % 3, *i));
+        if dir == Dir::Desc {
+            expect.reverse();
+        }
+        assert_eq!(seen, expect, "{dir:?}");
+    }
+    // A cursor with the wrong number of values is refused.
+    let bad = Query {
+        after: Some(Cursor {
+            values: vec![],
+            id: rid(1),
+        }),
+        ..query(1, vec![(0, Dir::Asc)], None)
+    };
+    assert!(matches!(
+        block_on(conn.query(&bad)),
+        Err(DbError::Invalid(_))
+    ));
+}
+
+#[test]
+fn filters_are_two_valued_and_fail_closed_on_broken_hops() {
+    let mut conn = connect();
+    commit(
+        &mut conn,
+        &[
+            insert(2, 10, vec![(0, text("alice"))]),
+            insert(2, 11, vec![(0, text("bob"))]),
+            insert(1, 1, vec![(0, Value::Ref(rid(10))), (1, int(5))]),
+            insert(1, 2, vec![(0, Value::Ref(rid(11))), (1, Value::Null)]),
+            insert(1, 3, vec![(0, Value::Null), (1, int(7))]),
+            insert(1, 4, vec![(0, Value::Ref(rid(12))), (1, int(9))]),
+        ],
+    );
+    let owner = |f| {
+        Box::new(Expr::Field(Path {
+            hops: vec![Hop { field: 0, model: 2 }],
+            field: f,
+        }))
+    };
+    let q =
+        |conn: &mut Box<dyn Connection>, e: Expr| block_on(conn.query(&filtered(1, e))).map(ids);
+    assert_eq!(
+        q(
+            &mut conn,
+            Expr::Cmp(CmpOp::Eq, owner(0), konst(text("alice")))
+        ),
+        Ok(vec![1])
+    );
+    // Not of a comparison with Null is true; a broken hop is false also under Not and Or.
+    assert_eq!(
+        q(
+            &mut conn,
+            Expr::Not(Box::new(Expr::Cmp(CmpOp::Gt, field(1), konst(int(6)))))
+        ),
+        Ok(vec![1, 2])
+    );
+    assert_eq!(
+        q(
+            &mut conn,
+            Expr::Not(Box::new(Expr::Cmp(
+                CmpOp::Eq,
+                owner(0),
+                konst(text("alice"))
+            )))
+        ),
+        Ok(vec![2])
+    );
+    assert_eq!(
+        q(
+            &mut conn,
+            Expr::Or(vec![
+                Expr::Cmp(CmpOp::Eq, owner(0), konst(text("x"))),
+                Expr::Cmp(CmpOp::Ge, field(1), konst(int(0))),
+            ])
+        ),
+        Ok(vec![1])
+    );
+    assert_eq!(
+        q(
+            &mut conn,
+            Expr::Cmp(
+                CmpOp::Eq,
+                Box::new(Expr::RowId(vec![Hop { field: 0, model: 2 }])),
+                konst(Value::Ref(rid(11)))
+            )
+        ),
+        Ok(vec![2])
+    );
+    assert_eq!(
+        q(
+            &mut conn,
+            Expr::Cmp(
+                CmpOp::Eq,
+                Box::new(Expr::Coalesce(field(1), int(0))),
+                konst(int(0))
+            )
+        ),
+        Ok(vec![2])
+    );
+    assert_eq!(q(&mut conn, Expr::And(vec![])), Ok(vec![1, 2, 3, 4]));
+    assert_eq!(q(&mut conn, Expr::Or(vec![])), Ok(vec![]));
+    assert_eq!(q(&mut conn, Expr::Const(int(1))), Ok(vec![]));
+    // A hostile filter is refused before it is evaluated, however deep it is nested.
+    let deep = (0..200_000).fold(Expr::Const(Value::Bool(true)), |e, _| {
+        Expr::Not(Box::new(e))
+    });
+    let mut hostile = filtered(1, deep);
+    let refused = block_on(conn.query(&hostile));
+    // Drop the deep filter iteratively; the derived drop recurses once per level (F1 of T69).
+    let mut stack: Vec<Expr> = hostile.filter.take().into_iter().collect();
+    while let Some(e) = stack.pop() {
+        if let Expr::Not(inner) = e {
+            stack.push(*inner);
+        }
+    }
+    assert!(matches!(refused, Err(DbError::Invalid(_))));
+}
+
+#[test]
+fn set_tags_and_map_entries_are_stored_as_the_contract_says() {
+    let mut conn = connect();
+    let stamp = |n| Hlc::new(n, 0, ReplicaId(1)).unwrap();
+    let set = |changes| (1, CollectionChange::Set(changes));
+    let add = |e: &str, r, q| SetChange::Add {
+        elem: text(e),
+        tag: tag(r, q),
+    };
+    let remove = |e: &str, r, q| SetChange::Remove {
+        elem: text(e),
+        tag: tag(r, q),
+    };
+    let entry = |k: &str, v: Option<i64>, n| MapEntry {
+        key: text(k),
+        value: v.map(int),
+        hlc: stamp(n),
+    };
+    let write = |v, collections| Write::Update {
+        model: 1,
+        row: rid(1),
+        expect_version: v,
+        fields: vec![],
+        collections,
+    };
+    commit(
+        &mut conn,
+        &[Write::Insert {
+            model: 1,
+            row: rid(1),
+            fields: vec![],
+            collections: vec![set(vec![add("b", 1, 1), add("a", 2, 1)])],
+        }],
+    );
+    commit(
+        &mut conn,
+        &[
+            // Replay of an older add of replica 1 is ignored, a newer one replaces it.
+            write(1, vec![set(vec![add("b", 1, 1), add("b", 1, 3)])]),
+            // A remove of the replaced tag is ignored; the live one of replica 2 goes.
+            write(2, vec![set(vec![remove("b", 1, 1), remove("a", 2, 1)])]),
+            write(
+                3,
+                vec![(
+                    2,
+                    CollectionChange::Map(vec![entry("y", Some(1), 1), entry("x", Some(2), 1)]),
+                )],
+            ),
+            write(
+                4,
+                vec![(2, CollectionChange::Map(vec![entry("y", None, 2)]))],
+            ),
+        ],
+    );
+    let rows = block_on(conn.query(&all(1))).unwrap().0;
+    assert_eq!(rows[0].version, 5);
+    assert_eq!(
+        rows[0].collections,
+        vec![
+            (
+                1,
+                CollectionState::Set(vec![SetTag {
+                    elem: text("b"),
+                    tag: tag(1, 3),
+                }])
+            ),
+            (
+                2,
+                CollectionState::Map(vec![entry("x", Some(2), 1), entry("y", None, 2)])
+            ),
+        ]
+    );
+    let in_set = |e: &str| Expr::InSet {
+        elem: konst(text(e)),
+        set: Path {
+            hops: vec![],
+            field: 1,
+        },
+    };
+    let in_map = |k: &str| Expr::InMap {
+        key: konst(text(k)),
+        map: Path {
+            hops: vec![],
+            field: 2,
+        },
+    };
+    let mut q = |e| block_on(conn.query(&filtered(1, e))).map(ids);
+    assert_eq!(q(in_set("b")), Ok(vec![1]));
+    assert_eq!(q(in_set("a")), Ok(vec![]));
+    assert_eq!(q(in_map("x")), Ok(vec![1]));
+    assert_eq!(q(in_map("y")), Ok(vec![]));
+}
+
+#[test]
+fn refused_writes_change_nothing() {
+    let mut conn = connect();
+    block_on(conn.migrate(&enum_plan())).unwrap();
+    commit(&mut conn, &[insert(1, 1, vec![(0, en("todo"))])]);
+    let entry = |v: Value| MapEntry {
+        key: text("k"),
+        value: Some(v),
+        hlc: Hlc::new(1, 0, ReplicaId(1)).unwrap(),
+    };
+    let refused = [
+        // Field twice in one write.
+        Write::Update {
+            model: 1,
+            row: rid(1),
+            expect_version: 1,
+            fields: vec![(1, int(1)), (1, int(2))],
+            collections: vec![],
+        },
+        // Set value in a column.
+        update(1, 1, 1, vec![(1, Value::Set(vec![]))]),
+        // Remove in an insert.
+        Write::Insert {
+            model: 1,
+            row: rid(2),
+            fields: vec![],
+            collections: vec![(
+                2,
+                CollectionChange::Set(vec![SetChange::Remove {
+                    elem: int(1),
+                    tag: tag(1, 1),
+                }]),
+            )],
+        },
+        // Undeclared variant in an enum column and as an enum map value.
+        update(1, 1, 1, vec![(0, en("nope"))]),
+        update(1, 1, 1, vec![(0, text("todo"))]),
+        Write::Update {
+            model: 1,
+            row: rid(1),
+            expect_version: 1,
+            fields: vec![],
+            collections: vec![(3, CollectionChange::Map(vec![entry(en("owner"))]))],
+        },
+    ];
+    for w in refused {
+        block_on(async {
+            let mut tx = conn.begin().await.unwrap();
+            // The valid insert before the refused write is not applied either.
+            let batch = [insert(1, 5, vec![]), w.clone()];
+            assert!(
+                matches!(tx.apply(&batch).await, Err(DbError::Invalid(_))),
+                "{w:?}"
+            );
+            tx.rollback().await.unwrap();
+        });
+    }
+    let rows = block_on(conn.query(&all(1))).unwrap().0;
+    assert_eq!(ids(Rows(rows.clone())), vec![1]);
+    assert_eq!(rows[0].version, 1);
+    // Null and declared variants are accepted, also as map values; set elements are not
+    // checked against the variants (D87).
+    commit(
+        &mut conn,
+        &[Write::Update {
+            model: 1,
+            row: rid(1),
+            expect_version: 1,
+            fields: vec![(0, Value::Null)],
+            collections: vec![(3, CollectionChange::Map(vec![entry(en("admin"))]))],
+        }],
+    );
 }

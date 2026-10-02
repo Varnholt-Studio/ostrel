@@ -23,7 +23,8 @@ fn ac_18_conformance_memory() {
 ```
 
 * `run_dir` takes a closure that returns a connection to a new, empty database on every call.
-  The harness calls `migrate` with an empty plan and runs one case on it.
+  The harness calls `migrate` with `case_plan()` (a new database to a schema without enum
+  columns) and runs one case on it.
 * All connections of one driver share a database, so one driver must not serve two cases.
   `new_driver_per_case` builds a new driver for every case and connects it to the URL. A driver
   that can create an empty database per connection (for example a new schema in PostgreSQL)
@@ -41,7 +42,7 @@ fn ac_18_conformance_memory() {
   `"ok"` is expected, a transaction that succeeds when an error is expected, and a different
   error variant are reported.
 * Each `query` step runs `Connection::query` on committed state and compares the rows in order:
-  id, version, and the fields as a map by `FieldId`. A returned row must have exactly the fields
+  id, version, the fields as a map by `FieldId`, and the collections (none in format 1). A returned row must have exactly the fields
   listed in the expectation, so a driver that drops `None` fields fails.
 * Failures do not stop the run. A failed connect, migrate, begin, commit or rollback ends that
   case; a wrong result does not.

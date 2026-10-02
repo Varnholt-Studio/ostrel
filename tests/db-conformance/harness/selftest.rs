@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use ostrel_db::api::{
-    BoxFuture, Capabilities, Connection, DbError, Dir, Driver, FieldId, MigrationPlan, ModelId,
-    Query, Row, RowId, Rows, ServerSeq, StoredOp, Transaction, Value, Write,
+    AppliedSchema, BoxFuture, Capabilities, Connection, DbError, Dir, Driver, FieldId,
+    MigrationPlan, ModelId, NewOp, Query, Row, RowId, Rows, ServerSeq, StoredOp, Transaction,
+    Value, Write, compare_key,
 };
 
 use super::cases::{self, Expect};
@@ -105,14 +106,10 @@ impl Driver for RefDriver {
 
 fn cmp_value(a: &Value, b: &Value, utf16: bool) -> std::cmp::Ordering {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Text(x), Value::Text(y)) if utf16 => x.encode_utf16().cmp(y.encode_utf16()),
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
-        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-        (Value::Null, _) => std::cmp::Ordering::Less,
-        (_, Value::Null) => std::cmp::Ordering::Greater,
-        _ => std::cmp::Ordering::Equal,
+        // The case files hold Null, Bool, Int and Text only; for them the column order of the
+        // contract is `compare_key`.
+        _ => compare_key(a, b),
     }
 }
 
@@ -124,6 +121,7 @@ fn scan(state: &State, q: &Query, faults: Faults) -> Rows {
             id: *id,
             version: r.version,
             fields: r.fields.iter().map(|(f, v)| (*f, v.clone())).collect(),
+            collections: Vec::new(),
         })
         .collect();
     let get = |r: &Row, f: FieldId| {
@@ -162,7 +160,9 @@ fn store(v: &Value, faults: Faults) -> Value {
 
 fn apply_one(state: &mut State, w: &Write, faults: Faults) -> Result<(), DbError> {
     match w {
-        Write::Insert { model, row, fields } => {
+        Write::Insert {
+            model, row, fields, ..
+        } => {
             if let Some(old) = state.get(row) {
                 let allowed = if old.deleted {
                     faults.reuse_tombstone
@@ -187,6 +187,7 @@ fn apply_one(state: &mut State, w: &Write, faults: Faults) -> Result<(), DbError
             row,
             expect_version,
             fields,
+            ..
         } => {
             let r = live(state, *model, *row)?;
             if r.version != *expect_version {
@@ -230,6 +231,9 @@ impl Connection for RefConn {
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>> {
         Box::pin(async move { Ok(scan(&self.state.borrow(), q, self.faults)) })
     }
+    fn applied_schema<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<AppliedSchema>, DbError>> {
+        Box::pin(async { Err(DbError::Unsupported("applied schema")) })
+    }
     fn begin<'c>(&'c mut self) -> BoxFuture<'c, Result<Box<dyn Transaction<'c> + 'c>, DbError>> {
         Box::pin(async move {
             let work = self.state.borrow().clone();
@@ -251,7 +255,7 @@ impl<'c> Transaction<'c> for RefTx<'c> {
     }
     fn append_ops<'a>(
         &'a mut self,
-        _ops: &'a [StoredOp],
+        _ops: &'a [NewOp],
     ) -> BoxFuture<'a, Result<ServerSeq, DbError>> {
         Box::pin(async { Err(DbError::Unsupported("op log")) })
     }
@@ -286,6 +290,9 @@ impl<'c> Transaction<'c> for RefTx<'c> {
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
+
+/// Largest `Int` (ARCHITECTURE 7.4).
+const INT_MAX: i64 = (1 << 53) - 1;
 
 /// A small suite in format 1 that a correct driver passes. Each case targets one rule, so a
 /// fault in the reference driver breaks a known set of cases.
@@ -572,24 +579,36 @@ fn decode_accepts_int_bounds() {
       "schema": [{"model": 0, "name": "T", "fields": [{"field": 0, "name": "n", "type": "Int"}]}],
       "cases": [{"name": "ac_00_x", "doc": "", "steps": [
         {"tx": [{"insert": {"model": 0, "row": "340282366920938463463374607431768211455",
-          "fields": {"0": {"int": "-9223372036854775808"}}}},
-          {"insert": {"model": 0, "row": "0", "fields": {"0": {"int": "9223372036854775807"}}}}],
+          "fields": {"0": {"int": "-9007199254740991"}}}},
+          {"insert": {"model": 0, "row": "0", "fields": {"0": {"int": "9007199254740991"}}}}],
          "expect": "ok"}]}]}"#;
     let suite = cases::decode(&json::parse(text).unwrap()).unwrap();
     let cases::Action::Tx(writes) = &suite.cases[0].steps[0].action else {
         panic!("not a tx")
     };
+    let max_id = RowId::from_hex(&format!("{:032x}", u128::MAX)).unwrap();
     assert_eq!(
         writes[0],
         Write::Insert {
             model: 0,
-            row: RowId(u128::MAX),
-            fields: vec![(0, Value::Int(i64::MIN))],
+            row: max_id,
+            fields: vec![(0, Value::int(-INT_MAX).unwrap())],
+            collections: vec![],
         }
     );
     assert!(
-        matches!(&writes[1], Write::Insert { fields, .. } if fields[0].1 == Value::Int(i64::MAX))
+        matches!(&writes[1], Write::Insert { fields, .. } if fields[0].1 == Value::int(INT_MAX).unwrap())
     );
+    // One past the range on either side makes the file invalid, as do the i64 bounds.
+    for n in [
+        "9007199254740992",
+        "-9007199254740992",
+        "9223372036854775807",
+        "-9223372036854775808",
+    ] {
+        let err = decode_err(&text.replacen("-9007199254740991", n, 1));
+        assert!(err.contains("not an Int"), "{n}: {err}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -841,5 +860,9 @@ fn new_driver_per_case_passes_the_connect_error_on() {
     let mut report = Report::default();
     block_on(run_text("suite.json", SUITE, &fresh, &mut report));
     assert_eq!(report.failures.len(), 7, "{report}");
-    assert!(report.failures[0].message.contains("connect failed with Unsupported"));
+    assert!(
+        report.failures[0]
+            .message
+            .contains("connect failed with Unsupported")
+    );
 }
