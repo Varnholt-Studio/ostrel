@@ -1,0 +1,208 @@
+/*
+ * Ostrel default theme, version 1.
+ * Tokens: std/theme/tokens.json is the source of truth; the :root blocks below mirror it and
+ * theme.test.mjs keeps both in sync. Selectors use only elements, data and aria attributes and
+ * classes with the reserved o- prefix, so app classes never collide with the theme.
+ */
+
+:root {
+  --ostrel-bg: #ffffff;
+  --ostrel-surface: #f5f6f8;
+  --ostrel-text: #1b1e24;
+  --ostrel-muted: #5c6370;
+  --ostrel-line: #d9dce1;
+  --ostrel-accent: #2f5bd3;
+  --ostrel-accent-text: #ffffff;
+  --ostrel-accent-soft: #e6edfc;
+  --ostrel-danger: #b3261e;
+  --ostrel-font: system-ui, sans-serif;
+  --ostrel-font-mono: ui-monospace, monospace;
+  --ostrel-text-size: 1rem;
+  --ostrel-title-size: 1.25rem;
+  --ostrel-space-1: 0.25rem;
+  --ostrel-space-2: 0.5rem;
+  --ostrel-space-3: 1rem;
+  --ostrel-radius: 0.375rem;
+  --ostrel-side-width: 16rem;
+  --ostrel-pending-opacity: 0.55;
+  --ostrel-shadow: 0 1px 2px #0000001f;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ostrel-bg: #16181d;
+    --ostrel-surface: #1f2229;
+    --ostrel-text: #e8eaee;
+    --ostrel-muted: #a2a9b4;
+    --ostrel-line: #343842;
+    --ostrel-accent: #7b9cf0;
+    --ostrel-accent-text: #10131a;
+    --ostrel-accent-soft: #26314d;
+    --ostrel-danger: #f2a19b;
+    --ostrel-pending-opacity: 0.6;
+    --ostrel-shadow: 0 1px 2px #00000080;
+  }
+}
+
+/* Base */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--ostrel-bg);
+  color: var(--ostrel-text);
+  font-family: var(--ostrel-font);
+  font-size: var(--ostrel-text-size);
+  line-height: 1.4;
+}
+
+/* Layout classes for the std elements row, col and split */
+
+.o-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--ostrel-space-2);
+  min-width: 0;
+}
+
+.o-col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ostrel-space-2);
+  min-height: 0;
+}
+
+.o-split {
+  display: grid;
+  grid-template-columns: var(--ostrel-side-width) 1fr;
+  height: 100vh;
+}
+
+.o-split > * {
+  padding: var(--ostrel-space-3);
+  overflow-y: auto;
+}
+
+.o-split > :first-child {
+  background: var(--ostrel-surface);
+  border-right: 1px solid var(--ostrel-line);
+}
+
+.o-scroll-end {
+  overflow-y: auto;
+}
+
+/* Controls */
+
+button,
+input {
+  font: inherit;
+  border-radius: var(--ostrel-radius);
+  border: 1px solid var(--ostrel-line);
+  padding: var(--ostrel-space-1) var(--ostrel-space-2);
+  color: var(--ostrel-text);
+  background: var(--ostrel-surface);
+}
+
+button {
+  cursor: pointer;
+  box-shadow: var(--ostrel-shadow);
+}
+
+button:hover {
+  border-color: var(--ostrel-accent);
+}
+
+button:disabled {
+  cursor: default;
+  opacity: var(--ostrel-pending-opacity);
+}
+
+input {
+  background: var(--ostrel-bg);
+  min-width: 0;
+}
+
+button:focus-visible,
+input:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--ostrel-accent);
+  outline-offset: 1px;
+}
+
+a {
+  color: var(--ostrel-accent);
+}
+
+img {
+  max-width: 100%;
+}
+
+code {
+  font-family: var(--ostrel-font-mono);
+}
+
+.o-entry {
+  display: flex;
+  gap: var(--ostrel-space-1);
+}
+
+.o-entry > input {
+  flex: 1;
+}
+
+.o-entry > button {
+  background: var(--ostrel-accent);
+  color: var(--ostrel-accent-text);
+  border-color: var(--ostrel-accent);
+}
+
+/* look: title, strong, muted */
+
+[data-look="title"] {
+  font-size: var(--ostrel-title-size);
+  font-weight: 600;
+}
+
+[data-look="strong"] {
+  font-weight: 600;
+}
+
+[data-look="muted"] {
+  color: var(--ostrel-muted);
+}
+
+/* selected: */
+
+[aria-current="true"] {
+  background: var(--ostrel-accent-soft);
+  border-color: var(--ostrel-accent);
+  font-weight: 600;
+}
+
+/* Sync state of records (SYNTAX 4.7) */
+
+[data-pending="true"] {
+  opacity: var(--ostrel-pending-opacity);
+}
+
+[data-rejected="true"] {
+  color: var(--ostrel-danger);
+  text-decoration: line-through;
+}
+
+/* Std error notice */
+
+.o-notice {
+  color: var(--ostrel-danger);
+  border: 1px solid var(--ostrel-danger);
+  border-radius: var(--ostrel-radius);
+  padding: var(--ostrel-space-2);
+}
