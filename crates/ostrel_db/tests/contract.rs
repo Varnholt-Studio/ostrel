@@ -476,6 +476,11 @@ impl Connection for FixtureConn {
             if p.from != self.state.schema.as_ref().map(|a| a.hash) {
                 return Err(DbError::SchemaMismatch);
             }
+            // A plan from the stored schema to itself with no steps changes nothing, not even
+            // the stored schema text or the enum columns.
+            if p.from == Some(p.to) && p.steps.is_empty() {
+                return Ok(());
+            }
             self.state.schema = Some(AppliedSchema {
                 hash: p.to,
                 schema: p.schema.clone(),
@@ -1493,15 +1498,65 @@ fn applied_schema_reports_the_last_successful_migration_only() {
             ..plan(Some(1), 1)
         };
         conn.migrate(&noop).await.unwrap();
-        assert_eq!(
-            conn.applied_schema().await.unwrap().unwrap().hash,
-            first.hash
-        );
+        assert_eq!(conn.applied_schema().await, Ok(Some(first.clone())));
 
         conn.migrate(&plan(Some(1), 2)).await.unwrap();
         let second = conn.applied_schema().await.unwrap().unwrap();
         assert_eq!(second.hash, SchemaHash([2; 32]));
         assert_eq!(second.schema, "{\"v\":2}");
+    });
+}
+
+#[test]
+fn a_no_op_migration_keeps_the_stored_schema_and_enum_columns() {
+    let mut conn = connect();
+    block_on(async {
+        conn.migrate(&enum_plan()).await.unwrap();
+        let stored = conn.applied_schema().await.unwrap();
+        // Same hash, no steps, but a different schema text and no enum columns.
+        let noop = MigrationPlan {
+            schema: "other".to_string(),
+            enums: vec![],
+            ..plan(Some(1), 1)
+        };
+        conn.migrate(&noop).await.unwrap();
+        assert_eq!(conn.applied_schema().await.unwrap(), stored);
+
+        // The enum columns of the first migration still validate writes.
+        let mut tx = conn.begin().await.unwrap();
+        assert!(matches!(
+            tx.apply(&[insert(1, 9, vec![(0, en("nope"))])]).await,
+            Err(DbError::Invalid(_))
+        ));
+        drop(tx);
+
+        // And they still give the declaration order.
+        let mut tx = conn.begin().await.unwrap();
+        tx.apply(&[
+            insert(1, 1, vec![(0, en("done"))]),
+            insert(1, 2, vec![(0, en("backlog"))]),
+            insert(1, 3, vec![(0, en("todo"))]),
+        ])
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let by = sorted(1, vec![(0, Dir::Asc)]);
+        assert_eq!(ids(conn.query(&by).await.unwrap()), [2, 3, 1]);
+
+        // An invalid no op plan is still refused by the check.
+        let invalid = MigrationPlan {
+            enums: vec![EnumColumn {
+                model: 1,
+                field: 0,
+                variants: vec![],
+            }],
+            ..plan(Some(1), 1)
+        };
+        assert!(matches!(
+            conn.migrate(&invalid).await,
+            Err(DbError::Invalid(_))
+        ));
+        assert_eq!(conn.applied_schema().await.unwrap(), stored);
     });
 }
 
