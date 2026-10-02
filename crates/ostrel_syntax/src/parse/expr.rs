@@ -51,9 +51,15 @@ use ostrel_core::{Diagnostic, FileId};
 /// expression parser.
 ///
 /// `src` is the source text the tokens were lexed from, `file` its id for
-/// diagnostics. See [`super::parse_with`] for the details.
-pub fn parse(src: &str, file: FileId, tokens: &[Token]) -> (Module, Vec<Diagnostic>) {
-    super::parse_with(src, file, tokens, ParseLimits::DEFAULT, &Exprs)
+/// diagnostics, and `lexed` the diagnostics the lexer reported for these
+/// tokens. See [`super::parse_with`] for the details.
+pub fn parse(
+    src: &str,
+    file: FileId,
+    tokens: &[Token],
+    lexed: &[Diagnostic],
+) -> (Module, Vec<Diagnostic>) {
+    super::parse_with(src, file, tokens, lexed, ParseLimits::DEFAULT, &Exprs)
 }
 
 /// The expression parser of the v0.1 slice.
@@ -470,56 +476,16 @@ mod tests {
     use super::super::MAX_DEPTH;
     use super::*;
     use crate::ast::{Item, Limits, StmtKind};
-    use crate::lex::{LiteralScan, TextStop, lex_with};
+    use crate::lex::lex;
     use crate::{MAX_HEIGHT, MAX_NODES};
 
     const F: FileId = FileId::from_raw(0);
 
-    /// Literal scanner for these tests until the scanner of WP T1-2b is
-    /// wired in: an integer is a digit run, and a `\` skips the next
-    /// character (`\u{...}` whole), so escapes reach the parser unchanged.
-    struct TestLiterals;
-
-    impl LiteralScan for TestLiterals {
-        fn int(&self, src: &str, start: usize, _: FileId, _: &mut Vec<Diagnostic>) -> usize {
-            let rest = src.get(start..).unwrap_or("");
-            start + rest.bytes().take_while(u8::is_ascii_digit).count().max(1)
-        }
-
-        fn string_text(
-            &self,
-            src: &str,
-            start: usize,
-            _: FileId,
-            _: &mut Vec<Diagnostic>,
-        ) -> (usize, TextStop) {
-            let mut chars = src.get(start..).unwrap_or("").char_indices();
-            while let Some((i, c)) = chars.next() {
-                match c {
-                    '"' => return (start + i + 1, TextStop::Quote),
-                    '{' => return (start + i + 1, TextStop::Brace),
-                    '\n' | '\r' => return (start + i, TextStop::LineEnd),
-                    '\\' => {
-                        if let Some((_, 'u')) = chars.next() {
-                            for (_, c) in chars.by_ref() {
-                                if c == '}' {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            (src.len(), TextStop::LineEnd)
-        }
-    }
-
     // ----- helpers -----
 
     fn parse_src(src: &str, limits: ParseLimits) -> (Module, Vec<Diagnostic>, Vec<Diagnostic>) {
-        let (tokens, lex_diags) = lex_with(src, F, &TestLiterals);
-        let (module, diags) = super::super::parse_with(src, F, &tokens, limits, &Exprs);
+        let (tokens, lex_diags) = lex(src, F);
+        let (module, diags) = super::super::parse_with(src, F, &tokens, &lex_diags, limits, &Exprs);
         (module, lex_diags, diags)
     }
 
@@ -972,8 +938,8 @@ mod tests {
     #[test]
     fn parse_uses_the_default_limits_and_this_parser() {
         let src = "fn main()\n  print(\"{1 + 2}\")\n";
-        let (tokens, _) = lex_with(src, F, &TestLiterals);
-        let (m, diags) = parse(src, F, &tokens);
+        let (tokens, lexed) = lex(src, F);
+        let (m, diags) = parse(src, F, &tokens, &lexed);
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(m.limits(), Limits::DEFAULT);
         assert_eq!(m.items().len(), 1);
