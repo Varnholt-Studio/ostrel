@@ -1,0 +1,1 @@
+tests/errors/parse_walrus_assign.ostl:2:5: error[E0020]: Ostrel assigns with `=`; compound assignment does not exist

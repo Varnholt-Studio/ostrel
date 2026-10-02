@@ -1,0 +1,1 @@
+tests/errors/parse_for_of.ostl:3:9: error[E0024]: expected `in` after the loop variable; write `for x in xs`

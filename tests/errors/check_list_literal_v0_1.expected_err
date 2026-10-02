@@ -1,0 +1,1 @@
+tests/errors/check_list_literal_v0_1.ostl:2:12: error[E0100]: list literal is not available in v0.1

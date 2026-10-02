@@ -1,0 +1,1 @@
+tests/errors/lex_unexpected_char.ostl:2:13: error[E0008]: unexpected character `@`

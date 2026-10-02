@@ -1,0 +1,1 @@
+tests/errors/lex_string_in_interpolation.ostl:2:13: error[E0006]: string literal inside interpolation; bind it with `let` first

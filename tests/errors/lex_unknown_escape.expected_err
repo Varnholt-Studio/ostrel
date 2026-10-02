@@ -1,0 +1,1 @@
+tests/errors/lex_unknown_escape.ostl:2:12: error[E0004]: unknown escape sequence `\q`
