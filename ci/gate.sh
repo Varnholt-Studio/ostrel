@@ -15,11 +15,21 @@
 # Exported to the checks:
 #   GATE_SCOPE   "full" or "quick"
 #   GATE_CRATES  "all", or a space separated list of touched package names (may be empty)
+#
+# Build directory (D56): a CARGO_TARGET_DIR set by the caller is kept; a relative value is
+# resolved against the caller's working directory. When unset or empty, the gate builds into
+# ./target of this checkout, never into a cache shared with other checkouts, so artifacts of
+# parallel states cannot mix.
 set -uo pipefail
+caller_dir="$PWD"
 cd "$(dirname "$0")/.." || exit 1
 
-# Shared build cache keeps repeated builds fast on small machines.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/ostrel-target}"
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  CARGO_TARGET_DIR="$PWD/target"
+elif [[ "$CARGO_TARGET_DIR" != /* ]]; then
+  CARGO_TARGET_DIR="$caller_dir/$CARGO_TARGET_DIR"
+fi
+export CARGO_TARGET_DIR
 
 scope="${GATE_SCOPE:-full}"
 case "$scope" in
