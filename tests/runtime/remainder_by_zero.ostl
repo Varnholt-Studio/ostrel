@@ -1,0 +1,9 @@
+// DivisionByZero for `%`, also when the dividend is zero: 0 % 0 has no value.
+
+fn rest(a: Int, b: Int) -> Int
+  a % b
+
+fn main()
+  print(rest(-7, 3))
+  print(rest(0, 0))
+  print("not reached")

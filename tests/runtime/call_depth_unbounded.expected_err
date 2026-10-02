@@ -1,0 +1,1 @@
+tests/runtime/call_depth_unbounded.ostl:5:3: runtime error[CallDepth]: call would exceed the limit of 10000 frames

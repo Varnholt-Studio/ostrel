@@ -1,0 +1,8 @@
+// IntOverflow: a sum one above the Int range (G9); output printed before the error stays.
+
+fn main()
+  let max = 9007199254740991
+  print("before")
+  print(max - 1 + 1)
+  print(max + 1)
+  print("not reached")

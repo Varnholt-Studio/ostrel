@@ -1,0 +1,10 @@
+// IntOverflow inside a called function is reported at the product, not at the call. The
+// product of two Int values far outside 64 bits must still be IntOverflow, never a wrap.
+
+fn square(n: Int) -> Int
+  n * n
+
+fn main()
+  print(square(3))
+  print(square(9007199254740991))
+  print("not reached")

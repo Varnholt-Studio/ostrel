@@ -1,0 +1,7 @@
+// IntOverflow: a difference one below the Int range (G9).
+
+fn main()
+  let min = -9007199254740991
+  print(min + 1 - 1)
+  print(min - 1)
+  print("not reached")
