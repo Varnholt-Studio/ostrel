@@ -7,7 +7,7 @@
 //! with [`StubLiterals`], a minimal literal scanner.
 
 use super::*;
-use crate::ast::{BinaryOp, Item, StrPart, UnaryOp};
+use crate::ast::{BinaryOp, Item, MAX_HEIGHT, MAX_NODES, StrPart, UnaryOp};
 use crate::lex::{LiteralScan, TextStop, lex_with};
 use ostrel_core::SourceMap;
 
@@ -295,7 +295,7 @@ fn interpolated(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
 /// diagnostics.
 fn run(src: &str, limits: ParseLimits) -> (Module, Vec<Diagnostic>, Vec<Diagnostic>) {
     let (tokens, lex_diags) = lex_with(src, F, &StubLiterals);
-    let (module, diags) = parse_with(src, F, &tokens, limits, &TestExprs);
+    let (module, diags) = parse_with(src, F, &tokens, &lex_diags, limits, &TestExprs);
     (module, lex_diags, diags)
 }
 
@@ -331,7 +331,14 @@ fn rendered(path: &str, src: &str) -> String {
         return String::from("<file not added>");
     };
     let (tokens, lex_diags) = lex_with(src, file, &StubLiterals);
-    let (_, diags) = parse_with(src, file, &tokens, ParseLimits::DEFAULT, &TestExprs);
+    let (_, diags) = parse_with(
+        src,
+        file,
+        &tokens,
+        &lex_diags,
+        ParseLimits::DEFAULT,
+        &TestExprs,
+    );
     lex_diags
         .iter()
         .chain(diags.iter())
@@ -487,10 +494,10 @@ fn empty_input_and_missing_eof() {
     let src = "fn main()\n  print(1)\n";
     let (mut tokens, _) = lex_with(src, F, &StubLiterals);
     tokens.pop();
-    let (m, diags) = parse_with(src, F, &tokens, ParseLimits::DEFAULT, &TestExprs);
+    let (m, diags) = parse_with(src, F, &tokens, &[], ParseLimits::DEFAULT, &TestExprs);
     assert!(diags.is_empty(), "{diags:?}");
     assert_eq!(m.items().len(), 1);
-    let (m, diags) = parse_with(src, F, &[], ParseLimits::DEFAULT, &TestExprs);
+    let (m, diags) = parse_with(src, F, &[], &[], ParseLimits::DEFAULT, &TestExprs);
     assert!(m.items().is_empty() && diags.is_empty());
 }
 
@@ -1044,22 +1051,159 @@ fn height_limit_with_chains() -> R {
     Ok(())
 }
 
-#[test]
-fn many_statements_are_linear() -> R {
-    const LINES: usize = 100_000;
+/// Lexes and parses `src` and returns the work counter of the parser.
+fn steps_for(src: &str) -> u64 {
+    let (tokens, lex_diags) = lex_with(src, F, &StubLiterals);
+    let mut p = Parser::new(
+        src,
+        F,
+        &tokens,
+        &lex_diags,
+        ParseLimits::DEFAULT,
+        &TestExprs,
+    );
+    let _ = p.program();
+    assert!(p.diags.is_empty(), "{:?}", p.diags);
+    p.steps()
+}
+
+/// `lines` statements of the form `let xN = N + 1` in one function.
+fn many_lets(lines: usize) -> String {
     let mut src = String::from("fn main()\n");
-    for i in 0..LINES {
+    for i in 0..lines {
         src.push_str(&format!("  let x{i} = {i} + 1\n"));
     }
-    let start = std::time::Instant::now();
-    let (m, _, diags) = run(&src, ParseLimits::DEFAULT);
-    assert!(diags.is_empty());
+    src
+}
+
+#[test]
+fn many_statements_are_linear() -> R {
+    // D74: no wall clock in the gate. The work counter of the parser must
+    // grow linearly with the input: doubling the statements at most doubles
+    // the work (plus a constant), and the work per token is bounded.
+    const LINES: usize = 20_000;
+    let (m, _, diags) = run(&many_lets(LINES), ParseLimits::DEFAULT);
+    assert!(diags.is_empty(), "{diags:?}");
     assert_eq!(
         block_stmts(&m, fn_items(&m).first().copied().must()?.body).len(),
         LINES
     );
-    // Generous bound for unoptimised builds on a loaded machine.
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    let small = steps_for(&many_lets(LINES));
+    let large = steps_for(&many_lets(2 * LINES));
+    assert!(large <= 2 * small + 64, "{small} steps, then {large}");
+    let tokens = lex_with(&many_lets(LINES), F, &StubLiterals).0.len();
+    let per_token = small / u64::try_from(tokens).map_err(|e| e.to_string())?;
+    assert!(per_token <= 16, "{per_token} steps per token");
+    Ok(())
+}
+
+#[test]
+fn hostile_lines_are_linear() -> R {
+    // Long lines with many `(`, `+=` candidates and lexer faults: the work
+    // per token stays bounded.
+    let line = |n: usize| {
+        let mut src = String::from("fn main()\n");
+        for _ in 0..n {
+            src.push_str("  print(((1 + 2) * 3) - 4, 5, 6 + 7 + 8 + 9)\n");
+        }
+        src
+    };
+    let small = steps_for(&line(5_000));
+    let large = steps_for(&line(10_000));
+    assert!(large <= 2 * small + 64, "{small} steps, then {large}");
+    Ok(())
+}
+
+#[test]
+fn lexer_fault_does_not_hide_the_next_line() -> R {
+    // Review T9 @33d2618: the end of the `NL` of a reported line is the start
+    // of the next line; a fault in column 1 of that line is its own fault.
+    let src = "fn main()\n  print(1) @\nlet x = 1\n";
+    let (_, lex_diags, diags) = run(src, ParseLimits::DEFAULT);
+    assert_eq!(lex_diags.len(), 1, "{lex_diags:?}");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    let d = diags.first().must()?;
+    assert_eq!((d.code, d.span.start), (codes::EXPECTED, at(src, "let", 0)));
+    assert!(d.message.contains("found `let`"), "{}", d.message);
+    // The same with the faulty character in column 1 of line 2.
+    let src = "fn main()\n@\nlet x = 1\n";
+    let (_, lex_diags, diags) = run(src, ParseLimits::DEFAULT);
+    assert_eq!(lex_diags.len(), 1, "{lex_diags:?}");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    let d = diags.first().must()?;
+    assert_eq!((d.code, d.span.start), (codes::EXPECTED, at(src, "let", 0)));
+    // The faulty line itself still gets no second diagnostic.
+    let src = "fn main()\n  print(1) @ (\n  print(2)\n";
+    let (_, lex_diags, diags) = run(src, ParseLimits::DEFAULT);
+    assert_eq!(lex_diags.len(), 1, "{lex_diags:?}");
+    assert!(diags.is_empty(), "{diags:?}");
+    Ok(())
+}
+
+#[test]
+fn suppression_follows_lexer_diagnostic_spans() -> R {
+    // Which lines are reported is taken from the lexer diagnostics, not from
+    // the tokens: a diagnostic on a clean line suppresses that line only.
+    let src = "fn main()\n  let = 1\n  let = 2\n";
+    let (tokens, lex_diags) = lex_with(src, F, &StubLiterals);
+    assert!(lex_diags.is_empty(), "{lex_diags:?}");
+    let parse_lexed = |lexed: &[Diagnostic]| {
+        let (_, diags) = parse_with(src, F, &tokens, lexed, ParseLimits::DEFAULT, &TestExprs);
+        diags.iter().map(|d| d.span.start).collect::<Vec<_>>()
+    };
+    let first = at(src, "=", 0);
+    let second = at(src, "=", 1);
+    assert_eq!(parse_lexed(&[]), vec![first, second]);
+    let on = |offset: u32| Diagnostic::error(Code::new(1), Span::point(F, offset), "lexer");
+    // Anywhere on line 2, including its indentation and its line end.
+    for offset in [at(src, "  let", 0), first, at(src, "1\n", 0) + 1] {
+        assert_eq!(parse_lexed(&[on(offset)]), vec![second], "at {offset}");
+    }
+    // The start of line 3 belongs to line 3, not to the end of line 2.
+    assert_eq!(parse_lexed(&[on(at(src, "  let", 1))]), vec![first]);
+    // A comment line is no part of the next line: a fault in it does not hide
+    // a fault below it.
+    let src = "fn main()\n  // note\n  let = 1\n";
+    let (tokens, _) = lex_with(src, F, &StubLiterals);
+    let comment = Diagnostic::error(Code::new(1), Span::point(F, at(src, "note", 0)), "lexer");
+    let (_, diags) = parse_with(
+        src,
+        F,
+        &tokens,
+        &[comment],
+        ParseLimits::DEFAULT,
+        &TestExprs,
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    // A diagnostic at the very end of the source belongs to the last line.
+    let src = "fn main()\n  let = 1";
+    let (tokens, _) = lex_with(src, F, &StubLiterals);
+    let end = u32::try_from(src.len()).map_err(|e| e.to_string())?;
+    let (_, diags) = parse_with(
+        src,
+        F,
+        &tokens,
+        &[on(end)],
+        ParseLimits::DEFAULT,
+        &TestExprs,
+    );
+    assert!(diags.is_empty(), "{diags:?}");
+    Ok(())
+}
+
+#[test]
+fn compound_assignment_after_let() -> R {
+    // Review T9 F2: `let x += 1` and `let x := 1` are E0020, not E0028.
+    for (src, op) in [
+        ("fn main()\n  let x += 1\n", "+"),
+        ("fn main()\n  let x := 1\n", ":"),
+    ] {
+        assert_eq!(
+            codes_at(src),
+            vec![(codes::ASSIGN_OPERATOR.number(), at(src, op, 0))],
+            "{src:?}"
+        );
+    }
     Ok(())
 }
 

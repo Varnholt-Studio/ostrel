@@ -1,6 +1,6 @@
 //! Parser for the v0.1 slice (ARCHITECTURE 3.4, SYNTAX 7, WP T1-3).
 //!
-//! The parser turns the tokens of one file into an [`ast::Module`] and never
+//! The parser turns the tokens of one file into an [`ast::Module`](crate::ast::Module) and never
 //! fails: every fault is a [`Diagnostic`]. It reads declarations, blocks and
 //! statements by recursive descent. Expressions are read by an
 //! [`ExprParse`] implementation (WP T1-3b, `expr.rs`, precedence climbing with
@@ -32,9 +32,12 @@
 //! * A fault in a block head (`fn`, `if`, `else`) skips the rest of the head
 //!   line, but the block below it is still parsed, so faults inside the block
 //!   are reported and nothing in it is reported twice.
-//! * The lexer has already reported a line that holds an `Error` token or a
-//!   faulty indentation (tab, odd width). The parser never reports a second
-//!   diagnostic on such a line.
+//! * A logical line on which a lexer diagnostic starts has already been
+//!   reported. The parser never reports a second diagnostic on such a line.
+//!   The lines are found from the spans of the lexer diagnostics passed to
+//!   [`parse_with`], never from the shape of the tokens, so every fault the
+//!   lexer reports (an `Error` token, a tab, a jump of indentation and so on)
+//!   is covered the same way.
 //! * A `(` that is not closed on its logical line is reported once at the
 //!   `(` (E0025) before anything else on that line.
 //! * After `{` at the end of a block head (E0022), the matching lone `}` line
@@ -45,15 +48,14 @@
 //! Three limits (D43, D54, ARCHITECTURE 3.4) end the parse with one
 //! diagnostic at the triggering token and no further diagnostics: the
 //! nesting depth of brackets and blocks ([`MAX_DEPTH`]), the height of the
-//! syntax tree ([`MAX_HEIGHT`]) and the number of tree nodes ([`MAX_NODES`]).
+//! syntax tree ([`MAX_HEIGHT`](crate::ast::MAX_HEIGHT)) and the number of
+//! tree nodes ([`MAX_NODES`](crate::ast::MAX_NODES)).
 //! Each can be lowered with [`ParseLimits`] to test the exact boundary.
 
 pub mod codes;
 
 #[cfg(test)]
 mod tests;
-
-pub use crate::ast::{MAX_HEIGHT, MAX_NODES};
 
 use crate::ast::{
     AstError, BlockId, ExprId, ExprKind, FnDecl, Ident, Limits, Module, Param, StmtId, StmtKind,
@@ -76,7 +78,8 @@ pub struct ParseLimits {
 }
 
 impl ParseLimits {
-    /// [`MAX_DEPTH`], [`MAX_NODES`] and [`MAX_HEIGHT`].
+    /// [`MAX_DEPTH`], [`MAX_NODES`](crate::ast::MAX_NODES) and
+    /// [`MAX_HEIGHT`](crate::ast::MAX_HEIGHT).
     pub const DEFAULT: ParseLimits = ParseLimits {
         max_depth: MAX_DEPTH,
         tree: Limits::DEFAULT,
@@ -127,16 +130,20 @@ pub trait ExprParse {
 /// Parses the tokens of one file.
 ///
 /// `src` is the source text the tokens were lexed from, `file` its id for
-/// diagnostics. Trivia tokens are skipped. A token stream without a final
-/// `EOF` is treated as if it had one at the end of `src`.
+/// diagnostics. `lexed` holds the diagnostics the lexer reported for these
+/// tokens: no parser diagnostic is reported on a logical line on which one
+/// of them starts (one fault, one diagnostic). Trivia tokens are skipped. A
+/// token stream without a final `EOF` is treated as if it had one at the end
+/// of `src`.
 pub fn parse_with(
     src: &str,
     file: FileId,
     tokens: &[Token],
+    lexed: &[Diagnostic],
     limits: ParseLimits,
     exprs: &dyn ExprParse,
 ) -> (Module, Vec<Diagnostic>) {
-    let mut p = Parser::new(src, file, tokens, limits, exprs);
+    let mut p = Parser::new(src, file, tokens, lexed, limits, exprs);
     // A `Stop::File` has been reported; the module keeps what was parsed.
     let _ = p.program();
     (p.module, p.diags)
@@ -148,6 +155,7 @@ struct Lines {
     line_of: Vec<u32>,
     unclosed: Vec<Option<u32>>,
     faulty: Vec<(u32, u32)>,
+    steps: u64,
 }
 
 /// Parser state. [`ExprParse`] implementations use its public methods.
@@ -160,9 +168,12 @@ pub struct Parser<'a> {
     line_of: Vec<u32>,
     /// Per logical line: token index of the outermost `(` not closed on it.
     unclosed: Vec<Option<u32>>,
-    /// Byte ranges of the logical lines the lexer has already reported,
-    /// sorted by start.
+    /// Byte ranges `start..end` (end exclusive) of the logical lines the
+    /// lexer has already reported, sorted and disjoint.
     faulty: Vec<(u32, u32)>,
+    /// Work counter: token lookups plus scanned tokens. Tests use it to show
+    /// that parsing is linear without measuring time (D74).
+    steps: std::cell::Cell<u64>,
     pos: usize,
     module: Module,
     diags: Vec<Diagnostic>,
@@ -177,6 +188,7 @@ impl<'a> Parser<'a> {
         src: &'a str,
         file: FileId,
         tokens: &[Token],
+        lexed: &[Diagnostic],
         limits: ParseLimits,
         exprs: &'a dyn ExprParse,
     ) -> Parser<'a> {
@@ -185,7 +197,7 @@ impl<'a> Parser<'a> {
             let end = u32::try_from(src.len()).unwrap_or(u32::MAX);
             toks.push(Token::new(TokenKind::Eof, Span::point(file, end)));
         }
-        let lines = scan_lines(src, &toks);
+        let lines = scan_lines(src, &toks, lexed);
         Parser {
             src,
             file,
@@ -194,6 +206,7 @@ impl<'a> Parser<'a> {
             line_of: lines.line_of,
             unclosed: lines.unclosed,
             faulty: lines.faulty,
+            steps: std::cell::Cell::new(lines.steps),
             pos: 0,
             module: Module::with_limits(limits.tree),
             diags: Vec::new(),
@@ -312,7 +325,18 @@ impl<'a> Parser<'a> {
 
     // ----- internals -----
 
+    /// Work done so far (see the field `steps`).
+    #[cfg(test)]
+    fn steps(&self) -> u64 {
+        self.steps.get()
+    }
+
+    fn step(&self) {
+        self.steps.set(self.steps.get().saturating_add(1));
+    }
+
     fn nth_token(&self, n: usize) -> Token {
+        self.step();
         let eof = Token::new(TokenKind::Eof, Span::point(self.file, 0));
         let last = self.toks.last().copied().unwrap_or(eof);
         self.pos
@@ -332,12 +356,7 @@ impl<'a> Parser<'a> {
 
     /// True if `tok` lies on a logical line the lexer has already reported.
     fn lexed_fault_at(&self, tok: Token) -> bool {
-        let at = tok.span.start;
-        let after = self.faulty.partition_point(|&(start, _)| start <= at);
-        after
-            .checked_sub(1)
-            .and_then(|i| self.faulty.get(i))
-            .is_some_and(|&(start, end)| start <= at && at <= end)
+        in_ranges(&self.faulty, tok.span.start)
     }
 
     /// Reports a limit diagnostic, never suppressed, and returns
@@ -768,6 +787,7 @@ impl<'a> Parser<'a> {
     }
 
     fn let_stmt(&mut self) -> Result<StmtId, Stop> {
+        self.check_assign_operator()?;
         let kw = self.bump();
         let name = self.name("a name after `let`")?;
         if self.peek() != TokenKind::Eq {
@@ -899,6 +919,7 @@ impl<'a> Parser<'a> {
     fn check_assign_operator(&mut self) -> Result<(), Stop> {
         let mut i = self.pos;
         while let (Some(a), Some(b)) = (self.toks.get(i).copied(), self.toks.get(i + 1).copied()) {
+            self.step();
             if matches!(a.kind, TokenKind::Nl | TokenKind::Eof) {
                 break;
             }
@@ -949,16 +970,32 @@ pub fn text_range(start: u32, end: u32) -> TextRange {
     TextRange::empty(start).cover(TextRange::empty(end))
 }
 
-/// Splits the tokens into logical lines. A line ends with its `NL` (or
-/// `EOF`); the `INDENT` and `DEDENT` tokens before its first token belong to
-/// it. A line is faulty if it holds an `Error` token or an `INDENT` whose
-/// indentation has a tab or an odd width: the lexer has reported both.
-fn scan_lines(src: &str, toks: &[Token]) -> Lines {
+/// True if `at` lies in one of the sorted, disjoint ranges `start..end`.
+fn in_ranges(ranges: &[(u32, u32)], at: u32) -> bool {
+    let after = ranges.partition_point(|&(start, _)| start <= at);
+    after
+        .checked_sub(1)
+        .and_then(|i| ranges.get(i))
+        .is_some_and(|&(start, end)| start <= at && at < end)
+}
+
+/// Splits the tokens into logical lines and marks the lines the lexer has
+/// reported.
+///
+/// A line ends with its `NL` (or `EOF`); the `INDENT` and `DEDENT` tokens
+/// before its first token belong to it. Its byte range runs from the start
+/// of the source line of its first token (so leading whitespace belongs to
+/// it) to the end of its `NL`, end exclusive, so the next line never
+/// overlaps it (the end of an `NL` is the start of the next line). Blank and
+/// comment lines before it are not part of it. The last line also holds the
+/// offset at the very end of the source. A line is faulty if a diagnostic in
+/// `lexed` starts in its range.
+fn scan_lines(src: &str, toks: &[Token], lexed: &[Diagnostic]) -> Lines {
     let mut lines = Lines {
         line_of: Vec::with_capacity(toks.len()),
         ..Lines::default()
     };
-    let mut faulty = false;
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
     let mut start: Option<u32> = None;
     let mut open: Vec<u32> = Vec::new();
     for (index, tok) in toks.iter().enumerate() {
@@ -967,15 +1004,6 @@ fn scan_lines(src: &str, toks: &[Token]) -> Lines {
         let index = u32::try_from(index).unwrap_or(u32::MAX);
         start = Some(start.map_or(tok.span.start, |s| s.min(tok.span.start)));
         match tok.kind {
-            TokenKind::Error => faulty = true,
-            TokenKind::Indent => {
-                let ws = src
-                    .get(tok.span.start as usize..tok.span.end as usize)
-                    .unwrap_or("");
-                if ws.contains('\t') || !ws.len().is_multiple_of(2) {
-                    faulty = true;
-                }
-            }
             TokenKind::LParen => open.push(index),
             TokenKind::RParen => {
                 open.pop();
@@ -985,13 +1013,44 @@ fn scan_lines(src: &str, toks: &[Token]) -> Lines {
         if matches!(tok.kind, TokenKind::Nl | TokenKind::Eof) {
             lines.unclosed.push(open.first().copied());
             open.clear();
-            if faulty {
-                let from = start.unwrap_or(tok.span.start);
-                lines.faulty.push((from, tok.span.end));
+            let first = start.unwrap_or(tok.span.start);
+            let prev = ranges.last().map_or(0, |&(_, end)| end);
+            let from = src
+                .get(prev.min(first) as usize..first as usize)
+                .and_then(|before| before.rfind('\n'))
+                .and_then(|i| u32::try_from(i + 1).ok())
+                .map_or(prev.min(first), |i| prev.min(first) + i);
+            // An empty `NL` (at the end of the source) or `EOF` also holds
+            // its own offset.
+            let to = if tok.span.is_empty() {
+                tok.span.end.saturating_add(1)
+            } else {
+                tok.span.end
+            };
+            // Keep the ranges disjoint even for a malformed token stream.
+            let from = ranges.last().map_or(from, |&(_, end)| from.max(end));
+            if from < to {
+                ranges.push((from, to));
             }
-            faulty = false;
             start = None;
         }
     }
+    let mut faulty: Vec<(u32, u32)> = Vec::new();
+    for diag in lexed {
+        let at = diag.span.start;
+        let after = ranges.partition_point(|&(start, _)| start <= at);
+        let hit = after
+            .checked_sub(1)
+            .and_then(|i| ranges.get(i))
+            .filter(|&&(start, end)| start <= at && at < end);
+        if let Some(&range) = hit {
+            faulty.push(range);
+        }
+    }
+    faulty.sort_unstable();
+    faulty.dedup();
+    let scanned = toks.len().saturating_add(lexed.len());
+    lines.steps = u64::try_from(scanned).unwrap_or(u64::MAX);
+    lines.faulty = faulty;
     lines
 }
