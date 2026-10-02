@@ -47,8 +47,10 @@ while [ $# -gt 0 ]; do
     --commands)
       [ $# -ge 2 ] || { echo "$usage" >&2; exit 2; }
       commands=""
-      for c in ${2//,/ }; do
+      IFS=',' read -r -a requested <<< "$2"
+      for c in "${requested[@]}"; do
         case "$c" in
+          "") ;;
           check|run|fmt) case " $commands " in *" $c "*) ;; *) commands="${commands:+$commands }$c" ;; esac ;;
           *) echo "run.sh: unknown command '$c' in --commands (check, run, fmt)" >&2; exit 2 ;;
         esac

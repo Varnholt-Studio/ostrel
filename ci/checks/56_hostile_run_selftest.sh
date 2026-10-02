@@ -121,8 +121,17 @@ if grep -q WARNING <<< "$out"; then
 fi
 expect off_real_warns 0 "WARNING" "${base[@]}" HOSTILE_DIR="$d" OSTREL="$tmp/bin/real"
 expect bad_switch 1 "must be on or off" "${base[@]}" HOSTILE_DIR="$d" HOSTILE_RUN_COMPILER=maybe
-expect on_without_commands 1 "no --commands option" "${base[@]}" HOSTILE_DIR="$d" HOSTILE_RUN_COMPILER=on OSTREL="$tmp/bin/real"
 expect quick_skips 0 "skipped (GATE_SCOPE=quick)" "${base[@]}" HOSTILE_DIR="$d" GATE_SCOPE=quick HOSTILE_RUN_COMPILER=on
+
+# An older runner without the --commands branch: the check must refuse it (#283).
+d=$(fixture no_commands)
+sed -i '/^ *--commands)$/d' "$d/run.sh"
+n=$((n + 1))
+if grep -qE -- '--commands\)' "$d/run.sh"; then
+  echo "   selftest no_commands_fixture: could not remove the --commands branch from the runner copy"
+  fail=1
+fi
+expect on_without_commands 1 "no --commands option" "${base[@]}" HOSTILE_DIR="$d" HOSTILE_RUN_COMPILER=on OSTREL="$tmp/bin/real"
 
 # A runner with --commands: the check passes its arguments on and returns its exit code.
 d=$(fixture runner)
