@@ -16,13 +16,29 @@ import {
   signLink,
   toB64url,
 } from './link.mjs';
-import { CHALLENGE_TTL_MS, CLOCK_SKEW_MS, Registry, signInMessage } from './server.mjs';
+import { CHALLENGE_TTL_MS, CLOCK_SKEW_MS, Registry, registerMessage, signInMessage } from './server.mjs';
 
 const T0 = 1_790_000_000_000;
 
 const newPair = () => crypto.subtle.generateKey(ALG, true, ['sign', 'verify']);
 
-/** A user with one registered device (`a`) and a fresh device (`b`) that wants to join. */
+/** Registers the user key `user` (proof of possession over a fresh challenge). */
+async function register(registry, user, now = T0) {
+  const challenge = registry.issueChallenge(now);
+  const signature = new Uint8Array(await crypto.subtle.sign(ALG, user.privateKey, registerMessage(challenge)));
+  await registry.register({ userId: await rawPublicKey(user), challenge, signature }, now);
+}
+
+/** Adds the device `device` to the user, with a link signed by `signer`. */
+async function addDevice(registry, userId, signer, device, now = T0) {
+  const link = await signLink({ signerPair: signer, userId, deviceKey: await rawPublicKey(device), now });
+  return registry.acceptLink(await presentLink({ link, devicePair: device }), now);
+}
+
+/**
+ * A registered user key (`user`), one device key (`a`) added by a link the user key signed,
+ * and a fresh device (`b`) that wants to join.
+ */
 async function setup() {
   const registry = new Registry();
   const user = await newPair();
@@ -31,8 +47,17 @@ async function setup() {
   const userId = await rawPublicKey(user);
   const aKey = await rawPublicKey(a);
   const bKey = await rawPublicKey(b);
-  registry.register(userId, aKey);
-  return { registry, userId, a, b, aKey, bKey };
+  await register(registry, user);
+  await addDevice(registry, userId, user, a);
+  return { registry, user, userId, a, b, aKey, bKey };
+}
+
+/** Export and import of the user key, as the bundle of the keys spike (T31) carries it. */
+async function exportImport(pair) {
+  const jwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+  const privateKey = await crypto.subtle.importKey('jwk', jwk, ALG, true, ['sign']);
+  const publicKey = await crypto.subtle.importKey('jwk', { kty: jwk.kty, crv: jwk.crv, x: jwk.x }, ALG, true, ['verify']);
+  return { privateKey, publicKey };
 }
 
 async function linkFor(s, { now = T0, signer = s.a, ttlMs } = {}) {
@@ -144,7 +169,8 @@ test('a key of another user cannot sign a link for this user', async () => {
   const s = await setup();
   const other = await newPair();
   const otherDevice = await newPair();
-  s.registry.register(await rawPublicKey(other), await rawPublicKey(otherDevice));
+  await register(s.registry, other);
+  await addDevice(s.registry, await rawPublicKey(other), other, otherDevice);
   await rejects(s.registry.acceptLink(await linkFor(s, { signer: otherDevice }), T0), 'UnknownSigner');
 });
 
@@ -168,9 +194,91 @@ test('a revoked device key cannot sign in and cannot be linked again', async () 
   await signIn(s.registry, s.userId, s.a, T0 + 3);
 });
 
-test('the last active key cannot be revoked', async () => {
+test('the user key cannot be revoked, by a device key or by itself', async () => {
   const s = await setup();
-  assert.throws(() => s.registry.revoke(s.userId, s.aKey, s.aKey), (e) => e.kind === 'LastKey');
+  for (const acting of [s.aKey, s.userId]) {
+    assert.throws(() => s.registry.revoke(s.userId, s.userId, acting), (e) => e.kind === 'UserKeyNotRevocable');
+  }
+  assert.equal(s.registry.isActive(s.userId, s.userId), true);
+});
+
+test('registration needs the private user key', async () => {
+  const registry = new Registry();
+  const user = await newPair();
+  const userId = await rawPublicKey(user);
+  // An id that is no key at all, and a real key signed by someone else, are refused.
+  for (const [id, signer] of [[new Uint8Array(32).fill(7), user], [userId, await newPair()]]) {
+    const challenge = registry.issueChallenge(T0);
+    const signature = new Uint8Array(await crypto.subtle.sign(ALG, signer.privateKey, registerMessage(challenge)));
+    await rejects(registry.register({ userId: id, challenge, signature }, T0), 'BadSignature');
+  }
+  // A sign in signature is not a registration signature.
+  const challenge = registry.issueChallenge(T0);
+  const signature = new Uint8Array(await crypto.subtle.sign(ALG, user.privateKey, signInMessage(challenge)));
+  await rejects(registry.register({ userId, challenge, signature }, T0), 'BadSignature');
+  // The challenge is single use, also after a failed attempt.
+  await rejects(registry.register({ userId, challenge, signature }, T0), 'UnknownChallenge');
+  await rejects(registry.register({ userId: new Uint8Array(31), challenge, signature }, T0), 'Malformed');
+  assert.equal(registry.users.size, 0);
+  await register(registry, user);
+  await rejects(register(registry, user, T0 + 1), 'UserExists');
+});
+
+test('two concurrent registrations of one user key: exactly one wins', async () => {
+  const registry = new Registry();
+  const user = await newPair();
+  const results = await Promise.allSettled([register(registry, user), register(registry, user)]);
+  assert.deepEqual(results.map((r) => r.status).sort(), ['fulfilled', 'rejected']);
+  assert.equal(results.find((r) => r.status === 'rejected').reason.kind, 'UserExists');
+});
+
+test('an imported user key signs in and links a new device after every device key is revoked', async () => {
+  const s = await setup();
+  await s.registry.acceptLink(await linkFor(s), T0);
+  // Device b revokes device a, then the user key revokes b: no device key is left.
+  s.registry.revoke(s.userId, s.aKey, s.bKey);
+  s.registry.revoke(s.userId, s.bKey, s.userId);
+  assert.deepEqual(s.registry.activeKeys(s.userId), []);
+  // Recovery on a new browser: import the user key bundle, sign in, link the new device key.
+  const imported = await exportImport(s.user);
+  assert.deepEqual(await rawPublicKey(imported), s.userId);
+  const session = await signIn(s.registry, s.userId, imported, T0 + 1);
+  assert.deepEqual(session, { userId: toB64url(s.userId), deviceKey: toB64url(s.userId) });
+  const c = await newPair();
+  await addDevice(s.registry, s.userId, imported, c, T0 + 2);
+  await signIn(s.registry, s.userId, c, T0 + 3);
+});
+
+test('a user key is never added as a device key, of its own user or of another', async () => {
+  const s = await setup();
+  const self = await signLink({ signerPair: s.a, userId: s.userId, deviceKey: s.userId, now: T0 });
+  await rejects(s.registry.acceptLink(await presentLink({ link: self, devicePair: s.user }), T0), 'DeviceKeyTaken');
+  const other = await newPair();
+  await register(s.registry, other);
+  const foreign = await signLink({ signerPair: s.a, userId: s.userId, deviceKey: await rawPublicKey(other), now: T0 });
+  await rejects(s.registry.acceptLink(await presentLink({ link: foreign, devicePair: other }), T0), 'DeviceKeyTaken');
+  // And a device key cannot be registered as a user key.
+  await rejects(register(s.registry, s.a, T0 + 1), 'DeviceKeyTaken');
+});
+
+test('a signer revoked while its link is being checked does not add the key', async () => {
+  const s = await setup();
+  const presented = await linkFor(s);
+  const pending = s.registry.acceptLink(presented, T0);
+  // acceptLink has passed its first signer check and waits on signature verification.
+  s.registry.revoke(s.userId, s.aKey, s.userId);
+  await rejects(pending, 'UnknownSigner');
+  assert.deepEqual(s.registry.activeKeys(s.userId), []);
+  await rejects(signIn(s.registry, s.userId, s.b, T0 + 1), 'UnknownDeviceKey');
+});
+
+test('a device key revoked during sign in gets no session', async () => {
+  const s = await setup();
+  const challenge = s.registry.issueChallenge(T0);
+  const signature = new Uint8Array(await crypto.subtle.sign(ALG, s.a.privateKey, signInMessage(challenge)));
+  const pending = s.registry.signIn({ userId: s.userId, deviceKey: s.aKey, challenge, signature }, T0);
+  s.registry.revoke(s.userId, s.aKey, s.userId);
+  await rejects(pending, 'UnknownDeviceKey');
 });
 
 test('a device key already owned by a user is not added again', async () => {
