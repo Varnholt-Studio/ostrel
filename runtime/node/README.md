@@ -65,13 +65,13 @@ Server to host:
 
 ## Errors
 
-| Code | Meaning | `data.kind` |
-|---|---|---|
-| -32700 | Line is not valid JSON (id `null`) | |
-| -32600 | Not a JSON-RPC 2.0 request object, bad id, or request over 1 MiB | |
-| -32601 | Unknown method | |
-| -32602 | Bad params, unknown module, or unknown function | |
-| -32000 | The extern call failed | `Threw`, `Undefined`, `Type`, `TooLarge`, `Busy` |
+| Code | Meaning | `id` of the answer | `data.kind` |
+|---|---|---|---|
+| -32700 | Line is not valid JSON | `null` | |
+| -32600 | Not a JSON-RPC 2.0 request object (also `jsonrpc` missing or not `"2.0"`, `method` not a string), bad id, or request over 1 MiB | the id if the line is an object with a valid id, else `null` | |
+| -32601 | Unknown method | request id | |
+| -32602 | Bad params, unknown module, or unknown function | request id | |
+| -32000 | The extern call failed | request id | `Threw`, `Undefined`, `Type`, `TooLarge`, `Busy` |
 
 * `Threw`: the function threw or its promise rejected. The message is
   `<name>: <message>` of the error, cut to 256 characters.

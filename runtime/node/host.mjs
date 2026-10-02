@@ -174,13 +174,20 @@ async function handle(modules, line) {
   } catch {
     return sendError(null, Codes.PARSE_ERROR, "line is not valid JSON");
   }
-  if (req === null || typeof req !== "object" || Array.isArray(req) || req.jsonrpc !== "2.0") {
+  if (req === null || typeof req !== "object" || Array.isArray(req)) {
     return sendError(null, Codes.INVALID_REQUEST, "expected a JSON-RPC 2.0 request object");
   }
-  const notification = !Object.hasOwn(req, "id");
-  if (!notification && !validId(req.id)) {
+  const hasId = Object.hasOwn(req, "id");
+  // ARCHITECTURE 7.2: a -32600 answer carries the id when the line is an
+  // object with a valid id, else null.
+  if (hasId && !validId(req.id)) {
     return sendError(null, Codes.INVALID_REQUEST, "id must be a string or a safe integer");
   }
+  if (req.jsonrpc !== "2.0") {
+    return sendError(hasId ? req.id : null, Codes.INVALID_REQUEST,
+      "expected a JSON-RPC 2.0 request object");
+  }
+  const notification = !hasId;
   const id = notification ? null : req.id;
   // The host never answers a notification. The only one it acts on is
   // cancel, which frees the slot of a running call without an answer.

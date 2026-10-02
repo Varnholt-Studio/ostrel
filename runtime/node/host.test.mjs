@@ -195,13 +195,15 @@ test("unknown methods, modules and functions are rejected without lookup on prot
   await host.stop();
 });
 
-test("malformed lines get an error with id null and the host keeps serving", async () => {
+test("malformed lines get an error, the id only when it is valid, and the host keeps serving", async () => {
   const host = await readyHost();
   const bad = [
     ["{not json", Codes.PARSE_ERROR],
     ["[1,2]", Codes.INVALID_REQUEST],
     ["42", Codes.INVALID_REQUEST],
-    ['{"id":1,"method":"ping"}', Codes.INVALID_REQUEST],
+    ['{"method":"ping"}', Codes.INVALID_REQUEST],
+    ['{"jsonrpc":"1.0","method":"ping"}', Codes.INVALID_REQUEST],
+    ['{"id":{"a":1},"method":"ping"}', Codes.INVALID_REQUEST],
     ['{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}', Codes.INVALID_REQUEST],
     ['{"jsonrpc":"2.0","id":1.5,"method":"ping"}', Codes.INVALID_REQUEST],
   ];
@@ -210,6 +212,16 @@ test("malformed lines get an error with id null and the host keeps serving", asy
     const res = await host.nextMessage();
     assert.equal(res.id, null, line);
     assert.equal(res.error.code, code, line);
+  }
+  for (const [line, id] of [
+    ['{"id":1,"method":"ping"}', 1],
+    ['{"jsonrpc":"1.0","id":2,"method":"ping"}', 2],
+    ['{"jsonrpc":2,"id":"two","method":"ping"}', "two"],
+  ]) {
+    host.writeLine(line);
+    const res = await host.nextMessage();
+    assert.equal(res.id, id, line);
+    assert.equal(res.error.code, Codes.INVALID_REQUEST, line);
   }
   host.writeLine('{"jsonrpc":"2.0","id":2,"method":7}');
   assert.equal((await host.nextMessage()).error.code, Codes.INVALID_REQUEST);
