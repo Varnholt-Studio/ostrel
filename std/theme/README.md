@@ -46,6 +46,7 @@ attributes, and classes with the reserved `o-` prefix.
 | `.o-scroll-end` | `scroll: end` | scroll container |
 | `.o-entry` | element `entry` | field plus accent submit button |
 | `.o-notice` | std error notice | danger border and text |
+| `select`, `option` | element `pick` | control look of `input`, accent border on hover, focus ring, dimmed when disabled |
 | `[data-look="title"]`, `"strong"`, `"muted"` | `look:` | larger and bold, bold, muted color |
 | `[aria-current="true"]` | `selected:` | soft accent background |
 | `[data-pending="true"]` | root of every `for` item | reduced opacity |
@@ -65,6 +66,9 @@ backend depend on them.
    with the `o-` classes above, `look:` as `data-look`, `selected:` as `aria-current="true"`,
    and pending and rejected as `data-pending="true"` and `data-rejected="true"`.
 4. ASSUMPTION: `.o-` is reserved; the checker rejects an app style tag starting with `o-`.
+5. ASSUMPTION: the view core renders `pick` as a native `select` with one `option` per entry of
+   `options:` (both tags are on the allowlist in `runtime/js/view/safe/attrs.js`). The theme
+   keeps the native arrow and popup, so no icon or `appearance` override is needed.
 
 ## Out of scope for this draft
 
