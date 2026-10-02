@@ -26,6 +26,24 @@ const MIB: usize = 1024 * 1024;
 const NEST: usize = 100_000;
 /// Operator, `and`, `or` and call chain length (REVIEW_RED_A3 #1).
 const CHAIN: usize = 5_000_000;
+/// AST height limit (D54, ARCHITECTURE 3.4); the chain cases keep a margin around it.
+const HEIGHT_BELOW_OPERANDS: usize = 2_000;
+const HEIGHT_ABOVE_OPERANDS: usize = 2_100;
+/// Global AST node limit 1 000 000 per file (D54); wide cases at about 0.9 and 1.1 times it.
+const NODES_BELOW: usize = 900_000;
+const NODES_ABOVE: usize = 1_100_000;
+/// Operands per function body in the wide cases. The body `1 + 1 + ...` alone has
+/// 2 * WIDE_OPERANDS - 1 nodes in any AST (one per literal, one per operator), so the
+/// representation dependent nodes per function (item, type, block, return) change the
+/// total by a few percent only and the margins of D54 hold.
+const WIDE_OPERANDS: usize = 100;
+/// Assumed nodes per function for the wide cases: body plus 6 for the rest.
+const WIDE_NODES_PER_FN: usize = 2 * WIDE_OPERANDS - 1 + 6;
+/// The nine bidirectional control characters the lexer rejects raw (D53).
+const BIDI: [char; 9] = [
+    '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+    '\u{2068}', '\u{2069}',
+];
 const DEFAULT_COUNT: u64 = 200;
 const DEFAULT_SEED: u64 = 0x05_7e_e1_00_00_00_00_04;
 
@@ -95,6 +113,33 @@ fn in_main(expr: &str) -> Vec<u8> {
 
 fn repeat(s: &str, n: usize) -> String {
     s.repeat(n)
+}
+
+/// `1 + 1 + ... + 1` with `operands` operands: a flat chain whose AST height is about
+/// the number of operands (D54).
+fn add_chain(operands: usize) -> String {
+    let mut s = String::from("1");
+    for _ in 1..operands {
+        s.push_str(" + 1");
+    }
+    s
+}
+
+/// `fn main()` with `let x = 1 + 1 + ...` of `operands` operands (D54 chain cases).
+fn chain_case(operands: usize) -> Vec<u8> {
+    format!("fn main()\n  let x = {}\n  print(x)\n", add_chain(operands)).into_bytes()
+}
+
+/// Many small top level functions with about `nodes` AST nodes in total (D54 wide cases).
+fn wide_case(nodes: usize) -> Vec<u8> {
+    let fns = nodes / WIDE_NODES_PER_FN;
+    let body = add_chain(WIDE_OPERANDS);
+    let mut s = String::new();
+    for i in 0..fns {
+        s.push_str(&format!("fn f{i}() -> Int\n  return {body}\n\n"));
+    }
+    s.push_str(&format!("fn main()\n  print(f{}())\n", fns - 1));
+    s.into_bytes()
 }
 
 fn named_cases(out: &mut Out, seed: u64) -> io::Result<()> {
@@ -187,6 +232,11 @@ fn named_cases(out: &mut Out, seed: u64) -> io::Result<()> {
     }
     calls.extend_from_slice(b")\n");
     out.write("chain_call_5m.ostl", &calls)?;
+    // D54: AST height 2 048 and node limit 1 000 000, with margins (no exact boundary).
+    out.write("chain_below.ostl", &chain_case(HEIGHT_BELOW_OPERANDS))?;
+    out.write("chain_above.ostl", &chain_case(HEIGHT_ABOVE_OPERANDS))?;
+    out.write("wide_below.ostl", &wide_case(NODES_BELOW))?;
+    out.write("wide_above.ostl", &wide_case(NODES_ABOVE))?;
     let mut lets = String::from("fn main()\n  let x0 = 0\n");
     for i in 1..NEST {
         lets.push_str(&format!("  let x{i} = x{} + 1\n", i - 1));
@@ -246,6 +296,31 @@ fn named_cases(out: &mut Out, seed: u64) -> io::Result<()> {
     out.write(
         "bidi_override_in_comment.ostl",
         "// \u{202e} } \u{2066}\nfn main()\n  print(1)\n".as_bytes(),
+    )?;
+    // D53: each of the nine characters raw in a string and in a comment is rejected;
+    // as a `\u{...}` escape it stays valid, and other invisible characters stay valid.
+    for c in BIDI {
+        let code = c as u32;
+        out.write(
+            &format!("bidi_u{code:04x}_in_string.ostl"),
+            format!("fn main()\n  print(\"a{c}b\")\n").as_bytes(),
+        )?;
+        out.write(
+            &format!("bidi_u{code:04x}_in_comment.ostl"),
+            format!("// a{c}b\nfn main()\n  print(1)\n").as_bytes(),
+        )?;
+    }
+    out.write(
+        "bidi_escape_in_string.ostl",
+        b"fn main()\n  print(\"a\\u{202E}b\\u{2066}c\")\n",
+    )?;
+    out.write(
+        "invisible_in_string.ostl",
+        "fn main()\n  print(\"a\u{200b}b\u{200d}c\u{200f}d\u{61c}e\u{2060}f\")\n".as_bytes(),
+    )?;
+    out.write(
+        "invisible_in_comment.ostl",
+        "// a\u{200b}b\u{200d}c\u{200f}d\u{61c}e\u{2060}f\nfn main()\n  print(1)\n".as_bytes(),
     )?;
     out.write(
         "zero_width_in_ident.ostl",

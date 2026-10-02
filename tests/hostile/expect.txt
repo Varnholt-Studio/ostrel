@@ -26,9 +26,9 @@ backslash_eof.ostl 1 1
 long_line_10mib_comment.ostl * 1
 long_line_10mib_ident.ostl 1 1
 long_line_10mib_string.ostl 0 0
-# 5 242 879 operators in one line: the global AST node limit (D43) may reject it (see
-# the chain block below), so only exit 0 or 1 is guaranteed.
-long_line_10mib_add_chain.ostl * *
+# 5 242 880 operands in one flat chain: over the AST height limit 2 048 and the node
+# limit 1 000 000 (D54), so a diagnostic and exit 1.
+long_line_10mib_add_chain.ostl 1 1
 
 # Nesting: satisfied by a diagnostic from the parser depth limit 256 (SPEC 5.0, ARCH 3.4).
 nest_paren_100k.ostl 1 1
@@ -44,15 +44,21 @@ nest_interp_open_100k.ostl 1 1
 nest_indent_2000.ostl 1 1
 
 # Long flat chains are not nesting and must not overflow the stack (D43, iterative
-# operator chains). D43 also requires a global AST node limit whose value is not decided
-# yet (SPEC Q18). Until it is, these valid programs may end with 0 (under the limit) or
-# with a node limit diagnostic, exit 1 (over the limit): AC-04 guarantees only 0 or 1,
-# never a crash. Once Q18 names the number, cases just below and just above it get strict
-# expectations here (README, node limit).
-chain_add_100k.ostl * *
-chain_and_100k.ostl * *
-chain_and_5m.ostl * *
-chain_or_5m.ostl * *
+# operator chains). D54: AST height at most 2 048 and at most 1 000 000 nodes per file,
+# each over the limit is a parser diagnostic, exit 1 (README, node limit). The cases keep
+# margins around both limits, the exact boundary is a unit test of T1.
+chain_below.ostl 0 0
+chain_above.ostl 1 1
+wide_below.ostl 0 0
+wide_above.ostl 1 1
+chain_add_100k.ostl 1 1
+chain_and_100k.ostl 1 1
+chain_and_5m.ostl 1 1
+chain_or_5m.ostl 1 1
+# Flat and low (height under 2 048), with about 4 to 6 nodes per line: 400 000 to 600 000
+# nodes, but the count per line depends on the AST representation (D54 rejects exact
+# counts), and no spec text bounds 100 000 locals or functions in the VM. Only exit 0 or
+# 1 is guaranteed.
 many_lets_100k.ostl * *
 many_fns_100k.ostl * *
 # Calling an Int is a type error: v0.1 has no function values (SYNTAX 4.11), and the
@@ -92,6 +98,37 @@ escape_u_surrogate_low.ostl 1 1 error[E0005]
 escape_u_too_large.ostl 1 1 error[E0005]
 escape_u_zero.ostl 0 0
 escape_u_max.ostl 0 0
+
+# Bidirectional control characters U+202A to U+202E and U+2066 to U+2069 raw anywhere in
+# the source are a lexer diagnostic (D53, ARCH 3.1); as a `\u{...}` escape they are valid,
+# and other invisible characters stay valid in strings and comments (D53).
+bidi_override_in_string.ostl 1 1
+bidi_override_in_comment.ostl 1 1
+bidi_u202a_in_string.ostl 1 1
+bidi_u202b_in_string.ostl 1 1
+bidi_u202c_in_string.ostl 1 1
+bidi_u202d_in_string.ostl 1 1
+bidi_u202e_in_string.ostl 1 1
+bidi_u2066_in_string.ostl 1 1
+bidi_u2067_in_string.ostl 1 1
+bidi_u2068_in_string.ostl 1 1
+bidi_u2069_in_string.ostl 1 1
+bidi_u202a_in_comment.ostl 1 1
+bidi_u202b_in_comment.ostl 1 1
+bidi_u202c_in_comment.ostl 1 1
+bidi_u202d_in_comment.ostl 1 1
+bidi_u202e_in_comment.ostl 1 1
+bidi_u2066_in_comment.ostl 1 1
+bidi_u2067_in_comment.ostl 1 1
+bidi_u2068_in_comment.ostl 1 1
+bidi_u2069_in_comment.ostl 1 1
+bidi_escape_in_string.ostl 0 0
+invisible_in_string.ostl 0 0
+invisible_in_comment.ostl 0 0
+# Identifiers are ASCII only; any other character where a token is expected is E0008
+# (SPEC 12.2).
+zero_width_in_ident.ostl 1 1 error[E0008]
+non_ascii_ident.ostl 1 1 error[E0008]
 
 # Tabs in indentation are a lex error (SYNTAX 3).
 tab_indent.ostl 1 1

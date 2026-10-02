@@ -81,7 +81,8 @@ done
 required="empty.ostl invalid_utf8.ostl nul_bytes.ostl random_1mib.ostl nest_paren_100k.ostl
   long_line_10mib_comment.ostl unterminated_string_eof.ostl string_literal_in_interp.ostl
   nested_interp.ostl double_brace.ostl escaped_braces.ostl run_deep_recursion.ostl
-  run_overflow_add.ostl run_long_loop_by_recursion.ostl"
+  run_overflow_add.ostl run_long_loop_by_recursion.ostl chain_below.ostl chain_above.ostl
+  wide_below.ostl wide_above.ostl bidi_u202e_in_string.ostl bidi_u202e_in_comment.ostl"
 for name in $required; do
   [ -n "${where[$name]:-}" ] || problem "required case missing: $name"
 done
@@ -99,6 +100,16 @@ f="${where[invalid_utf8.ostl]:-}"
 if [ -n "$f" ] && ! LC_ALL=C grep -q "$(printf '\377')" "$f"; then problem "invalid_utf8.ostl has no 0xFF byte"; fi
 f="${where[nul_bytes.ostl]:-}"
 if [ -n "$f" ] && [ "$(tr -cd '\000' < "$f" | wc -c)" -eq 0 ]; then problem "nul_bytes.ostl has no NUL byte"; fi
+# D54 chain cases: operands must stay on their side of the AST height limit in README.
+height=$(sed -n 's/^AST height limit: \([0-9][0-9]*\)\.$/\1/p' "$here/README" | head -1)
+if [ -z "$height" ]; then
+  problem "no AST height limit in tests/hostile/README"
+else
+  f="${where[chain_below.ostl]:-}"
+  if [ -n "$f" ] && [ $(( $(tr -cd '+' < "$f" | wc -c) + 1 )) -ge $((height - 16)) ]; then problem "chain_below.ostl is not clearly under the AST height limit $height"; fi
+  f="${where[chain_above.ostl]:-}"
+  if [ -n "$f" ] && [ $(( $(tr -cd '+' < "$f" | wc -c) + 1 )) -le "$height" ]; then problem "chain_above.ostl is not over the AST height limit $height"; fi
+fi
 for f in "$here"/cases/*; do
   [ "$(size "$f")" -le 65536 ] || problem "committed case over 64 KiB, generate it instead: $f"
 done

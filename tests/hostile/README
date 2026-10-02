@@ -41,12 +41,25 @@ Small step limit for `run --max-steps`: 1000000.
 
 ### Node limit
 
-D43 requires a global AST node limit in the parser besides the nesting depth limit of 256.
-Its number is not decided yet (SPEC Q18, open with the architect). Until it is, the long
-flat chains (`long_line_10mib_add_chain`, `chain_*`, `many_*`) expect exit 0 or 1 for
-`check` and `run`: never a crash, panic, signal or timeout. When Q18 names the number, it
-is written here and the generator adds one chain just below and one just above it, with
-strict expectations (0 below, 1 above).
+The parser has three limits (D43, D54, ARCHITECTURE 3.4); each one exceeded is a
+diagnostic and exit code 1, never a crash:
+
+Nesting depth limit: 256.
+AST height limit: 2048.
+AST node limit per file: 1000000.
+
+The nesting depth counts brackets and blocks. The AST height is the longest path from the
+root to a leaf, so a flat chain `1 + 1 + ...` has about one level per operand. The node
+limit counts every node the parser creates, not tokens or trivia (`ostrel_syntax::parse::MAX_NODES`,
+no CLI flag in v0.1).
+
+The corpus tests these limits with margins, not at the exact boundary (D54; T1 tests the
+boundary as a unit test): `chain_below` (2 000 operands, exit 0), `chain_above` (2 100
+operands, exit 1), `wide_below` (about 900 000 nodes in many small functions, exit 0) and
+`wide_above` (about 1 100 000 nodes, exit 1). Each function of the wide cases returns a
+chain of 100 operands, so at least 199 of its about 205 nodes do not depend on how the AST
+represents items and statements. The longer chains (`chain_add_100k`, `chain_and_*`,
+`chain_or_5m`, `long_line_10mib_add_chain`) are over the height limit and expect exit 1.
 
 ## Layout
 
@@ -82,8 +95,12 @@ small, and that two generator runs produce the same manifest.
 * AC-04 named cases: `empty.ostl`, `invalid_utf8*.ostl`, `nul_*.ostl`, `random_1mib.ostl`,
   `nest_*_100k.ostl`, `long_line_10mib_*.ostl`, `unterminated_*_eof.ostl`.
 * Nesting is satisfied by a diagnostic from the parser depth limit (SPEC 5.0), so every
-  `nest_*` case expects exit 1. Long flat chains are not nesting (D43); they expect exit 0
-  or 1 until the node limit is known (see Node limit).
+  `nest_*` case expects exit 1. Long flat chains are not nesting (D43); they hit the AST
+  height limit and expect exit 1. Height and node limit are tested with margins on both
+  sides by `chain_below`, `chain_above`, `wide_below` and `wide_above` (D54, Node limit).
+* Bidirectional control characters (D53): each of the nine characters raw in a string and
+  in a comment (`bidi_u*`, exit 1), the same characters as `\u{...}` escapes and other
+  invisible characters in strings and comments (exit 0), non ASCII identifiers (E0008).
 * Chains of REVIEW_RED_A3 #1: operator chain of 5 242 879 `+` in one 10 MiB line
   (`long_line_10mib_add_chain`), `and` and `or` chains of 5 000 000 (`chain_and_5m`,
   `chain_or_5m`) and a postfix call chain `f(1)(1)...` of 5 000 000 calls
