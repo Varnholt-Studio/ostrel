@@ -1,0 +1,8 @@
+fn spin(n: Int) -> Int
+  if n == 0
+    return 1
+  return spin(n - 1) + spin(n - 1) - spin(n - 1)
+
+fn main()
+  print("start")
+  print(spin(60))

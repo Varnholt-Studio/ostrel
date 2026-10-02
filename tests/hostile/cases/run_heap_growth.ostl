@@ -1,0 +1,19 @@
+// D44: 64 live texts of 8 MiB each (512 MiB) pass the 256 MiB heap limit before any
+// single text reaches the 16 MiB text limit.
+fn big(s: Text, n: Int) -> Text
+  if n == 0
+    return s
+  return big("{s}{s}", n - 1)
+
+fn hold(s: Text, n: Int) -> Int
+  if n == 0
+    return 0
+  let t = "{s}{n}"
+  let r = hold(s, n - 1)
+  if t == s
+    return r + 1
+  return r
+
+fn main()
+  print("start")
+  print(hold(big("abcdefgh", 20), 64))
