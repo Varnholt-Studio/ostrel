@@ -1,0 +1,7 @@
+# Committed fuzz campaigns for AC-36: one campaign per line, "TARGET SEED".
+# run.sh runs every line for the given duration (default 30m).
+# A seed is never reused for a different meaning; add new lines instead of editing old ones.
+check 1
+fmt 1
+check 20261002
+fmt 20261002

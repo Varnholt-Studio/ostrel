@@ -1,0 +1,88 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>outbox check</title>
+<script type="module">
+  // Checks the outbox against the real IndexedDB of the browser and posts the result to the
+  // runner (run_chromium.mjs). Two iframes stand in for two tabs of the same origin.
+  import { openOutbox } from '../outbox.mjs';
+
+  const DB = 'ostrel-outbox-check';
+  const USER = 'user-alice';
+  const REPLICA = '00000000000000a1';
+  const PER_TAB = 50;
+  const results = [];
+
+  function check(name, ok, detail = '') {
+    results.push({ name, ok: Boolean(ok), detail });
+  }
+
+  function runTab(tab) {
+    return new Promise((resolve) => {
+      const frame = document.createElement('iframe');
+      const listener = (event) => {
+        if (event.data?.tab !== tab) return;
+        removeEventListener('message', listener);
+        resolve(event.data);
+      };
+      addEventListener('message', listener);
+      frame.src = `tab.html?db=${DB}&tab=${tab}&count=${PER_TAB}`;
+      document.body.append(frame);
+    });
+  }
+
+  async function deleteDatabase(name) {
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.deleteDatabase(name);
+      request.onsuccess = resolve;
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function main() {
+    await deleteDatabase(DB);
+
+    const [one, two] = await Promise.all([runTab('one'), runTab('two')]);
+    check('tab one appended', !one.error, one.error);
+    check('tab two appended', !two.error, two.error);
+    const opIds = [...(one.opIds ?? []), ...(two.opIds ?? [])];
+    const seqs = opIds.map((opId) => Number.parseInt(opId.slice(16), 16)).sort((a, b) => a - b);
+    const expected = Array.from({ length: 2 * PER_TAB }, (_, i) => i + 1);
+    check('two tabs: seqs unique and contiguous', JSON.stringify(seqs) === JSON.stringify(expected));
+
+    // A fresh connection sees what both tabs wrote, like a reload.
+    let outbox = await openOutbox({ indexedDB, IDBKeyRange, name: DB });
+    const pending = await outbox.pending({ user: USER, replica: REPLICA, limit: 1000 });
+    check('reload: all entries pending in seq order', pending.length === 2 * PER_TAB &&
+      pending.every((entry, i) => entry.seq === i + 1));
+
+    // An op IndexedDB cannot store aborts the whole transaction, clock included.
+    let failed = false;
+    try {
+      await outbox.append({ user: USER, replica: REPLICA, op: { notCloneable: () => 1 } });
+    } catch (error) {
+      failed = error?.name === 'DataCloneError';
+    }
+    check('uncloneable op rejects with DataCloneError', failed);
+    const next = await outbox.append({ user: USER, replica: REPLICA, op: { kind: 'noop' } });
+    check('failed append left no gap in seq', next.seq === 2 * PER_TAB + 1, `seq ${next.seq}`);
+
+    await outbox.remove(pending.slice(0, 10).map((entry) => entry.opId));
+    outbox.close();
+    outbox = await openOutbox({ indexedDB, IDBKeyRange, name: DB });
+    const rest = await outbox.pending({ user: USER, replica: REPLICA, limit: 1000 });
+    check('remove is durable', rest.length === 2 * PER_TAB + 1 - 10 && rest[0].seq === 11);
+
+    const discarded = await outbox.discardForeign({ user: 'user-bob', replica: '00000000000000b2' });
+    check('discardForeign counts foreign entries', discarded === rest.length, `${discarded}`);
+    outbox.close();
+    await deleteDatabase(DB);
+  }
+
+  try {
+    await main();
+  } catch (error) {
+    check('no unexpected error', false, String(error?.stack ?? error));
+  }
+  await fetch('/result', { method: 'POST', body: JSON.stringify(results) });
+</script>
+<body></body>

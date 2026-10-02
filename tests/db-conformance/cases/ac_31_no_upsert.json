@@ -1,0 +1,714 @@
+{
+ "format": 1,
+ "ac": "AC-31",
+ "schema": [
+  {
+   "model": 0,
+   "name": "Note",
+   "fields": [
+    {
+     "field": 0,
+     "name": "title",
+     "type": "Text"
+    }
+   ]
+  },
+  {
+   "model": 1,
+   "name": "Tag",
+   "fields": [
+    {
+     "field": 0,
+     "name": "label",
+     "type": "Text"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "name": "ac_31_insert_existing_id_same_model",
+   "doc": "Insert of an id that exists in the same model fails; the existing row is unchanged.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": [
+      {
+       "id": "1",
+       "version": 1,
+       "fields": {
+        "0": {
+         "text": "a"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "ac_31_insert_existing_id_other_model",
+   "doc": "Insert of an id that exists in another model fails; neither model changes.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 1,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": [
+      {
+       "id": "1",
+       "version": 1,
+       "fields": {
+        "0": {
+         "text": "a"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "query": {
+      "model": 1,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    }
+   ]
+  },
+  {
+   "name": "ac_31_insert_deleted_id_same_model",
+   "doc": "Insert of a deleted id in the same model fails; the row is not resurrected.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "delete": {
+        "model": 0,
+        "row": "1",
+        "expect_version": 1
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    }
+   ]
+  },
+  {
+   "name": "ac_31_insert_deleted_id_other_model",
+   "doc": "Insert of an id deleted in another model fails; no model gains a row.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "delete": {
+        "model": 0,
+        "row": "1",
+        "expect_version": 1
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 1,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    },
+    {
+     "query": {
+      "model": 1,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    }
+   ]
+  },
+  {
+   "name": "ac_31_insert_twice_in_one_transaction",
+   "doc": "Two inserts of the same id in one transaction fail; the rollback leaves no row.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      },
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    }
+   ]
+  },
+  {
+   "name": "ac_31_conflict_rolls_back_whole_transaction",
+   "doc": "A conflicting insert after a valid one fails the transaction; the valid insert is rolled back and its id stays free.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "2",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      },
+      {
+       "insert": {
+        "model": 1,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": [
+      {
+       "id": "1",
+       "version": 1,
+       "fields": {
+        "0": {
+         "text": "a"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "query": {
+      "model": 1,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    },
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "2",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": [
+      {
+       "id": "1",
+       "version": 1,
+       "fields": {
+        "0": {
+         "text": "a"
+        }
+       }
+      },
+      {
+       "id": "2",
+       "version": 1,
+       "fields": {
+        "0": {
+         "text": "b"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "ac_31_update_missing_row_is_not_upsert",
+   "doc": "Update of an id that never existed fails and creates no row.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "update": {
+        "model": 0,
+        "row": "1",
+        "expect_version": 1,
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "NotFound"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    },
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": [
+      {
+       "id": "1",
+       "version": 1,
+       "fields": {
+        "0": {
+         "text": "b"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "ac_31_update_deleted_row_is_not_upsert",
+   "doc": "Update of a deleted row fails and does not resurrect it.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "delete": {
+        "model": 0,
+        "row": "1",
+        "expect_version": 1
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "update": {
+        "model": 0,
+        "row": "1",
+        "expect_version": 2,
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "NotFound"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    }
+   ]
+  },
+  {
+   "name": "ac_31_update_in_other_model_is_not_upsert",
+   "doc": "Update of an id that lives in another model fails; neither model changes.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "update": {
+        "model": 1,
+        "row": "1",
+        "expect_version": 1,
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "NotFound"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": [
+      {
+       "id": "1",
+       "version": 1,
+       "fields": {
+        "0": {
+         "text": "a"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "query": {
+      "model": 1,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    }
+   ]
+  },
+  {
+   "name": "ac_31_delete_deleted_row",
+   "doc": "Delete of a deleted row fails; the id stays taken.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "delete": {
+        "model": 0,
+        "row": "1",
+        "expect_version": 1
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "delete": {
+        "model": 0,
+        "row": "1",
+        "expect_version": 2
+       }
+      }
+     ],
+     "expect": {
+      "error": "NotFound"
+     }
+    },
+    {
+     "tx": [
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "query": {
+      "model": 0,
+      "order": [],
+      "limit": null
+     },
+     "expect": []
+    }
+   ]
+  }
+ ]
+}
