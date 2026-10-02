@@ -5,26 +5,37 @@ on:
     branches: [main, dev]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: target
+      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+          persist-credentials: false
+      - name: Rust toolchain (pinned in rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version && cargo --version
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-      - name: Install test runner
-        run: pip install pytest
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+      - name: Fetch dependencies
+        run: cargo fetch --locked
       - name: Quality gate
         run: bash ci/gate.sh

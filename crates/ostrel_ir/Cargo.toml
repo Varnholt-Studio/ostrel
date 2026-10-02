@@ -1,0 +1,15 @@
+[package]
+name = "ostrel_ir"
+description = "Intermediate representation and lowering for the Ostrel programming language."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ostrel_core.workspace = true
+ostrel_sema.workspace = true
+
+[lints]
+workspace = true

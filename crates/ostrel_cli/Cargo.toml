@@ -1,0 +1,22 @@
+[package]
+name = "ostrel_cli"
+description = "Command line interface (ostrel) of the Ostrel programming language."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ostrel"
+path = "src/main.rs"
+
+[dependencies]
+ostrel_core.workspace = true
+ostrel_syntax.workspace = true
+ostrel_sema.workspace = true
+ostrel_ir.workspace = true
+ostrel_vm.workspace = true
+
+[lints]
+workspace = true

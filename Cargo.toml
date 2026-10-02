@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ostrel_core",
+    "crates/ostrel_syntax",
+    "crates/ostrel_sema",
+    "crates/ostrel_ir",
+    "crates/ostrel_vm",
+    "crates/ostrel_cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Internal crates. External crates are added only from the allowlist in
+# ci/allowed-crates.txt and with an architect decision.
+[workspace.dependencies]
+ostrel_core = { path = "crates/ostrel_core" }
+ostrel_syntax = { path = "crates/ostrel_syntax" }
+ostrel_sema = { path = "crates/ostrel_sema" }
+ostrel_ir = { path = "crates/ostrel_ir" }
+ostrel_vm = { path = "crates/ostrel_vm" }
+
+# Every crate opts in with `[lints] workspace = true`. Crates that read user
+# input (ostrel_syntax, ostrel_cli) additionally deny unwrap, expect, panic and
+# unchecked indexing at their crate root, because Cargo does not allow crate
+# level lint tables next to `workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 1
