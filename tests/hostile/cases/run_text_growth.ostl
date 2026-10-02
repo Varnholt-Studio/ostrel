@@ -1,0 +1,7 @@
+fn grow(s: Text, n: Int) -> Text
+  if n == 0
+    return s
+  return grow("{s}{s}", n - 1)
+
+fn main()
+  print(grow("abcdefgh", 40))
