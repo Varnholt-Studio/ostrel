@@ -83,12 +83,23 @@ with size and FNV-1a hash in `corpus/MANIFEST`.
 bash tests/hostile/run.sh --self-test                     # corpus checks, no compiler needed
 bash tests/hostile/run.sh --ostrel target/release/ostrel  # full run, used by the gate
 bash tests/hostile/run.sh --count 5000 --seed 12345       # more seeded cases
+bash tests/hostile/run.sh --commands run --ostrel PATH    # only the `run` half
 ```
+
+`--commands` takes a comma separated list of `check`, `run` and `fmt`. Without it the
+runner runs `check` and `run`, plus `fmt` in a milestone with a `fmt` limit; `fmt` is
+refused for a milestone without one. `45_hostile.sh` runs the default set,
+`56_hostile_run.sh` runs `--commands run`. The `--max-steps` second run of `StepLimit`
+cases belongs to `run`. A stderr text in `expect.txt` is checked under `run` for
+`runtime error[Kind]` and under both commands for a diagnostic `error[CODE]`.
 
 `--milestone` selects the limits row (default `v0.1`). The self test checks that every
 required case exists (the seven named cases of AC-04, the string cases of RED-B F17, the
 `run` cases of A2-16), that every name in `expect.txt` exists, that committed cases stay
-small, and that two generator runs produce the same manifest.
+small, and that two generator runs produce the same manifest. It also tests the runner
+itself against `stub_ostrel.sh`, a stand-in that answers every committed case as
+`expect.txt` says: each `--commands` set must make exactly its calls, a wrong exit code or a
+missing diagnostic code must be reported, and an unknown command must exit 2.
 
 ## Coverage
 
@@ -100,7 +111,13 @@ small, and that two generator runs produce the same manifest.
   sides by `chain_below`, `chain_above`, `wide_below` and `wide_above` (D54, Node limit).
 * Bidirectional control characters (D53): each of the nine characters raw in a string and
   in a comment (`bidi_u*`, exit 1), the same characters as `\u{...}` escapes and other
-  invisible characters in strings and comments (exit 0), non ASCII identifiers (E0008).
+  invisible characters in strings and comments (exit 0), non ASCII identifiers (E0008),
+  and raw characters in `style` text (a CSS comment and a declaration value, exit 1).
+* SPEC 12.6 (D68): `duplicate_main` (E0201), `lone_close_brace` (E0012) and `indent_jump`
+  (E0013) exit 1; CRLF and one BOM at byte 0 are valid, a lone CR and a BOM inside code are
+  E0008; an empty file is E0400. Codes are pinned in `expect.txt` once they are registered
+  in `tests/errors/README.md`. SYNTAX has no doc comments, so the bidi case for them is
+  the plain comment case.
 * Chains of REVIEW_RED_A3 #1: operator chain of 5 242 879 `+` in one 10 MiB line
   (`long_line_10mib_add_chain`), `and` and `or` chains of 5 000 000 (`chain_and_5m`,
   `chain_or_5m`) and a postfix call chain `f(1)(1)...` of 5 000 000 calls

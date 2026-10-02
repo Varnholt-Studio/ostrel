@@ -297,6 +297,17 @@ fn named_cases(out: &mut Out, seed: u64) -> io::Result<()> {
         "bidi_override_in_comment.ostl",
         "// \u{202e} } \u{2066}\nfn main()\n  print(1)\n".as_bytes(),
     )?;
+    // D53, SPEC 12.6 (E0011): raw bidi characters are rejected in `style` text too, in a CSS
+    // comment and in a declaration value. A program without a `style` body cannot exit 0
+    // either way, so the expectation does not depend on `style` support in the milestone.
+    out.write(
+        "bidi_u202e_in_style_comment.ostl",
+        "style\n  .a {\n    color: red; /* a\u{202e}b */\n  }\n\nfn main()\n  print(1)\n".as_bytes(),
+    )?;
+    out.write(
+        "bidi_u2066_in_style_value.ostl",
+        "style\n  .a::after {\n    content: \"a\u{2066}b\";\n  }\n\nfn main()\n  print(1)\n".as_bytes(),
+    )?;
     // D53: each of the nine characters raw in a string and in a comment is rejected;
     // as a `\u{...}` escape it stays valid, and other invisible characters stay valid.
     for c in BIDI {
