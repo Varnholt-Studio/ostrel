@@ -34,6 +34,7 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 |---|---|---|---|
 | E0001 | `lex_tab_indent` | 2:1 | tab in indentation; indent with two spaces |
 | E0002 | `lex_odd_indent` | 2:1 | indentation must be a multiple of two spaces |
+| E0002 | `lex_odd_indent_too_deep` | 2:1 | indentation must be a multiple of two spaces |
 | E0003 | `lex_unterminated_string` | 2:11 | unterminated string literal |
 | E0004 | `lex_unknown_escape` | 2:12 | unknown escape sequence `\q` |
 | E0004 | `lex_escape_empty_unicode` | 2:12 | malformed escape `\u{}`; write 1 to 6 hex digits between the braces |
@@ -47,6 +48,10 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0008 | `lex_column_counts_scalars` | 2:21 | unexpected character `@` |
 | E0009 | `lex_semicolon` | 2:12 | `;` is not used in Ostrel; write one statement per line |
 | E0010 | `lex_int_literal_too_large` | 2:11 | integer literal is outside the `Int` range of -9007199254740991 to 9007199254740991 |
+| E0011 | `lex_bidi_in_comment` | 2:16 | bidirectional control character U+202E is not allowed in source; write `\u{202E}` inside a string if it is needed |
+| E0011 | `lex_bidi_in_string` | 2:12 | bidirectional control character U+2066 is not allowed in source; write `\u{2066}` inside a string if it is needed |
+| E0012 | `lex_lone_close_brace` | 2:10 | `}` in a string literal must be written as `\}` |
+| E0013 | `lex_indent_jump` | 2:1 | indentation is more than one level deeper than the line above; indent a block by two spaces |
 | E0020 | `parse_compound_assign` | 3:5 | Ostrel assigns with `=`; compound assignment does not exist |
 | E0020 | `parse_walrus_assign` | 2:5 | Ostrel assigns with `=`; `:=` does not exist, declare a new name with `let` |
 | E0021 | `parse_is_operator` | 3:8 | `is` is not Ostrel; to unwrap an optional write `if let y = x` |
@@ -59,12 +64,17 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0100 | `check_float_type_v0_1` | 1:14 | type `Float` is not available in v0.1 |
 | E0200 | `name_unknown` | 3:9 | unknown name `y` |
 | E0201 | `name_duplicate_fn` | 4:4 | function `f` is already declared |
+| E0201 | `name_duplicate_main` | 4:4 | function `main` is already declared |
 | E0202 | `name_duplicate_param` | 1:16 | parameter `a` is already declared |
 | E0203 | `name_unknown_type` | 1:13 | unknown type `Integer`; v0.1 has `Int`, `Text` and `Bool` |
 | E0300 | `type_text_plus` | 2:13 | `+` does not join text; join text with interpolation |
 | E0301 | `type_condition_not_bool` | 2:6 | condition must be `Bool`, found `Int` |
 | E0302 | `type_arity` | 5:9 | `inc` takes 1 argument, found 2 |
 | E0303 | `type_implicit_return_in_branch` | 5:5 | add `return`; a function body with branches returns only through `return` |
+| E0304 | `type_mismatch_argument` | 5:13 | expected `Int`, found `Text` |
+| E0304 | `type_mismatch_equality` | 3:11 | expected `Int`, found `Text` |
+| E0304 | `type_return_value_without_result` | 3:3 | this function returns nothing, found `Int` |
+| E0305 | `type_missing_return` | 1:4 | `sign` can end without returning `Int`; add `return` |
 | E0400 | `entry_missing_main` | 1:1 | missing `fn main()`; `ostrel run` starts a script program there |
 | E0401 | `entry_main_params` | 1:9 | `fn main` takes no parameters |
 | E0402 | `entry_main_result` | 1:11 | `fn main` returns nothing; remove the result type |
@@ -81,8 +91,28 @@ The `{` that opens an interpolation is depth 1; each further unescaped `{` adds 
 subtracts 1. Depth 32 is accepted; the brace that would reach depth 33 is E0007 at that brace
 (SPEC 12.1). `lex_interpolation_too_deep` opens 33 braces, so the error is at the 33rd, 3:42.
 
+## Layout, code points and bidi (D68)
+
+* Indentation is a stack of columns. A line may open exactly one level, two columns deeper than
+  the line above. Deeper is E0013 at column 1 of the line (`lex_indent_jump`); the following lines
+  of that block give no further diagnostic. An odd column is E0002, also when it is too deep as
+  well, and a fault never gives both (`lex_odd_indent` with 3 spaces, `lex_odd_indent_too_deep`
+  with 5 spaces, SPEC 12.6).
+* A raw bidi control character (U+202A to U+202E, U+2066 to U+2069) is E0011 anywhere, in comments
+  and strings too (D53). The message names the code point with at least four upper case hex
+  digits and never contains the raw character, so `lex_bidi_in_comment.ostl` and `lex_bidi_in_string.ostl` are the only files in
+  this directory that carry such a character, and no `.expected_err` file ever does. The lexer
+  continues after it, so the rest of the string or comment gives no second diagnostic.
+* `}` in string text outside an interpolation is E0012 at the brace; it is written `\}`.
+* `lex_non_ascii_name` holds exactly one non ASCII character, so its single diagnostic does not
+  depend on whether the lexer merges a run of unexpected characters.
+
 ## Assumptions
 
+* `type_return_value_without_result`: the message text is the checker owner's (SPEC 12.6 leaves
+  texts of E0304 and E0305 to the owner); the position, the `return` keyword, is binding.
+* `type_missing_return`: the body ends with an `if` that has no `else`, so no trailing expression
+  exists and E0303 does not apply (SPEC 12.6).
 * `check_float_type_v0_1`: `Float` is a type of the language (SPEC 5.0 AC-20) but outside the
   v0.1 slice, so the checker reports it with E0100, while a name that is no type at all, such as
   `Integer`, is E0203. The parser reads any type name, so this case needs no construct beyond
@@ -96,6 +126,7 @@ subtracts 1. Depth 32 is accepted; the brace that would reach depth 33 is E0007 
 * `Int` literal range: ARCHITECTURE 3.2 G9.
 * False friends (`+=`, `:=`, `is`, text joined with `+`, implicit return in a branch): SYNTAX 9.
 * Diagnostic format, columns, interpolation depth, code catalog: SPEC 12.1.
+* E0011 to E0013, E0201 for a second `main`, E0304, E0305: SPEC 12.6, D53, D68, ARCHITECTURE 3.5.
 * Identifiers are ASCII only, `else if` on one line is a parser diagnostic: SPEC 12.2.
 * Escapes, including the malformed `\u{}` forms: SPEC 12.4.
 * Block structure without braces or `:` heads, one statement per line: SYNTAX 2 P1 and P2.
@@ -110,4 +141,6 @@ support beyond T1-3. Their goldens are added once the parser reads `for` and `[.
 
 Runtime errors (`IntOverflow`, `DivisionByZero`, `CallDepth`, `StepLimit`) exit with 1 from
 `ostrel run` and have their own goldens (T2-4, AC-52). Parser depth and size limits belong to
-the hostile corpus in `tests/hostile/` (AC-04).
+the hostile corpus in `tests/hostile/` (AC-04); their three codes (nesting depth, AST height,
+node count, D54) enter this catalog with their first golden once the parser that reports them
+is on `dev`.

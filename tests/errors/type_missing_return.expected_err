@@ -1,0 +1,1 @@
+tests/errors/type_missing_return.ostl:1:4: error[E0305]: `sign` can end without returning `Int`; add `return`
