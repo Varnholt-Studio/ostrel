@@ -1,23 +1,24 @@
-# Locked package set of Cargo.lock (ARCHITECTURE section 11, decision D4).
+# Locked external package set of Cargo.lock (ARCHITECTURE section 11, D4).
 #
 # Contract for ci/checks/30_deps.sh:
-#   * One line per [[package]] entry of Cargo.lock, sorted bytewise
-#     (LC_ALL=C): "name version source checksum". Workspace members have no
-#     source and no checksum; both columns are written as "-".
+#   * One line per [[package]] entry of Cargo.lock that has a "source"
+#     field, sorted bytewise (LC_ALL=C): "name version source checksum".
+#     A package without a checksum (for example a git source) writes "-" in
+#     the checksum column; 30_deps rejects such sources anyway.
+#   * Workspace members (entries without a source) are never listed. Adding
+#     a crate under crates/ (D58) needs no change of this file.
 #   * Lines starting with "#" and empty lines are ignored.
-#   * The remaining lines must equal the package set of Cargo.lock exactly.
-#   * A commit that changes this file must name an architect DECISION id in
-#     its commit message.
+#   * The remaining lines must equal the external package set of Cargo.lock
+#     exactly.
+#   * A commit that adds a crate to ci/allowed-crates.txt names the architect
+#     DECISION id and updates this file in the same commit. Version or
+#     checksum changes of already allowed packages need no DECISION, but this
+#     file must be regenerated in the same commit.
 #
 # Regenerate from the repository root:
-#   awk '/^\[\[package\]\]/{if(n)print n,v,s,c;n=v="";s=c="-"}
+#   awk '/^\[\[package\]\]/{if(n&&s!="-")print n,v,s,c;n=v="";s=c="-"}
 #        /^name = /{n=$3} /^version = /{v=$3} /^source = /{s=$3}
-#        /^checksum = /{c=$3} END{if(n)print n,v,s,c}' Cargo.lock \
+#        /^checksum = /{c=$3} END{if(n&&s!="-")print n,v,s,c}' Cargo.lock \
 #     | tr -d '"' | LC_ALL=C sort
 #
-ostrel_cli 0.0.0 - -
-ostrel_core 0.0.0 - -
-ostrel_ir 0.0.0 - -
-ostrel_sema 0.0.0 - -
-ostrel_syntax 0.0.0 - -
-ostrel_vm 0.0.0 - -
+# The workspace has no external packages yet, so the list below is empty.
