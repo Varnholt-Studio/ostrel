@@ -10,8 +10,8 @@
 #     referenced by an in tree path (crates/ostrel_*).
 #   * Sources other than crates.io (git, registry overrides, out of tree
 #     paths) are never allowed, whatever this list says.
-#   * Adding a line needs an architect DECISION id in the commit message and
-#     the matching change of ci/deps-snapshot.txt.
+#   * Adding a crate name needs a DECISION id in the commit message (D64).
+#     Changing features or regenerating ci/deps-snapshot.txt needs none.
 #
 # name               features                                        used by
 tokio                rt,net,io-util,time,sync,macros,process         # server, VM host, drivers, sidecar
@@ -23,7 +23,7 @@ tokio-postgres       *                                               # ostrel_db
 rusqlite             *                                               # ostrel_db_sqlite, never "bundled"
 serde                derive                                          # sync, CLI, tests
 serde_json           *                                               # sync, CLI, tests
-ed25519-dalek        std,rand_core                                   # ostrel_auth, PASETO v4.public
+ed25519-dalek        std,rand_core,fast,zeroize                      # ostrel_auth, PASETO v4.public (D63)
 getrandom            *                                               # ostrel_auth, ostrel_core
-base64               *                                               # ostrel_auth, base64url
+base64               alloc                                           # ostrel_auth, base64url (D63)
 rustc-hash           *                                               # ostrel_sema, ostrel_vm

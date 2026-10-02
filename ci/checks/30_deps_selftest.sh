@@ -134,14 +134,24 @@ printf '  "std",\n] }\n' >> "$d/Cargo.toml"
 expect features_multiline 1 "write the features of rustc-hash on one line" "$d"
 
 d=$(case_dir commit_without_decision)
-echo "# note" >> "$d/ci/allowed-crates.txt"; commit "$d" "Tweak allowlist"
-expect commit_without_decision 1 "without a DECISION id" "$d"
+echo "anyhow * # new" >> "$d/ci/allowed-crates.txt"; commit "$d" "Allow anyhow"
+expect commit_without_decision 1 "adds crates to ci/allowed-crates.txt (anyhow) without a DECISION id" "$d"
 
 d=$(case_dir commit_with_decision)
-echo "# note" >> "$d/ci/allowed-crates.txt"; commit "$d" "Tweak allowlist
+echo "anyhow * # new" >> "$d/ci/allowed-crates.txt"; commit "$d" "Allow anyhow
 
 Per D4."
 expect commit_with_decision 0 "" "$d"
+
+# D64: features, comments and a regenerated snapshot need no DECISION id.
+d=$(case_dir commit_features_only)
+sed -i 's/^serde derive/serde derive,std/' "$d/ci/allowed-crates.txt"
+echo "# note" >> "$d/ci/allowed-crates.txt"; commit "$d" "Widen serde features"
+expect commit_features_only 0 "" "$d"
+
+d=$(case_dir commit_snapshot_only)
+echo "# regenerated" >> "$d/ci/deps-snapshot.txt"; commit "$d" "Regenerate snapshot"
+expect commit_snapshot_only 0 "" "$d"
 
 d=$(case_dir npm_outside_bench)
 printf '{ "devDependencies": { "left-pad": "1.0.0" } }\n' > "$d/runtime/js/package.json"

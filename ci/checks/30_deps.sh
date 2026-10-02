@@ -17,8 +17,9 @@
 #   4. The external packages of Cargo.lock (those with a source) equal
 #      ci/deps-snapshot.txt exactly. Workspace members are not in the snapshot, so a new
 #      crates/ostrel_* crate needs no snapshot change (D58).
-#   5. A commit that changes ci/deps-snapshot.txt or ci/allowed-crates.txt names a
-#      DECISION id (D<number>) in its message. Commits checked: GATE_BASE..HEAD, where
+#   5. A commit that adds a crate name to ci/allowed-crates.txt names a DECISION id
+#      (D<number>) in its message (D64). Feature changes, removals, comments and a
+#      regenerated ci/deps-snapshot.txt need none. Commits checked: GATE_BASE..HEAD, where
 #      GATE_BASE defaults to origin/dev when that ref exists. Needs the git history, so it
 #      runs only in a git checkout (branch gates); the server gate checks an export without
 #      .git and prints that the rule was not checked there.
@@ -104,6 +105,12 @@ toml_dep_features() {
   ' "$1"
 }
 
+# allow_names: the crate names (column 1) of a ci/allowed-crates.txt read from stdin,
+# sorted and unique.
+allow_names() {
+  sed 's/#.*//' | awk 'NF{print $1}' | LC_ALL=C sort -u
+}
+
 # check_policy_commits DIR: rule 5. Prints problems, returns 1 on any.
 check_policy_commits() {
   local dir=$1 base="${GATE_BASE:-}" c subj bad=0
@@ -120,13 +127,18 @@ check_policy_commits() {
     echo "   deps: no base ref (GATE_BASE or origin/dev), commit message rule not checked"
     return 0
   fi
+  local added
   while read -r c; do
+    added=$(LC_ALL=C comm -13 \
+      <(git -C "$dir" show "$c^:ci/allowed-crates.txt" 2>/dev/null | allow_names) \
+      <(git -C "$dir" show "$c:ci/allowed-crates.txt" 2>/dev/null | allow_names) | tr '\n' ' ')
+    [ -z "$added" ] && continue
     if ! git -C "$dir" log -1 --format=%B "$c" | grep -qE '\bD[0-9]+\b'; then
       subj=$(git -C "$dir" log -1 --format=%s "$c")
-      echo "   deps: commit ${c:0:10} ($subj) changes the dependency policy files without a DECISION id (D<number>) in its message"
+      echo "   deps: commit ${c:0:10} ($subj) adds crates to ci/allowed-crates.txt (${added% }) without a DECISION id (D<number>) in its message"
       bad=1
     fi
-  done < <(git -C "$dir" rev-list --no-merges "$base..HEAD" -- ci/deps-snapshot.txt ci/allowed-crates.txt)
+  done < <(git -C "$dir" rev-list --no-merges "$base..HEAD" -- ci/allowed-crates.txt)
   return $bad
 }
 
@@ -238,7 +250,7 @@ check_repo() {
     done < <(toml_dep_features "$dir/$m")
   done
 
-  # Rule 5: commit messages of changes to the policy files.
+  # Rule 5: commit messages of commits that add crates to the allowlist (D64).
   check_policy_commits "$dir" || bad=1
 
   # Rule 6: npm.
