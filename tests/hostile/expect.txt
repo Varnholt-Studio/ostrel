@@ -4,12 +4,14 @@
 #   <case>   file name in cases/ (committed) or in the generated corpus
 #   <check>  exit code of `ostrel check <case>`: 0, 1, or * (0 or 1)
 #   <run>    exit code of `ostrel run <case>`: 0, 1, or * (0 or 1)
-#   rest     optional text that stderr of `ostrel run` must contain
+#   rest     optional text that stderr must contain: `runtime error[Kind]` under `ostrel run`,
+#            `error[CODE]` under both commands (SPEC 12.6: a diagnostic exits 1 for both)
 # Cases not listed here must exit with 0 or 1 for both commands (AC-04).
 # Every strict value names its source. Expectations hold for the milestone in README.
 
 # AC-04 named cases. Source is UTF-8 (SYNTAX 3); no main means run fails (SYNTAX 4.11).
-empty.ostl * 1
+# SPEC 12.6 (D68): an empty file lexes to EOF only and is E0400 from check and run.
+empty.ostl 1 1 error[E0400]
 random_1mib.ostl 1 1
 invalid_utf8.ostl 1 1
 invalid_utf8_ident.ostl 1 1
@@ -129,6 +131,22 @@ invisible_in_comment.ostl 0 0
 # (SPEC 12.2).
 zero_width_in_ident.ostl 1 1 error[E0008]
 non_ascii_ident.ostl 1 1 error[E0008]
+
+# Hostile expectations of SPEC 12.6 (timo #233, D68), exit 1 for check and run.
+# E0012 (lone_close_brace) and E0013 (indent_jump) are pinned here once T1 registers them in
+# tests/errors/README.md; until then the exit code is pinned (56_hostile_run.sh rejects
+# unregistered codes). Same for E0011 on the raw bidi cases.
+duplicate_main.ostl 1 1 error[E0201]
+lone_close_brace.ostl 1 1
+indent_jump.ostl 1 1
+bidi_u202e_in_style_comment.ostl 1 1
+bidi_u2066_in_style_value.ostl 1 1
+# D68: CRLF is a line end, exactly one U+FEFF at byte 0 is skipped, U+FEFF elsewhere in
+# code and a lone CR are E0008.
+crlf_lines.ostl 0 0
+bom_start.ostl 0 0
+bom_middle.ostl 1 1 error[E0008]
+cr_only_lines.ostl 1 1 error[E0008]
 
 # Tabs in indentation are a lex error (SYNTAX 3).
 tab_indent.ostl 1 1

@@ -3,8 +3,12 @@
 #
 #   bash tests/hostile/run.sh --self-test        corpus checks only, no compiler needed
 #   bash tests/hostile/run.sh [--ostrel PATH]    run `ostrel check` and `ostrel run` on every case
+#   bash tests/hostile/run.sh --commands run     run only the `run` half (ci/checks/56_hostile_run.sh)
 #
 # Options:
+#   --commands LIST    compiler commands to run, comma separated from check, run and fmt
+#                      (default: check and run, plus fmt where the milestone has a fmt limit);
+#                      fmt needs a fmt limit in the milestone row
 #   --ostrel PATH      compiler binary (default: $OSTREL, else $CARGO_TARGET_DIR/release/ostrel,
 #                      else target/release/ostrel)
 #   --milestone M      limits row of tests/hostile/README (default: $HOSTILE_MILESTONE or v0.1)
@@ -29,6 +33,8 @@ milestone="${HOSTILE_MILESTONE:-v0.1}"
 out="${HOSTILE_OUT:-${CARGO_TARGET_DIR:-$HOME/.cache/ostrel-target}/hostile}"
 count=200
 seed=""
+commands=""
+usage="usage: $0 [--self-test] [--ostrel PATH] [--commands check,run,fmt] [--milestone M] [--out DIR] [--count N] [--seed S]"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,7 +44,18 @@ while [ $# -gt 0 ]; do
     --out) out="${2:-}"; shift 2 ;;
     --count) count="${2:-}"; shift 2 ;;
     --seed) seed="${2:-}"; shift 2 ;;
-    *) echo "usage: $0 [--self-test] [--ostrel PATH] [--milestone M] [--out DIR] [--count N] [--seed S]" >&2; exit 2 ;;
+    --commands)
+      [ $# -ge 2 ] || { echo "$usage" >&2; exit 2; }
+      commands=""
+      for c in ${2//,/ }; do
+        case "$c" in
+          check|run|fmt) case " $commands " in *" $c "*) ;; *) commands="${commands:+$commands }$c" ;; esac ;;
+          *) echo "run.sh: unknown command '$c' in --commands (check, run, fmt)" >&2; exit 2 ;;
+        esac
+      done
+      [ -n "$commands" ] || { echo "run.sh: --commands needs at least one of check, run, fmt" >&2; exit 2; }
+      shift 2 ;;
+    *) echo "$usage" >&2; exit 2 ;;
   esac
 done
 
@@ -77,12 +94,14 @@ for f in "$here"/cases/*.ostl "$corpus"/*.ostl; do
   where[$name]="$f"
 done
 
-# AC-04 named cases, RED-B F17 string cases, A2-16 run cases.
+# AC-04 named cases, RED-B F17 string cases, A2-16 run cases, SPEC 12.6 cases.
 required="empty.ostl invalid_utf8.ostl nul_bytes.ostl random_1mib.ostl nest_paren_100k.ostl
   long_line_10mib_comment.ostl unterminated_string_eof.ostl string_literal_in_interp.ostl
   nested_interp.ostl double_brace.ostl escaped_braces.ostl run_deep_recursion.ostl
   run_overflow_add.ostl run_long_loop_by_recursion.ostl chain_below.ostl chain_above.ostl
-  wide_below.ostl wide_above.ostl bidi_u202e_in_string.ostl bidi_u202e_in_comment.ostl"
+  wide_below.ostl wide_above.ostl bidi_u202e_in_string.ostl bidi_u202e_in_comment.ostl
+  bidi_u202e_in_style_comment.ostl duplicate_main.ostl lone_close_brace.ostl indent_jump.ostl
+  cr_only_lines.ostl"
 for name in $required; do
   [ -n "${where[$name]:-}" ] || problem "required case missing: $name"
 done
@@ -123,12 +142,126 @@ while IFS= read -r line; do
   exp_check[$name]="$c"; exp_run[$name]="$r"; exp_err[$name]="$rest"
 done < "$here/expect.txt"
 
+# Commands of this run: --commands, else check and run plus fmt where the milestone has a limit.
+default_commands="check run"
+[ "$lim_fmt" != "-" ] && default_commands="check run fmt"
+case " ${commands:-} " in
+  *" fmt "*) [ "$lim_fmt" != "-" ] || { echo "HOSTILE FAIL: --commands fmt, but milestone $milestone has no fmt limit in tests/hostile/README"; exit 1; } ;;
+esac
+mem_kib=$((lim_mem * 1024))
+
+# run_cases BINARY "COMMANDS" NAME...: runs BINARY on the named cases, reports through problem.
+run_cases() {
+  local bin="$1" cmds="$2" name f cmd lim code want errfile="$out/stderr.txt"
+  shift 2
+  total=0
+  for name in "$@"; do
+    f="${where[$name]}"
+    for cmd in $cmds; do
+      case "$cmd" in check) lim=$lim_check ;; run) lim=$lim_run ;; *) lim=$lim_fmt ;; esac
+      total=$((total + 1))
+      ( ulimit -v "$mem_kib"; exec timeout -k 1 "$lim" "$bin" "$cmd" "$f" ) < /dev/null > /dev/null 2> "$errfile"
+      code=$?
+      case "$code" in
+        0|1) ;;
+        124|137)
+          if [ "$cmd" = run ] && [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ]; then
+            problem "run $name: default StepLimit not reached within ${lim}s (code $code); defect, BLOCKER to chief per SPEC 12.4, do not loosen the limit"
+          else
+            problem "$cmd $name: no exit within ${lim}s (code $code)"
+          fi
+          continue ;;
+        101) problem "$cmd $name: panic (exit 101)"; continue ;;
+        *) if [ "$code" -gt 128 ]; then problem "$cmd $name: killed by signal $((code - 128))"; else problem "$cmd $name: exit $code, expected 0 or 1"; fi; continue ;;
+      esac
+      want="*"
+      case "$cmd" in check) want="${exp_check[$name]:-*}" ;; run) want="${exp_run[$name]:-*}" ;; esac
+      if [ "$want" != "*" ] && [ "$want" != "$code" ]; then
+        problem "$cmd $name: exit $code, expected $want; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
+        continue
+      fi
+      # Runtime errors are checked under run; a diagnostic error[CODE] under check and run
+      # (SPEC 12.1, 12.6: a diagnostic stops the program before it runs).
+      local text="${exp_err[$name]:-}"
+      case "$cmd:$text" in
+        run:?*|check:error\[*) grep -qF -- "$text" "$errfile" || problem "$cmd $name: stderr lacks '$text'; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')" ;;
+      esac
+    done
+    # StepLimit cases run a second time with a small --max-steps (README, step limit), so the
+    # flag and the StepLimit path are checked independently of machine speed.
+    case " $cmds " in *" run "*) ;; *) continue ;; esac
+    if [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ]; then
+      total=$((total + 1))
+      ( ulimit -v "$mem_kib"; exec timeout -k 1 "$lim_run" "$bin" run --max-steps "$small_steps" "$f" ) < /dev/null > /dev/null 2> "$errfile"
+      code=$?
+      if [ "$code" != 1 ]; then
+        problem "run --max-steps $small_steps $name: exit $code, expected 1; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
+      elif ! grep -qF -- "runtime error[StepLimit]" "$errfile"; then
+        problem "run --max-steps $small_steps $name: stderr lacks 'runtime error[StepLimit]'; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
+      fi
+    fi
+  done
+}
+
 if [ "$mode" = self ]; then
   again="$out/corpus-again"
   rm -rf "$again"
   "$gen" "$again" "${gen_args[@]}" > /dev/null || problem "generator failed on second run"
   cmp -s "$corpus/MANIFEST" "$again/MANIFEST" || problem "generator is not deterministic (MANIFEST differs)"
   rm -rf "$again"
+
+  # Runner self test against stub_ostrel.sh, which answers every committed case as
+  # expect.txt says: --commands must run exactly the chosen commands, the default must stay
+  # check and run (plus fmt with a fmt limit), and a wrong answer must be reported.
+  stub="$here/stub_ostrel.sh"
+  stub_log="$out/stub.log"
+  mapfile -t small_names < <(for f in "$here"/cases/*.ostl; do basename "$f"; done | LC_ALL=C sort)
+  n=${#small_names[@]}
+  steplimit_cases=0
+  for name in "${small_names[@]}"; do
+    [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ] && steplimit_cases=$((steplimit_cases + 1))
+  done
+  # stub_run "COMMANDS" BREAK [CASE...]: runs the stub on the cases (default: all committed
+  # ones), writes the runner output to stub.out and the calls to stub.log.
+  stub_run() {
+    local cmds="$1" brk="$2"
+    shift 2
+    [ $# -gt 0 ] || set -- "${small_names[@]}"
+    : > "$stub_log"
+    ( fail=0
+      export HOSTILE_STUB_LOG="$stub_log" HOSTILE_STUB_EXPECT="$here/expect.txt" HOSTILE_STUB_BREAK="$brk"
+      run_cases "$stub" "$cmds" "$@" > "$out/stub.out"
+      exit $fail )
+  }
+  calls() { grep -c -E "^$1 [^-]" "$stub_log"; }
+  for cmds in "run" "check" "$default_commands"; do
+    stub_run "$cmds" "" || problem "runner self test: stub run with '$cmds' failed: $(head -c 300 "$out/stub.out" | tr '\n' ' ')"
+    for c in check run fmt; do
+      want=0
+      case " $cmds " in *" $c "*) want=$n ;; esac
+      [ "$(calls "$c")" = "$want" ] || problem "runner self test: '$cmds' made $(calls "$c") '$c' calls, expected $want"
+    done
+    want=0
+    case " $cmds " in *" run "*) want=$steplimit_cases ;; esac
+    got=$(grep -c -- "^run --max-steps $small_steps " "$stub_log")
+    [ "$got" = "$want" ] || problem "runner self test: '$cmds' made $got small step runs, expected $want"
+  done
+  [ "$steplimit_cases" -gt 0 ] || problem "runner self test: no committed StepLimit case"
+  # A wrong exit code under run is found by --commands run and not looked at by check.
+  if stub_run run "run duplicate_main.ostl" duplicate_main.ostl; then
+    problem "runner self test: wrong exit code of 'run duplicate_main.ostl' not reported"
+  elif ! grep -q "run duplicate_main.ostl: exit 0, expected 1" "$out/stub.out"; then
+    problem "runner self test: wrong exit code reported without case name: $(head -c 300 "$out/stub.out" | tr '\n' ' ')"
+  fi
+  stub_run check "run duplicate_main.ostl" duplicate_main.ostl || problem "runner self test: '--commands check' looked at the run half"
+  # A diagnostic code is checked under check too (SPEC 12.6).
+  stub_run check "stderr duplicate_main.ostl" duplicate_main.ostl && problem "runner self test: missing error[E0201] under check not reported"
+  for bad in "bogus" "" "run,lint"; do
+    bash "$here/run.sh" --commands "$bad" --self-test > /dev/null 2>&1
+    [ $? = 2 ] || problem "runner self test: --commands '$bad' does not exit 2"
+  done
+  rm -f "$stub_log" "$out/stub.out" "$out/stderr.txt"
+  echo "hostile: runner self test over $n committed cases"
   echo "hostile: ${#where[@]} cases, ${#exp_check[@]} with expectations"
   if [ $fail -eq 0 ]; then echo "HOSTILE SELF-TEST: OK"; else echo "HOSTILE SELF-TEST: FAILED"; fi
   exit $fail
@@ -140,53 +273,10 @@ if [ -z "$ostrel" ]; then
 fi
 if [ ! -x "$ostrel" ]; then echo "HOSTILE FAIL: compiler binary not found: $ostrel (build it or pass --ostrel)"; exit 1; fi
 
-commands="check run"
-[ "$lim_fmt" != "-" ] && commands="check run fmt"
-mem_kib=$((lim_mem * 1024))
-errfile="$out/stderr.txt"
-total=0
-for name in $(printf '%s\n' "${!where[@]}" | LC_ALL=C sort); do
-  f="${where[$name]}"
-  for cmd in $commands; do
-    case "$cmd" in check) lim=$lim_check ;; run) lim=$lim_run ;; *) lim=$lim_fmt ;; esac
-    total=$((total + 1))
-    ( ulimit -v "$mem_kib"; exec timeout -k 1 "$lim" "$ostrel" "$cmd" "$f" ) < /dev/null > /dev/null 2> "$errfile"
-    code=$?
-    case "$code" in
-      0|1) ;;
-      124|137)
-        if [ "$cmd" = run ] && [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ]; then
-          problem "run $name: default StepLimit not reached within ${lim}s (code $code); defect, BLOCKER to chief per SPEC 12.4, do not loosen the limit"
-        else
-          problem "$cmd $name: no exit within ${lim}s (code $code)"
-        fi
-        continue ;;
-      101) problem "$cmd $name: panic (exit 101)"; continue ;;
-      *) if [ "$code" -gt 128 ]; then problem "$cmd $name: killed by signal $((code - 128))"; else problem "$cmd $name: exit $code, expected 0 or 1"; fi; continue ;;
-    esac
-    want="*"
-    case "$cmd" in check) want="${exp_check[$name]:-*}" ;; run) want="${exp_run[$name]:-*}" ;; esac
-    if [ "$want" != "*" ] && [ "$want" != "$code" ]; then
-      problem "$cmd $name: exit $code, expected $want; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
-      continue
-    fi
-    if [ "$cmd" = run ] && [ -n "${exp_err[$name]:-}" ] && ! grep -qF -- "${exp_err[$name]}" "$errfile"; then
-      problem "run $name: stderr lacks '${exp_err[$name]}'; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
-    fi
-  done
-  # StepLimit cases run a second time with a small --max-steps (README, step limit), so the
-  # flag and the StepLimit path are checked independently of machine speed.
-  if [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ]; then
-    total=$((total + 1))
-    ( ulimit -v "$mem_kib"; exec timeout -k 1 "$lim_run" "$ostrel" run --max-steps "$small_steps" "$f" ) < /dev/null > /dev/null 2> "$errfile"
-    code=$?
-    if [ "$code" != 1 ]; then
-      problem "run --max-steps $small_steps $name: exit $code, expected 1; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
-    elif ! grep -qF -- "runtime error[StepLimit]" "$errfile"; then
-      problem "run --max-steps $small_steps $name: stderr lacks 'runtime error[StepLimit]'; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
-    fi
-  fi
-done
+commands="${commands:-$default_commands}"
+echo "hostile: commands $commands"
+mapfile -t all_names < <(printf '%s\n' "${!where[@]}" | LC_ALL=C sort)
+run_cases "$ostrel" "$commands" "${all_names[@]}"
 echo "hostile: $total runs over ${#where[@]} cases"
 if [ $fail -eq 0 ]; then echo "HOSTILE: OK"; else echo "HOSTILE: FAILED"; fi
 exit $fail
