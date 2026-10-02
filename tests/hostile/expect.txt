@@ -26,7 +26,9 @@ backslash_eof.ostl 1 1
 long_line_10mib_comment.ostl * 1
 long_line_10mib_ident.ostl 1 1
 long_line_10mib_string.ostl 0 0
-long_line_10mib_add_chain.ostl 0 0
+# 5 242 879 operators in one line: the global AST node limit (D43) may reject it (see
+# the chain block below), so only exit 0 or 1 is guaranteed.
+long_line_10mib_add_chain.ostl * *
 
 # Nesting: satisfied by a diagnostic from the parser depth limit 256 (SPEC 5.0, ARCH 3.4).
 nest_paren_100k.ostl 1 1
@@ -41,11 +43,22 @@ nest_interp_brace_100k.ostl 1 1
 nest_interp_open_100k.ostl 1 1
 nest_indent_2000.ostl 1 1
 
-# Long flat chains are not nesting: iterative parsing (D43), valid v0.1 programs.
-chain_add_100k.ostl 0 0
-chain_and_100k.ostl 0 0
-many_lets_100k.ostl 0 0
-many_fns_100k.ostl 0 0
+# Long flat chains are not nesting and must not overflow the stack (D43, iterative
+# operator chains). D43 also requires a global AST node limit whose value is not decided
+# yet (SPEC Q18). Until it is, these valid programs may end with 0 (under the limit) or
+# with a node limit diagnostic, exit 1 (over the limit): AC-04 guarantees only 0 or 1,
+# never a crash. Once Q18 names the number, cases just below and just above it get strict
+# expectations here (README, node limit).
+chain_add_100k.ostl * *
+chain_and_100k.ostl * *
+chain_and_5m.ostl * *
+chain_or_5m.ostl * *
+many_lets_100k.ostl * *
+many_fns_100k.ostl * *
+# Calling an Int is a type error: v0.1 has no function values (SYNTAX 4.11), and the
+# node limit also ends with 1, so exit 1 holds with or without the limit.
+call_on_int_result.ostl 1 1
+chain_call_5m.ostl 1 1
 # Comparison is not associative (SYNTAX 7, cmpExpr).
 chain_compare_100k.ostl 1 1
 chained_compare.ostl 1 1
@@ -64,6 +77,21 @@ interp_unclosed_before_quote.ostl 1 1
 double_brace.ostl 1 1
 empty_interp.ostl 1 1
 escaped_braces.ostl 0 0
+
+# Escapes (SPEC 12.4): exactly \{ \} \" \\ \n \t \u{1 to 6 hex digits}. Not a scalar value
+# is E0005, every other escape is E0004; \u{0} is valid.
+unknown_escape.ostl 1 1 error[E0004]
+escape_cr.ostl 1 1 error[E0004]
+escape_nul.ostl 1 1 error[E0004]
+escape_u_empty.ostl 1 1 error[E0004]
+escape_u_huge.ostl 1 1 error[E0004]
+escape_u_seven_digits.ostl 1 1 error[E0004]
+escape_u_unclosed.ostl 1 1 error[E0004]
+escape_u_surrogate.ostl 1 1 error[E0005]
+escape_u_surrogate_low.ostl 1 1 error[E0005]
+escape_u_too_large.ostl 1 1 error[E0005]
+escape_u_zero.ostl 0 0
+escape_u_max.ostl 0 0
 
 # Tabs in indentation are a lex error (SYNTAX 3).
 tab_indent.ostl 1 1
@@ -113,5 +141,8 @@ run_overflow_by_recursion.ostl 0 1 runtime error[IntOverflow]
 run_division_by_zero.ostl 0 1 runtime error[DivisionByZero]
 run_modulo_by_zero.ostl 0 1 runtime error[DivisionByZero]
 run_long_loop_by_recursion.ostl 0 1 runtime error[StepLimit]
-run_text_growth.ostl 0 1 runtime error[
+# D44, SPEC 12.4: the 22nd doubling would make a 32 MiB text, over the 16 MiB text limit,
+# while the live heap is still far under 256 MiB.
+run_text_growth.ostl 0 1 runtime error[TextLimit]
+run_heap_growth.ostl 0 1 runtime error[HeapLimit]
 run_print_many_lines.ostl 0 0

@@ -52,6 +52,9 @@ IFS='|' read -r _ _ lim_check lim_run lim_fmt lim_mem _ <<< "$row"
 lim_check=$(echo "$lim_check" | tr -d ' '); lim_run=$(echo "$lim_run" | tr -d ' ')
 lim_fmt=$(echo "$lim_fmt" | tr -d ' '); lim_mem=$(echo "$lim_mem" | tr -d ' ')
 echo "hostile: milestone $milestone, limits check ${lim_check}s, run ${lim_run}s, fmt ${lim_fmt}, memory ${lim_mem} MiB"
+# Small step limit for the second run of StepLimit cases; value from tests/hostile/README.
+small_steps=$(sed -n 's/^Small step limit for `run --max-steps`: \([0-9][0-9]*\)\.$/\1/p' "$here/README" | head -1)
+if [ -z "$small_steps" ]; then echo "HOSTILE FAIL: no small step limit in tests/hostile/README"; exit 1; fi
 
 # Build the generator with plain rustc (std only, no workspace entry).
 mkdir -p "$out/bin" || exit 1
@@ -140,7 +143,13 @@ for name in $(printf '%s\n' "${!where[@]}" | LC_ALL=C sort); do
     code=$?
     case "$code" in
       0|1) ;;
-      124|137) problem "$cmd $name: no exit within ${lim}s (code $code)"; continue ;;
+      124|137)
+        if [ "$cmd" = run ] && [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ]; then
+          problem "run $name: default StepLimit not reached within ${lim}s (code $code); defect, BLOCKER to chief per SPEC 12.4, do not loosen the limit"
+        else
+          problem "$cmd $name: no exit within ${lim}s (code $code)"
+        fi
+        continue ;;
       101) problem "$cmd $name: panic (exit 101)"; continue ;;
       *) if [ "$code" -gt 128 ]; then problem "$cmd $name: killed by signal $((code - 128))"; else problem "$cmd $name: exit $code, expected 0 or 1"; fi; continue ;;
     esac
@@ -154,6 +163,18 @@ for name in $(printf '%s\n' "${!where[@]}" | LC_ALL=C sort); do
       problem "run $name: stderr lacks '${exp_err[$name]}'; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
     fi
   done
+  # StepLimit cases run a second time with a small --max-steps (README, step limit), so the
+  # flag and the StepLimit path are checked independently of machine speed.
+  if [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ]; then
+    total=$((total + 1))
+    ( ulimit -v "$mem_kib"; exec timeout -k 1 "$lim_run" "$ostrel" run --max-steps "$small_steps" "$f" ) < /dev/null > /dev/null 2> "$errfile"
+    code=$?
+    if [ "$code" != 1 ]; then
+      problem "run --max-steps $small_steps $name: exit $code, expected 1; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
+    elif ! grep -qF -- "runtime error[StepLimit]" "$errfile"; then
+      problem "run --max-steps $small_steps $name: stderr lacks 'runtime error[StepLimit]'; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
+    fi
+  fi
 done
 echo "hostile: $total runs over ${#where[@]} cases"
 if [ $fail -eq 0 ]; then echo "HOSTILE: OK"; else echo "HOSTILE: FAILED"; fi

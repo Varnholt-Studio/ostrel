@@ -7,7 +7,8 @@
 //!
 //! Writes two kinds of files into `<out-dir>`:
 //! * named cases: the large and binary inputs AC-04 requires (1 MiB random bytes,
-//!   10 MiB single line, nesting depth 100 000, invalid UTF-8, NUL bytes) that cannot or
+//!   10 MiB single line, nesting depth 100 000, chains of 5 000 000 operators or calls,
+//!   invalid UTF-8, NUL bytes) that cannot or
 //!   should not be committed;
 //! * seeded cases: `N` small random inputs (random bytes, token soup, mutations of valid
 //!   programs), reproducible from the base seed.
@@ -23,6 +24,8 @@ use std::process::ExitCode;
 
 const MIB: usize = 1024 * 1024;
 const NEST: usize = 100_000;
+/// Operator, `and`, `or` and call chain length (REVIEW_RED_A3 #1).
+const CHAIN: usize = 5_000_000;
 const DEFAULT_COUNT: u64 = 200;
 const DEFAULT_SEED: u64 = 0x05_7e_e1_00_00_00_00_04;
 
@@ -162,6 +165,28 @@ fn named_cases(out: &mut Out, seed: u64) -> io::Result<()> {
     out.write("chain_and_100k.ostl", &in_main(&p))?;
     let p = format!("1{}", repeat(" == 1", NEST));
     out.write("chain_compare_100k.ostl", &in_main(&p))?;
+    // RED-A3 #1: chains in the millions for `check` and `run`. Each is one flat line; a
+    // recursive pass or a recursive `Drop` over such an AST overflows the native stack.
+    let mut and_chain = b"fn main()\n  print(true".to_vec();
+    for _ in 0..CHAIN {
+        and_chain.extend_from_slice(b" and true");
+    }
+    and_chain.extend_from_slice(b")\n");
+    out.write("chain_and_5m.ostl", &and_chain)?;
+    let mut or_chain = b"fn main()\n  print(false".to_vec();
+    for _ in 0..CHAIN {
+        or_chain.extend_from_slice(b" or false");
+    }
+    or_chain.extend_from_slice(b")\n");
+    out.write("chain_or_5m.ostl", &or_chain)?;
+    // Postfix call chain `f(1)(1)(1)...`, not nesting: the postfix loop builds one level
+    // per call without recursing in the parser.
+    let mut calls = b"fn f(n: Int) -> Int\n  return n\n\nfn main()\n  print(f(1)".to_vec();
+    for _ in 0..CHAIN {
+        calls.extend_from_slice(b"(1)");
+    }
+    calls.extend_from_slice(b")\n");
+    out.write("chain_call_5m.ostl", &calls)?;
     let mut lets = String::from("fn main()\n  let x0 = 0\n");
     for i in 1..NEST {
         lets.push_str(&format!("  let x{i} = x{} + 1\n", i - 1));

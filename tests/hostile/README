@@ -18,9 +18,35 @@ of the compiler process. `-` means the command is not run in that milestone.
 | v0.3 | 1 | 5 | 1 | 512 |
 
 Sources: v0.1 and v0.2 from AC-04 and the `45_hostile.sh` row of MEASUREMENT 5.2 (5 s,
-512 MB). v0.3 applies the 1 s per input of AC-36 to the front end (`check`, `fmt`); `run`
-keeps 5 s because the step limit of 100 000 000 instructions (G15) must be reachable inside
-the limit. The `run` value for v0.3 is an assumption until QA lead confirms it.
+512 MB). v0.3 applies the 1 s per input of AC-36 to `check` and `fmt` and keeps 5 s for
+`run` (SPEC 12.4, binding).
+
+### Step limit
+
+Every case runs under `ostrel run` with the default step limit of 100 000 000 steps (G15,
+ARCHITECTURE 3.4), because that default is what AC-04 and AC-52 promise. SPEC 12.4: if the
+default `StepLimit` cannot be reached within the `run` time limit on the gate machine, that
+is a compiler defect reported as BLOCKER to the chief; QA does not loosen the time limit
+and does not lower the step limit to hide it. `run.sh` names this in the failure message.
+
+ASSUMPTION: the margin between 100 000 000 steps and 5 s on the 2 core gate machine is not
+measured yet, because no VM exists. It is measured with the first VM build (time of
+`run_long_loop_by_recursion.ostl` on the gate machine) and written here.
+
+To check the `StepLimit` path independently of machine speed, every case that expects
+`runtime error[StepLimit]` runs a second time with a small step limit and must again end
+with exit 1 and that error:
+
+Small step limit for `run --max-steps`: 1000000.
+
+### Node limit
+
+D43 requires a global AST node limit in the parser besides the nesting depth limit of 256.
+Its number is not decided yet (SPEC Q18, open with the architect). Until it is, the long
+flat chains (`long_line_10mib_add_chain`, `chain_*`, `many_*`) expect exit 0 or 1 for
+`check` and `run`: never a crash, panic, signal or timeout. When Q18 names the number, it
+is written here and the generator adds one chain just below and one just above it, with
+strict expectations (0 below, 1 above).
 
 ## Layout
 
@@ -32,7 +58,7 @@ the limit. The `run` value for v0.3 is an assumption until QA lead confirms it.
 | `run.sh` | builds the generator, generates the corpus, checks it and runs the compiler |
 
 The large and binary cases (1 MiB random bytes, 10 MiB single lines, nesting depth
-100 000, invalid UTF-8, NUL bytes) are generated into `$CARGO_TARGET_DIR/hostile/corpus/` (default
+100 000, chains of 5 000 000 operators or calls, invalid UTF-8, NUL bytes) are generated into `$CARGO_TARGET_DIR/hostile/corpus/` (default
 `~/.cache/ostrel-target`, as in `ci/gate.sh`) and never committed, because the gate rejects
 files over 5 MB anywhere in the tree and binary files are hard to review.
 The generator is deterministic: the same seed and count give byte identical files, listed
@@ -56,14 +82,21 @@ small, and that two generator runs produce the same manifest.
 * AC-04 named cases: `empty.ostl`, `invalid_utf8*.ostl`, `nul_*.ostl`, `random_1mib.ostl`,
   `nest_*_100k.ostl`, `long_line_10mib_*.ostl`, `unterminated_*_eof.ostl`.
 * Nesting is satisfied by a diagnostic from the parser depth limit (SPEC 5.0), so every
-  `nest_*` case expects exit 1. Long flat operator chains (`chain_*`) are not nesting and
-  must be accepted (D43).
+  `nest_*` case expects exit 1. Long flat chains are not nesting (D43); they expect exit 0
+  or 1 until the node limit is known (see Node limit).
+* Chains of REVIEW_RED_A3 #1: operator chain of 5 242 879 `+` in one 10 MiB line
+  (`long_line_10mib_add_chain`), `and` and `or` chains of 5 000 000 (`chain_and_5m`,
+  `chain_or_5m`) and a postfix call chain `f(1)(1)...` of 5 000 000 calls
+  (`chain_call_5m`, exit 1 because an `Int` cannot be called).
+* Escapes (SPEC 12.4): every rejected form with its code (E0004, E0005) and the valid
+  edge values `\u{0}` and `\u{10FFFF}`.
 * Strings (G1, RED-B F17): string literal inside interpolation, `{{`, escaped braces,
   `\u{...}` edge values, unterminated strings and interpolations.
 * `ostrel run` (A2-16, G15, D44): unbounded and mutual recursion (`CallDepth`), integer
   overflow on add, subtract, multiply and by recursion (`IntOverflow`), division and
   modulo by zero (`DivisionByZero`), a long loop by recursion (`StepLimit`), text growth
-  past the text length limit, and many output lines.
+  past the text limit (`TextLimit`), many live texts past the heap limit (`HeapLimit`,
+  D44), and many output lines.
 * Seeded cases `seed_bytes_*`, `seed_soup_*` (v0.1 token soup) and `seed_mutant_*`
   (mutations of valid programs).
 
