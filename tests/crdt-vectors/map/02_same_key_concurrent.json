@@ -1,0 +1,13 @@
+{
+  "strategy": "map",
+  "description": "Concurrent puts to one key: the higher Hlc wins; at equal wall time and counter the higher replica id.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "put": ["ana", "admin"] } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568000000000000000000000b", "op": { "put": ["ana", "member"] } }
+  ],
+  "deliveries": [[0, 1], [1, 0]],
+  "expect": {
+    "value": [["ana", "member"]],
+    "state": [["ana", { "hlc": "018bcfe568000000000000000000000b", "value": "member" }]]
+  }
+}

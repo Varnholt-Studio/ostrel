@@ -1,0 +1,15 @@
+{
+  "strategy": "set",
+  "description": "A adds x twice; the second add replaces A's first tag, so a remove that named only the first tag leaves x present.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "add": "x" } },
+    { "id": "000000000000000a00000002", "hlc": "018bcfe568010000000000000000000a", "op": { "add": "x" } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568020000000000000000000b",
+      "op": { "remove": "x", "tags": ["000000000000000a00000001"] } }
+  ],
+  "deliveries": [[0, 1, 2], [0, 2, 1]],
+  "expect": {
+    "value": ["x"],
+    "state": [["x", ["000000000000000a00000002"]]]
+  }
+}

@@ -1,0 +1,5 @@
+fn grow(n: Int) -> Int
+  return grow(n * 2)
+
+fn main()
+  print(grow(1))

@@ -1,0 +1,2 @@
+fn main()
+  print("bad \u{110000} end")

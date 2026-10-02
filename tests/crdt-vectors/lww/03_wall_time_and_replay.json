@@ -1,0 +1,14 @@
+{
+  "strategy": "lww",
+  "description": "The latest wall time wins in every delivery order, and delivering an op again changes nothing.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "set": 1 } },
+    { "id": "000000000000000a00000002", "hlc": "018bcfe568020000000000000000000a", "op": { "set": 2 } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568010000000000000000000b", "op": { "set": 3 } }
+  ],
+  "deliveries": [[0, 1, 2], [2, 1, 0], [1, 2, 0, 1, 0, 2]],
+  "expect": {
+    "value": 2,
+    "state": { "hlc": "018bcfe568020000000000000000000a", "value": 2 }
+  }
+}

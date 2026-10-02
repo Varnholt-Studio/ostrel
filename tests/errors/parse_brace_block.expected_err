@@ -1,0 +1,1 @@
+tests/errors/parse_brace_block.ostl:1:11: error[E0022]: blocks use indentation, not braces; remove `{`
