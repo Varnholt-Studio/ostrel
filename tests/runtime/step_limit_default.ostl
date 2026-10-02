@@ -1,0 +1,12 @@
+// StepLimit with the default limit of 100 000 000 steps: fib(40) needs several times more.
+// SPEC 12.4: only a program far beyond the limit is tested, never the exact boundary.
+
+fn fib(n: Int) -> Int
+  if n < 2
+    return n
+  return fib(n - 1) + fib(n - 2)
+
+fn main()
+  print("start")
+  print(fib(40))
+  print("not reached")

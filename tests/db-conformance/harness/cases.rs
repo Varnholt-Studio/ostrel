@@ -220,13 +220,14 @@ fn decode_step(json: &Json, schema: &[Model]) -> Result<Step> {
                 id: row_id(get(&r, "id"), &at)?,
                 version: number(get(&r, "version"), &at)?,
                 fields: decode_fields(get(&r, "fields"), model, true, &at)?,
+                collections: Vec::new(),
             });
         }
         Ok(Step {
             action: Action::Query(Query {
-                model: model_id,
                 order,
                 limit,
+                ..Query::all(model_id)
             }),
             expect: Expect::Rows(rows),
         })
@@ -260,12 +261,14 @@ fn decode_write(json: &Json, schema: &[Model]) -> Result<Write> {
             model,
             row,
             fields: decode_fields(get(&w, "fields"), fields, true, kind)?,
+            collections: Vec::new(),
         },
         "update" => Write::Update {
             model,
             row,
             expect_version: version()?,
             fields: decode_fields(get(&w, "fields"), fields, false, kind)?,
+            collections: Vec::new(),
         },
         _ => Write::Delete {
             model,
@@ -313,8 +316,10 @@ fn decode_value(json: &Json, field: Field) -> Result<Value> {
             canonical_decimal(digits)
                 .filter(|_| s != "-0")
                 .and_then(|_| s.parse::<i64>().ok())
-                .map(Value::Int)
-                .ok_or_else(|| format!("int: {s:?} is not an i64 in decimal"))
+                .and_then(|n| Value::int(n).ok())
+                .ok_or_else(|| {
+                    format!("int: {s:?} is not an Int (magnitude below 2^53) in decimal")
+                })
         }
         ("text", Type::Text) => Ok(Value::Text(string(body, "text")?.to_string())),
         ("text_repeat", Type::Text) => {
@@ -351,7 +356,7 @@ fn row_id(json: &Json, at: &str) -> Result<RowId> {
     let s = string(json, at)?;
     canonical_decimal(s)
         .and_then(|s| s.parse::<u128>().ok())
-        .map(RowId)
+        .and_then(|n| RowId::from_hex(&format!("{n:032x}")).ok())
         .ok_or_else(|| format!("{at}: row id {s:?} is not a u128 in decimal"))
 }
 

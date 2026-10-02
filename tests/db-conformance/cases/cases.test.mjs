@@ -11,7 +11,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const files = readdirSync(here).filter((f) => f.endsWith('.json')).sort();
 const ERRORS = new Set(['Conflict', 'VersionMismatch', 'NotFound']);
 const TYPES = new Set(['Text', 'Int', 'Bool']);
-const I64 = [-(2n ** 63n), 2n ** 63n - 1n];
+// Int range of ARCHITECTURE 7.4: the safe JavaScript integers.
+const INT = [-(2n ** 53n - 1n), 2n ** 53n - 1n];
 const U128 = 2n ** 128n - 1n;
 
 function keys(o, allowed, where) {
@@ -33,7 +34,7 @@ function value(v, field, where) {
     assert.equal(field.type, 'Int', where);
     assert.match(v.int, /^-?(0|[1-9][0-9]*)$/, where);
     const n = BigInt(v.int);
-    assert.ok(n >= I64[0] && n <= I64[1], `${where}: Int out of range`);
+    assert.ok(n >= INT[0] && n <= INT[1], `${where}: Int out of range`);
     return n;
   }
   assert.equal(field.type, 'Text', where);
