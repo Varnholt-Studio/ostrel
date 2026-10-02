@@ -26,8 +26,8 @@ function harness() {
         await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
         events.push('resign');
       }),
-      onMessage: (msg) => events.push(msg),
-      onError: (err) => events.push({ error: err }),
+      onMessage: hooks.onMessage ?? ((msg) => events.push(msg)),
+      onError: hooks.onError ?? ((err) => events.push({ error: err })),
     });
     const handle = { id, leader, events, lockView };
     tabs.push(handle);
@@ -275,6 +275,64 @@ test('a failing onLead is reported and leadership is handed on', async () => {
     await until(() => b.leader.isLeader() || a.leader.isLeader(), 'someone to lead');
     await tick(20);
     assert.equal([a, b].filter((t) => t.leader.isLeader()).length, 1);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('throwing onError does not leave a second leader', async () => {
+  const h = harness();
+  const unhandled = [];
+  const onUnhandled = (err) => unhandled.push(err);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const a = h.tab('a', {
+      onLead: async () => { throw new Error('socket failed'); },
+      onError: (err) => {
+        a.events.push({ error: err });
+        throw new Error('onError failed');
+      },
+    });
+    const b = h.tab('b');
+    a.leader.start();
+    await until(() => a.events.some((e) => e.error), 'a to report the error');
+    b.leader.start();
+    await until(() => h.locks.holder(LOCK_NAME) === 'b', 'b to hold the lock');
+    await until(() => b.leader.isLeader(), 'b to lead');
+    await tick(20);
+    assert.equal(a.leader.isLeader(), false);
+    assert.equal(a.leader.broadcast('x'), false);
+    assert.equal([a, b].filter((t) => t.leader.isLeader()).length, 1);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    await h.cleanup();
+  }
+});
+
+test('a throwing onError on the message path does not break the channel', async () => {
+  const h = harness();
+  const errors = [];
+  try {
+    const a = h.tab('a', {
+      onMessage: (msg) => {
+        if (msg.body === 'bad') throw new Error('handler failed');
+        a.events.push(msg);
+      },
+      onError: (err) => {
+        errors.push(err);
+        throw new Error('onError failed');
+      },
+    });
+    const b = h.tab('b');
+    a.leader.start();
+    await until(() => a.leader.isLeader(), 'a to lead');
+    b.leader.start();
+    b.leader.post('bad');
+    await until(() => errors.length === 1, 'the handler error');
+    b.leader.post('good');
+    await until(() => a.events.some((e) => e.body === 'good'), 'the next message');
+    assert.equal(a.leader.isLeader(), true);
   } finally {
     await h.cleanup();
   }

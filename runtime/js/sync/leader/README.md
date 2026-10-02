@@ -30,6 +30,9 @@ and exchange messages with the leader over the BroadcastChannel `ostrel-sync`.
 * `leaderId()` is the last announced leader and is informational only. A `resign` from a tab
   that is not the known leader is ignored.
 * Channel messages are untrusted; malformed ones are dropped.
+* `onError` is a sink. If it throws, the exception is swallowed; leadership is reset in every
+  case (`isLeader()` turns false, `resign` is sent) before the lock is handed on, so a failing
+  error handler can never leave two tabs leading.
 * `stop()` withdraws a queued request, or aborts `onLead`, waits for it to settle (handing the
   lock on) and closes the channel. A stopped leader cannot be started again.
 
@@ -38,6 +41,13 @@ and exchange messages with the leader over the BroadcastChannel `ostrel-sync`.
 * Node (part of the gate): `node --test runtime/js/sync/leader/*.test.mjs runtime/js/sync/leader/testing/*.test.mjs`
 
 ## Open points
+
+* A `down` message is accepted from any sender and updates `leaderId()`. The channel is
+  same origin, but the consumer must still validate `body` like any other untrusted input.
+* If `locks.request` fails with an error other than `AbortError`, the error is reported and
+  the tab does not ask for the lock again; it stays a follower until it is restarted.
+* `stop()` waits for `onLead` to settle. An `onLead` that ignores its `signal` keeps `stop()`
+  pending.
 
 * Wiring with the outbox (`pending`, `remove`, `discardForeign`) and the socket belongs to the
   sync client once the protocol stub (T5-2) is fixed; `onLead` is the hook for it.

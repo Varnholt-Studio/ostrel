@@ -87,12 +87,21 @@ export function createTabLeader({
   let leadDone = null; // settles when the lock callback returns
   let retryTimer = null;
 
+  // Reports an error without letting a throwing onError change the election state.
+  function report(err) {
+    try {
+      onError(err);
+    } catch {
+      // onError is a sink; an exception from it must not escape into the lock callback.
+    }
+  }
+
   function send(msg) {
     if (!channel) return;
     try {
       channel.postMessage(msg);
     } catch (err) {
-      onError(err);
+      report(err);
     }
   }
 
@@ -100,7 +109,7 @@ export function createTabLeader({
     try {
       onMessage(msg);
     } catch (err) {
-      onError(err);
+      report(err);
     }
   }
 
@@ -137,12 +146,14 @@ export function createTabLeader({
     try {
       await onLead({ signal: leadCtrl.signal });
     } catch (err) {
-      onError(err);
+      report(err);
+    } finally {
+      // Runs in every case, so a tab never believes it leads after the lock is gone.
+      leading = false;
+      leadCtrl = null;
+      if (currentLeader === tabId) currentLeader = null;
+      send({ t: 'resign', from: tabId });
     }
-    leading = false;
-    leadCtrl = null;
-    if (currentLeader === tabId) currentLeader = null;
-    send({ t: 'resign', from: tabId });
   }
 
   function requestLock() {
@@ -167,12 +178,12 @@ export function createTabLeader({
       });
     } catch (err) {
       done();
-      onError(err);
+      report(err);
       return;
     }
     Promise.resolve(request).catch((err) => {
       if (!granted) done();
-      if (err?.name !== 'AbortError') onError(err);
+      if (err?.name !== 'AbortError') report(err);
     });
   }
 
