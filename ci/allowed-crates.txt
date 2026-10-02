@@ -1,0 +1,29 @@
+# Allowed external crates (ARCHITECTURE section 11, decision D4).
+#
+# Contract for ci/checks/30_deps.sh:
+#   * One crate per line. Column 1 is the exact crates.io package name.
+#     Column 2, if present, is a comma separated list of the features a
+#     crate may enable; "*" means the default feature set is allowed.
+#     Everything after "#" is a comment.
+#   * Every direct dependency (normal, dev and build) of every crate in the
+#     workspace must be listed here, unless it is a workspace member
+#     referenced by an in tree path (crates/ostrel_*).
+#   * Sources other than crates.io (git, registry overrides, out of tree
+#     paths) are never allowed, whatever this list says.
+#   * Adding a line needs an architect DECISION id in the commit message and
+#     the matching change of ci/deps-snapshot.txt.
+#
+# name               features                                        used by
+tokio                rt,net,io-util,time,sync,macros,process         # server, VM host, drivers, sidecar
+hyper                http1,server                                    # ostrel_server
+hyper-util           *                                               # ostrel_server
+http-body-util       *                                               # ostrel_server
+tokio-tungstenite    handshake                                       # ostrel_server, WebSocket upgrade
+tokio-postgres       *                                               # ostrel_db_postgres
+rusqlite             *                                               # ostrel_db_sqlite, never "bundled"
+serde                derive                                          # sync, CLI, tests
+serde_json           *                                               # sync, CLI, tests
+ed25519-dalek        std,rand_core                                   # ostrel_auth, PASETO v4.public
+getrandom            *                                               # ostrel_auth, ostrel_core
+base64               *                                               # ostrel_auth, base64url
+rustc-hash           *                                               # ostrel_sema, ostrel_vm
