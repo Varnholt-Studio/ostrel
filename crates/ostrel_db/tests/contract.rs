@@ -1,8 +1,8 @@
 //! Shows that the contract in `ostrel_db::api` can be implemented by a crate outside
 //! `ostrel_db`, is object safe, and that the documented rules hold for a minimal driver.
 //!
-//! The driver here is a test fixture only and has no schema, so enum values sort by name in it;
-//! the tests use no enums in sort keys. The in memory driver for users lives in
+//! The driver here is a test fixture only. It knows enum declaration order only from
+//! `MigrationPlan::enums` (D79), like every driver. The in memory driver for users lives in
 //! `ostrel_db_memory`.
 
 use std::cmp::Ordering;
@@ -11,10 +11,10 @@ use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
 use ostrel_db::api::{
-    BoxFuture, Capabilities, CmpOp, CollectionChange, CollectionState, Connection, Cursor, DbError,
-    Dir, Driver, Expr, FieldId, Hlc, Hop, MAX_FILTER_NODES, MapEntry, MigrationPlan, ModelId,
-    NewOp, OpId, Path, Query, ReplicaId, Row, RowId, Rows, SchemaHash, ServerSeq, SetChange,
-    SetTag, StoredOp, Transaction, Value, Write, check_writes, compare_key,
+    AppliedSchema, BoxFuture, Capabilities, CmpOp, CollectionChange, CollectionState, Connection,
+    Cursor, DbError, Dir, Driver, EnumColumn, Expr, FieldId, Hlc, Hop, MAX_FILTER_NODES, MapEntry,
+    MigrationPlan, ModelId, NewOp, OpId, Path, Query, ReplicaId, Row, RowId, Rows, SchemaHash,
+    ServerSeq, SetChange, SetTag, StoredOp, Transaction, Value, Write, check_writes, compare_key,
 };
 
 #[derive(Clone)]
@@ -31,7 +31,15 @@ struct State {
     rows: BTreeMap<RowId, Stored>,
     ops: Vec<StoredOp>,
     seqs: BTreeMap<String, u64>,
-    schema: Option<SchemaHash>,
+    schema: Option<AppliedSchema>,
+    /// Declaration order per enum column, from the applied plan.
+    enums: BTreeMap<(ModelId, FieldId), Vec<String>>,
+}
+
+impl State {
+    fn variants(&self, model: ModelId, field: FieldId) -> Option<&[String]> {
+        self.enums.get(&(model, field)).map(Vec::as_slice)
+    }
 }
 
 struct FixtureDriver;
@@ -68,15 +76,58 @@ impl Driver for FixtureDriver {
     }
 }
 
-/// Column order of the contract (api query module documentation).
-fn column_order(a: &Value, b: &Value) -> Ordering {
+/// Ordinal of an enum value in declaration order.
+fn ordinal(variants: &[String], v: &Value) -> Option<usize> {
+    match v {
+        Value::Enum(name) => variants.iter().position(|x| x == name),
+        _ => None,
+    }
+}
+
+/// Column order of the contract (api query module documentation). `variants` is the
+/// declaration order when the column is enum typed. Writes refuse undeclared variants, so the
+/// name fallback only keeps the order total.
+fn column_order(variants: Option<&[String]>, a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Less,
         (_, Value::Null) => Ordering::Greater,
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+        (Value::Enum(_), Value::Enum(_)) => {
+            match variants.map(|vs| (ordinal(vs, a), ordinal(vs, b))) {
+                Some((Some(x), Some(y))) => x.cmp(&y),
+                _ => compare_key(a, b),
+            }
+        }
         _ => compare_key(a, b),
     }
+}
+
+/// The enum column an operand of an ordered comparison names, if any.
+fn enum_side<'s>(s: &'s State, model: ModelId, e: &Expr) -> Option<&'s [String]> {
+    let target = |p: &Path| p.hops.last().map_or(model, |h| h.model);
+    match e {
+        Expr::Field(p) => s.variants(target(p), p.field),
+        Expr::MapGet { map, .. } => s.variants(target(map), map.field),
+        Expr::Coalesce(a, _) => enum_side(s, model, a),
+        _ => None,
+    }
+}
+
+/// Ordered comparison of two non null values under the contract rules.
+fn ordered(
+    s: &State,
+    model: ModelId,
+    a: &Expr,
+    b: &Expr,
+    x: &Value,
+    y: &Value,
+) -> Option<Ordering> {
+    if let (Value::Enum(_), Value::Enum(_)) = (x, y) {
+        let vs = enum_side(s, model, a).or_else(|| enum_side(s, model, b))?;
+        return Some(ordinal(vs, x)?.cmp(&ordinal(vs, y)?));
+    }
+    Some(column_order(None, x, y))
 }
 
 /// Marker: a hop did not reach a live row, so the whole filter is false.
@@ -141,10 +192,15 @@ fn eval(s: &State, id: RowId, row: &Stored, e: &Expr) -> Result<Value, HopFailed
                     !(compare_key(&x, &y).is_eq() && (x == Value::Null) == (y == Value::Null))
                 }
                 _ if x == Value::Null || y == Value::Null => false,
-                CmpOp::Lt => column_order(&x, &y).is_lt(),
-                CmpOp::Le => column_order(&x, &y).is_le(),
-                CmpOp::Gt => column_order(&x, &y).is_gt(),
-                CmpOp::Ge => column_order(&x, &y).is_ge(),
+                _ => match ordered(s, row.model, a, b, &x, &y) {
+                    None => false,
+                    Some(o) => match op {
+                        CmpOp::Lt => o.is_lt(),
+                        CmpOp::Le => o.is_le(),
+                        CmpOp::Gt => o.is_gt(),
+                        _ => o.is_ge(),
+                    },
+                },
             };
             Value::Bool(r)
         }
@@ -210,9 +266,10 @@ fn sort_values(r: &Row, order: &[(FieldId, Dir)]) -> Vec<Value> {
 }
 
 /// Query order of a row position `(values, id)`.
-fn compare_pos(order: &[(FieldId, Dir)], a: (&[Value], RowId), b: (&[Value], RowId)) -> Ordering {
-    for (i, (_, dir)) in order.iter().enumerate() {
-        let o = column_order(&a.0[i], &b.0[i]);
+fn compare_pos(s: &State, q: &Query, a: (&[Value], RowId), b: (&[Value], RowId)) -> Ordering {
+    let order = &q.order;
+    for (i, (f, dir)) in order.iter().enumerate() {
+        let o = column_order(s.variants(q.model, *f), &a.0[i], &b.0[i]);
         let o = if *dir == Dir::Desc { o.reverse() } else { o };
         if o.is_ne() {
             return o;
@@ -252,11 +309,11 @@ fn scan(s: &State, q: &Query) -> Result<Rows, DbError> {
     let mut keyed: Vec<(Vec<Value>, Row)> = match &q.after {
         Some(c) => keyed
             .into_iter()
-            .filter(|(v, r)| compare_pos(&q.order, (v, r.id), (&c.values, c.id)).is_gt())
+            .filter(|(v, r)| compare_pos(s, q, (v, r.id), (&c.values, c.id)).is_gt())
             .collect(),
         None => keyed,
     };
-    keyed.sort_by(|(va, a), (vb, b)| compare_pos(&q.order, (va, a.id), (vb, b.id)));
+    keyed.sort_by(|(va, a), (vb, b)| compare_pos(s, q, (va, a.id), (vb, b.id)));
     keyed.truncate(q.limit.map_or(usize::MAX, |n| n as usize));
     Ok(Rows(keyed.into_iter().map(|(_, r)| r).collect()))
 }
@@ -368,6 +425,43 @@ fn apply_one(s: &mut State, w: &Write) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Refuses enum values that are not declared variants of their column (api module rules).
+fn check_enums(s: &State, ws: &[Write]) -> Result<(), DbError> {
+    let declared = |model: ModelId, f: FieldId, v: &Value| match s.variants(model, f) {
+        Some(vs) if *v != Value::Null => ordinal(vs, v).is_some(),
+        _ => true,
+    };
+    for w in ws {
+        let (Write::Insert {
+            model,
+            fields,
+            collections,
+            ..
+        }
+        | Write::Update {
+            model,
+            fields,
+            collections,
+            ..
+        }) = w
+        else {
+            continue;
+        };
+        let bad_field = fields.iter().any(|(f, v)| !declared(*model, *f, v));
+        let bad_value = collections.iter().any(|(f, c)| match c {
+            CollectionChange::Map(entries) => entries
+                .iter()
+                .filter_map(|e| e.value.as_ref())
+                .any(|v| !declared(*model, *f, v)),
+            CollectionChange::Set(_) => false,
+        });
+        if bad_field || bad_value {
+            return Err(DbError::Invalid("enum value is not a declared variant"));
+        }
+    }
+    Ok(())
+}
+
 fn live(s: &mut State, model: ModelId, row: RowId) -> Result<&mut Stored, DbError> {
     s.rows
         .get_mut(&row)
@@ -378,12 +472,24 @@ fn live(s: &mut State, model: ModelId, row: RowId) -> Result<&mut Stored, DbErro
 impl Connection for FixtureConn {
     fn migrate<'a>(&'a mut self, p: &'a MigrationPlan) -> BoxFuture<'a, Result<(), DbError>> {
         Box::pin(async move {
-            if p.from != self.state.schema {
+            p.check()?;
+            if p.from != self.state.schema.as_ref().map(|a| a.hash) {
                 return Err(DbError::SchemaMismatch);
             }
-            self.state.schema = Some(p.to);
+            self.state.schema = Some(AppliedSchema {
+                hash: p.to,
+                schema: p.schema.clone(),
+            });
+            self.state.enums = p
+                .enums
+                .iter()
+                .map(|c| ((c.model, c.field), c.variants.clone()))
+                .collect();
             Ok(())
         })
+    }
+    fn applied_schema<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<AppliedSchema>, DbError>> {
+        Box::pin(async move { Ok(self.state.schema.clone()) })
     }
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>> {
         Box::pin(async move { scan(&self.state, q) })
@@ -403,6 +509,7 @@ impl<'c> Transaction<'c> for FixtureTx<'c> {
     fn apply<'a>(&'a mut self, ws: &'a [Write]) -> BoxFuture<'a, Result<(), DbError>> {
         Box::pin(async move {
             check_writes(ws)?;
+            check_enums(&self.work, ws)?;
             ws.iter().try_for_each(|w| apply_one(&mut self.work, w))
         })
     }
@@ -545,7 +652,8 @@ fn plan(from: Option<u8>, to: u8) -> MigrationPlan {
     MigrationPlan {
         from: from.map(|b| SchemaHash([b; 32])),
         to: SchemaHash([to; 32]),
-        schema: "{}".to_string(),
+        schema: format!("{{\"v\":{to}}}"),
+        enums: vec![],
         steps: vec![],
     }
 }
@@ -1305,6 +1413,341 @@ fn migration_plans_must_start_from_the_stored_schema() {
             conn.migrate(&plan(Some(1), 3)).await,
             Err(DbError::SchemaMismatch)
         );
+    });
+}
+
+fn en(name: &str) -> Value {
+    Value::Enum(name.to_string())
+}
+
+fn strings(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| n.to_string()).collect()
+}
+
+/// Model 1: field 0 `status` (backlog, todo, done), field 1 `Bytes`, field 2 `Set` of enum
+/// elements, field 3 `Map` of user to role (guest, member, admin). Declaration order differs
+/// from name order in both enums.
+fn enum_plan() -> MigrationPlan {
+    MigrationPlan {
+        enums: vec![
+            EnumColumn {
+                model: 1,
+                field: 0,
+                variants: strings(&["backlog", "todo", "done"]),
+            },
+            EnumColumn {
+                model: 1,
+                field: 3,
+                variants: strings(&["guest", "member", "admin"]),
+            },
+        ],
+        ..plan(None, 1)
+    }
+}
+
+#[test]
+fn applied_schema_reports_the_last_successful_migration_only() {
+    let mut conn = connect();
+    block_on(async {
+        assert_eq!(conn.applied_schema().await, Ok(None), "never migrated");
+        // A refused plan of a fresh database leaves it unmigrated.
+        assert_eq!(
+            conn.migrate(&plan(Some(1), 2)).await,
+            Err(DbError::SchemaMismatch)
+        );
+        assert_eq!(conn.applied_schema().await, Ok(None));
+
+        conn.migrate(&plan(None, 1)).await.unwrap();
+        let first = AppliedSchema {
+            hash: SchemaHash([1; 32]),
+            schema: "{\"v\":1}".to_string(),
+        };
+        assert_eq!(conn.applied_schema().await, Ok(Some(first.clone())));
+
+        // SchemaMismatch and an invalid plan change nothing.
+        assert_eq!(
+            conn.migrate(&plan(Some(2), 3)).await,
+            Err(DbError::SchemaMismatch)
+        );
+        assert_eq!(
+            conn.migrate(&plan(None, 3)).await,
+            Err(DbError::SchemaMismatch)
+        );
+        let invalid = MigrationPlan {
+            enums: vec![EnumColumn {
+                model: 1,
+                field: 0,
+                variants: vec![],
+            }],
+            ..plan(Some(1), 3)
+        };
+        assert!(matches!(
+            conn.migrate(&invalid).await,
+            Err(DbError::Invalid(_))
+        ));
+        assert_eq!(conn.applied_schema().await, Ok(Some(first.clone())));
+
+        // A no op plan keeps the stored schema text of the first migration.
+        let noop = MigrationPlan {
+            schema: "other".to_string(),
+            ..plan(Some(1), 1)
+        };
+        conn.migrate(&noop).await.unwrap();
+        assert_eq!(
+            conn.applied_schema().await.unwrap().unwrap().hash,
+            first.hash
+        );
+
+        conn.migrate(&plan(Some(1), 2)).await.unwrap();
+        let second = conn.applied_schema().await.unwrap().unwrap();
+        assert_eq!(second.hash, SchemaHash([2; 32]));
+        assert_eq!(second.schema, "{\"v\":2}");
+    });
+}
+
+#[test]
+fn migration_plan_check_refuses_ambiguous_enum_columns() {
+    let column = |field, variants: &[&str]| EnumColumn {
+        model: 1,
+        field,
+        variants: strings(variants),
+    };
+    let with = |enums| MigrationPlan {
+        enums,
+        ..plan(None, 1)
+    };
+    assert_eq!(with(vec![]).check(), Ok(()));
+    assert_eq!(with(vec![column(0, &["a"])]).check(), Ok(()));
+    assert_eq!(
+        with(vec![column(0, &["a"]), column(1, &["a"])]).check(),
+        Ok(())
+    );
+    assert!(with(vec![column(0, &[])]).check().is_err());
+    assert!(with(vec![column(0, &["a", "b", "a"])]).check().is_err());
+    assert!(
+        with(vec![column(0, &["a"]), column(0, &["b"])])
+            .check()
+            .is_err()
+    );
+    let p = enum_plan();
+    assert_eq!(
+        p.enum_variants(1, 0),
+        Some(&strings(&["backlog", "todo", "done"])[..])
+    );
+    assert_eq!(p.enum_variants(1, 1), None);
+    assert_eq!(p.enum_variants(2, 0), None);
+}
+
+#[test]
+fn rows_sort_enums_by_declaration_and_bytes_bytewise_unlike_collections() {
+    // compare_key (D61) and the row order disagree on exactly these values (D79).
+    assert_eq!(compare_key(&en("todo"), &en("done")), Ordering::Greater);
+    let (lo, hi) = (Value::Bytes(vec![0x00]), Value::Bytes(vec![0xF8]));
+    assert_eq!(compare_key(&lo, &hi), Ordering::Greater, "AA after -A");
+
+    let mut conn = connect();
+    block_on(async {
+        conn.migrate(&enum_plan()).await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        tx.apply(&[
+            insert(1, 1, vec![(0, en("done")), (1, hi.clone())]),
+            insert(1, 2, vec![(0, en("backlog")), (1, lo.clone())]),
+            insert(1, 3, vec![(0, en("todo")), (1, Value::Bytes(vec![]))]),
+            insert(1, 4, vec![(0, Value::Null)]),
+        ])
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let by = |f, d| sorted(1, vec![(f, d)]);
+        // Declaration order, not name order (which would be backlog, done, todo).
+        assert_eq!(
+            ids(conn.query(&by(0, Dir::Asc)).await.unwrap()),
+            [4, 2, 3, 1]
+        );
+        assert_eq!(
+            ids(conn.query(&by(0, Dir::Desc)).await.unwrap()),
+            [1, 3, 2, 4]
+        );
+        // Bytewise: empty, 0x00, 0xF8; a never written field first.
+        assert_eq!(
+            ids(conn.query(&by(1, Dir::Asc)).await.unwrap()),
+            [4, 3, 2, 1]
+        );
+        assert_eq!(
+            ids(conn.query(&by(1, Dir::Desc)).await.unwrap()),
+            [1, 2, 3, 4]
+        );
+
+        // A cursor after `todo` continues in declaration order.
+        let page = Query {
+            after: Some(Cursor {
+                values: vec![en("todo")],
+                id: rid(3),
+            }),
+            ..by(0, Dir::Asc)
+        };
+        assert_eq!(ids(conn.query(&page).await.unwrap()), [1]);
+        let page = Query {
+            after: Some(Cursor {
+                values: vec![lo.clone()],
+                id: rid(2),
+            }),
+            ..by(1, Dir::Asc)
+        };
+        assert_eq!(ids(conn.query(&page).await.unwrap()), [1]);
+
+        // Ordered filters use the declaration order of the column side.
+        let ge = |v: &str| filtered(1, Expr::Cmp(CmpOp::Ge, field(0), konst(en(v))));
+        assert_eq!(ids(conn.query(&ge("todo")).await.unwrap()), [1, 3]);
+        let le = filtered(1, Expr::Cmp(CmpOp::Le, konst(en("todo")), field(0)));
+        assert_eq!(ids(conn.query(&le).await.unwrap()), [1, 3]);
+        // Unknown variant or no enum column on either side: false, also for Lt.
+        assert!(conn.query(&ge("nope")).await.unwrap().0.is_empty());
+        let consts = Expr::Cmp(CmpOp::Lt, konst(en("a")), konst(en("b")));
+        assert!(conn.query(&filtered(1, consts)).await.unwrap().0.is_empty());
+        let lt = filtered(1, Expr::Cmp(CmpOp::Lt, field(1), konst(hi.clone())));
+        assert_eq!(ids(conn.query(&lt).await.unwrap()), [2, 3]);
+    });
+}
+
+#[test]
+fn collections_keep_name_and_base64url_order_and_map_values_use_the_column_order() {
+    let mut conn = connect();
+    let add = |v: Value, seq| SetChange::Add {
+        elem: v,
+        tag: tag(1, seq),
+    };
+    let role = |user: u64, r: Option<&str>| MapEntry {
+        key: Value::Ref(rid(user)),
+        value: r.map(en),
+        hlc: Hlc::new(1, 0, ReplicaId(1)).unwrap(),
+    };
+    block_on(async {
+        conn.migrate(&enum_plan()).await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        tx.apply(&[
+            Write::Insert {
+                model: 1,
+                row: rid(1),
+                fields: vec![],
+                collections: vec![
+                    (
+                        2,
+                        CollectionChange::Set(vec![
+                            add(en("todo"), 1),
+                            add(en("backlog"), 2),
+                            add(en("done"), 3),
+                        ]),
+                    ),
+                    (3, CollectionChange::Map(vec![role(7, Some("admin"))])),
+                ],
+            },
+            Write::Insert {
+                model: 1,
+                row: rid(2),
+                fields: vec![],
+                collections: vec![
+                    (
+                        2,
+                        CollectionChange::Set(vec![
+                            add(Value::Bytes(vec![0x00]), 1),
+                            add(Value::Bytes(vec![0xF8]), 2),
+                        ]),
+                    ),
+                    (3, CollectionChange::Map(vec![role(7, Some("guest"))])),
+                ],
+            },
+            Write::Insert {
+                model: 1,
+                row: rid(3),
+                fields: vec![],
+                collections: vec![(3, CollectionChange::Map(vec![role(7, None)]))],
+            },
+        ])
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let rows = conn.query(&Query::all(1)).await.unwrap().0;
+        let elems = |r: &Row| match &r.collections[0].1 {
+            CollectionState::Set(tags) => tags.iter().map(|t| t.elem.clone()).collect::<Vec<_>>(),
+            CollectionState::Map(_) => vec![],
+        };
+        // Set elements by variant name and by base64url text (D61), not by row order.
+        assert_eq!(elems(&rows[0]), [en("backlog"), en("done"), en("todo")]);
+        assert_eq!(
+            elems(&rows[1]),
+            [Value::Bytes(vec![0xF8]), Value::Bytes(vec![0x00])]
+        );
+
+        // (roles[me] ?? guest) >= member in declaration order: only the admin row. By name,
+        // admin < guest < member would select none of the rows.
+        let rule = Expr::Cmp(
+            CmpOp::Ge,
+            Box::new(Expr::Coalesce(
+                Box::new(Expr::MapGet {
+                    map: Path {
+                        hops: vec![],
+                        field: 3,
+                    },
+                    key: konst(Value::Ref(rid(7))),
+                }),
+                en("guest"),
+            )),
+            konst(en("member")),
+        );
+        assert_eq!(ids(conn.query(&filtered(1, rule)).await.unwrap()), [1]);
+    });
+}
+
+#[test]
+fn undeclared_enum_values_are_refused_before_anything_changes() {
+    let mut conn = connect();
+    block_on(async {
+        conn.migrate(&enum_plan()).await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        tx.apply(&[insert(1, 1, vec![(0, en("todo"))])])
+            .await
+            .unwrap();
+        let bad_column = [
+            insert(1, 2, vec![(0, en("backlog"))]),
+            update(1, 1, 1, vec![(0, en("Todo"))]),
+        ];
+        assert!(matches!(
+            tx.apply(&bad_column).await,
+            Err(DbError::Invalid(_))
+        ));
+        let bad_map_value = [Write::Update {
+            model: 1,
+            row: rid(1),
+            expect_version: 1,
+            fields: vec![],
+            collections: vec![(
+                3,
+                CollectionChange::Map(vec![MapEntry {
+                    key: Value::Ref(rid(7)),
+                    value: Some(en("owner")),
+                    hlc: Hlc::new(1, 0, ReplicaId(1)).unwrap(),
+                }]),
+            )],
+        }];
+        assert!(matches!(
+            tx.apply(&bad_map_value).await,
+            Err(DbError::Invalid(_))
+        ));
+        // Null, a non enum column and any Set element are not checked against variants.
+        tx.apply(&[update(1, 1, 1, vec![(0, Value::Null), (5, en("any"))])])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let rows = conn.query(&Query::all(1)).await.unwrap().0;
+        assert_eq!(
+            ids(Rows(rows.clone())),
+            [1],
+            "row 2 of the refused batch is absent"
+        );
+        assert_eq!(rows[0].version, 2);
     });
 }
 

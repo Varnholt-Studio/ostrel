@@ -7,6 +7,7 @@
 //!
 //! Status: F1b contract (ARCHITECTURE 6.1) on the shared ids and values of `ostrel_core`, with
 //! the query filter and keyset cursor, the change set of `Set` tags (D49) and `Map` entries,
-//! and the schema hash of migration plans. Migration steps are not designed yet.
+//! the schema hash and enum columns of migration plans, and the applied schema (D79). Migration
+//! steps are not designed yet.
 
 pub mod api;

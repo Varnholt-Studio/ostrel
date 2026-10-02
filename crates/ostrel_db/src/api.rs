@@ -14,6 +14,10 @@
 //! * A driver checks every write batch with [`check_writes`] and every query with
 //!   [`Query::check`] before it touches the database, so all drivers refuse the same malformed
 //!   input with the same [`DbError::Invalid`].
+//! * Enum typed columns are the ones listed in [`MigrationPlan::enums`] of the applied schema.
+//!   A write that puts a value other than a declared variant name (or `Null`) into such a
+//!   column, or into the value of such a `Map` field, fails with [`DbError::Invalid`] and
+//!   changes nothing.
 //! * After a transaction method returned an error, the caller rolls the transaction back. A
 //!   driver may refuse every further call except [`Transaction::rollback`].
 //! * Dropping a transaction without commit has the effect of a rollback.
@@ -24,6 +28,7 @@
 mod query;
 mod write;
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -150,18 +155,73 @@ pub enum MigrationStep {}
 
 /// Steps that bring a database from the schema `from` to the schema `to`.
 ///
-/// [`Connection::migrate`] first compares `from` with the hash stored by the last successful
-/// migration (`None` for a database that was never migrated). If they differ it returns
-/// [`DbError::SchemaMismatch`] and changes nothing. Otherwise it runs every step and stores
-/// `to` and `schema` in one transaction. A plan with `from == Some(to)` and no steps succeeds
-/// without changes.
+/// [`Connection::migrate`] first checks the plan with [`MigrationPlan::check`] and then
+/// compares `from` with the hash stored by the last successful migration (`None` for a
+/// database that was never migrated). If they differ it returns [`DbError::SchemaMismatch`]
+/// and changes nothing. Otherwise it runs every step and stores `to`, `schema` and `enums` in
+/// one transaction, so that [`Connection::applied_schema`] returns them. A plan with
+/// `from == Some(to)` and no steps succeeds without changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MigrationPlan {
     pub from: Option<SchemaHash>,
     pub to: SchemaHash,
-    /// Canonical JSON of the target schema, stored for readers of the database.
+    /// Canonical JSON of the target schema, stored for the planner and for readers of the
+    /// database.
     pub schema: String,
+    /// Every enum typed column of the target schema with its variants (D79). This is where a
+    /// driver learns the declaration order it sorts and compares enum columns by; it never
+    /// parses `schema`.
+    pub enums: Vec<EnumColumn>,
     pub steps: Vec<MigrationStep>,
+}
+
+/// An enum typed column of a model: a field whose type is an enum or an optional enum, or a
+/// `Map` field whose value type is one (D79: map values are stored like columns). `Set`
+/// elements and `Map` keys are not listed here; they are ordered by variant name (D61).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumColumn {
+    pub model: ModelId,
+    pub field: FieldId,
+    /// Variant names in declaration order. The position is the ordinal a driver may store.
+    pub variants: Vec<String>,
+}
+
+impl MigrationPlan {
+    /// Checks the rules a driver must not have to guess about: every [`EnumColumn`] has at
+    /// least one variant, no variant name twice, and no (model, field) is listed twice.
+    pub fn check(&self) -> Result<(), DbError> {
+        let mut columns = BTreeSet::new();
+        for c in &self.enums {
+            if !columns.insert((c.model, c.field)) {
+                return Err(DbError::Invalid("enum column listed twice"));
+            }
+            if c.variants.is_empty() {
+                return Err(DbError::Invalid("enum column without variants"));
+            }
+            let mut names = BTreeSet::new();
+            if !c.variants.iter().all(|v| names.insert(v.as_str())) {
+                return Err(DbError::Invalid("enum variant listed twice"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Declaration order of the enum column `(model, field)`, if the plan lists it.
+    pub fn enum_variants(&self, model: ModelId, field: FieldId) -> Option<&[String]> {
+        self.enums
+            .iter()
+            .find(|c| c.model == model && c.field == field)
+            .map(|c| c.variants.as_slice())
+    }
+}
+
+/// What the last successful [`Connection::migrate`] stored (D79).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedSchema {
+    /// [`MigrationPlan::to`] of that migration.
+    pub hash: SchemaHash,
+    /// [`MigrationPlan::schema`] of that migration, unchanged.
+    pub schema: String,
 }
 
 /// What a driver does natively. The planner emulates what is missing.
@@ -192,6 +252,10 @@ pub trait Connection {
     fn migrate<'a>(&'a mut self, plan: &'a MigrationPlan) -> BoxFuture<'a, Result<(), DbError>>;
     /// Reads committed state.
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>>;
+    /// Hash and canonical JSON stored by the last successful [`Connection::migrate`]; `None`
+    /// if the database was never migrated. A refused plan leaves it unchanged. The planner
+    /// computes the steps of the next plan from it (D79).
+    fn applied_schema<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<AppliedSchema>, DbError>>;
     /// The transaction borrows the connection for `'c`; nothing else can use it meanwhile.
     fn begin<'c>(&'c mut self) -> BoxFuture<'c, Result<Box<dyn Transaction<'c> + 'c>, DbError>>;
 }

@@ -5,10 +5,22 @@
 //! Sorting, ordered comparisons and cursors use one order per field type: [`Value::Null`] (and
 //! a field that was never written) before every other value; `false` before `true`; `Int`,
 //! `Float` and `Time` numerically; `Text` and `Rank` by code point (D50); `Bytes` byte by byte;
-//! references by [`RowId`]; enum values by their declaration order in the schema
-//! (docs/db-mapping.md 2.2). `List`, `Set` and `Map` values are not sortable. A key sorted
+//! references by [`RowId`]; enum values by their declaration order (D79), which the driver
+//! knows from [`MigrationPlan::enums`](super::MigrationPlan::enums) of the applied schema and
+//! never from the variant name. `List`, `Set` and `Map` values are not sortable. A key sorted
 //! [`Dir::Desc`] is the exact reverse, so `Null` comes last there. On PostgreSQL this means
 //! `NULLS FIRST` for ascending and `NULLS LAST` for descending keys.
+//!
+//! This row order differs from the element and key order of `Set` and `Map`
+//! ([`compare_key`](super::compare_key), D61) in two places, both intended (D79): enum values
+//! (declaration order here, variant name there) and `Bytes` (byte by byte here, base64url
+//! text there, so `[0x00]` sorts before `[0xF8]` here and after it there).
+//!
+//! An ordered comparison ([`CmpOp::Lt`] and the others) of two enum values uses the declaration
+//! order of the enum column on one side: an [`Expr::Field`] or [`Expr::MapGet`] of an enum
+//! column, also inside [`Expr::Coalesce`]. It is false when no side names an enum column or a
+//! value is not a variant of that column, like a comparison with `Null`. The planner never
+//! emits such a comparison; the rule only makes the result defined.
 //!
 //! # Filter semantics
 //!

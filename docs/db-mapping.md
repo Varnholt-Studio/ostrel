@@ -2,7 +2,7 @@
 
 Status: draft for review, work package T6-3 (ARCHITECTURE 15.3). Refs #23. Aligned with the F1b
 contract of `crates/ostrel_db/src/api.rs` (T6-1b, Refs #69): error names, `Set` tags (D49), change
-sets, `NULL` order, cursor and schema hash.
+sets, `NULL` order, cursor, schema hash, applied schema and the two orders of D79.
 Scope: how `ostrel_db_sqlite` stores models, collections, the op log and sequences, and how it plans
 queries, including `last n`. Inputs: ARCHITECTURE 5.1 (type table), 5.3 (ids), 6.1 and 6.2 (DB
 interface), 9 (pushdown subset); SYNTAX 4.2 to 4.5; SPEC AC-10, AC-31, AC-33 (e), AC-37, AC-56.
@@ -72,14 +72,23 @@ Collisions that the planner (`ostrel_db::plan`) must reject with a clear error b
 | `Int serial [per f]` | `INTEGER`, nullable | `NULL` until the server assigns it | numeric |
 | `Set[T]`, `Map[K, V]` | no column; side table | section 3 | not sortable |
 
+This table is the form of model columns and of `Map` values. `Set` elements and `Map` keys use
+another form in the side tables, so that their order is the schema free order of D61 (section 3,
+D79): an enum element or key is stored as its variant name and a `Bytes` element or key as
+unpadded base64url, both as `TEXT`.
+
 Non optional fields are `NOT NULL`. A field default (`= backlog`, `= {me}`) is applied by the
 runtime when it builds the `make`; it is not a SQL `DEFAULT`, because defaults such as `me` and
 `now` depend on the request. The only SQL defaults are the backfill values of section 5.
 
 Enums are stored as ordinals so that rule comparisons such as `(team.roles[me] ?? guest) >= member`
 compile to an indexable integer comparison. The wire format keeps the variant name (ARCHITECTURE
-5.1); the adapter converts using the schema. Table `ostrel_enums` (section 4) lists every ordinal
-with its name for readers of the file.
+5.1); the adapter converts using the schema. The declaration order comes from
+`MigrationPlan.enums` (`EnumColumn`: model, field, variants in declaration order), which lists
+every enum column and every `Map` field with an enum value type of the target schema; the adapter
+never parses the schema JSON for it (D79). A write with a value that is not a declared variant of
+its column fails with `DbError::Invalid`. Table `ostrel_enums` (section 4) lists every ordinal with
+its name, so the adapter can map names after a restart and readers of the file can decode them.
 
 ### 2.3 Implicit fields
 
@@ -159,6 +168,21 @@ does not need to decode blobs by hand.
 
 ## 3. Collections
 
+Element and key form (D79): the `elem` column of a `Set` and the `key` column of a `Map` hold the
+wire value, so that `ORDER BY elem` and `ORDER BY key` equal `compare_key` (D61) without any
+sorting in the adapter:
+
+| Element or key type | Column type | Stored value |
+|---|---|---|
+| enum | `TEXT` | variant name, so `backlog` < `done` < `todo` whatever the declaration order |
+| `Bytes` | `TEXT` | unpadded base64url, so `[0xF8]` (`-A`) sorts before `[0x00]` (`AA`) |
+| `Text`, `Rank` | `TEXT` | as in 2.2, `BINARY` collation |
+| reference | `BLOB` | 16 bytes big endian, the same order as the hex wire form |
+| `Bool`, `Int`, `Time`, `Float` | as in 2.2 | as in 2.2, numeric order equals D61 |
+
+A `Map` value is stored like a model column (2.2), so an enum value is an ordinal and
+`(team.roles[me] ?? guest) >= member` stays an integer comparison.
+
 ### 3.1 `Set[T]`
 
 Observed remove set with add tags (D49, ARCHITECTURE 6.2). A row of the side table is one live
@@ -167,7 +191,7 @@ tag; there are no tombstones.
 ```sql
 CREATE TABLE "Room__members" (
   row_id      BLOB    NOT NULL REFERENCES "Room" ("id") ON DELETE CASCADE,
-  elem        BLOB    NOT NULL,      -- column type of T, here a reference
+  elem        BLOB    NOT NULL,      -- element form of T (table above), here a reference
   tag_replica BLOB    NOT NULL CHECK (length(tag_replica) = 8),
   tag_seq     INTEGER NOT NULL,      -- OpId.seq of the add
   PRIMARY KEY (row_id, elem, tag_replica)
@@ -184,8 +208,8 @@ by membership. An element is in the set while it has at least one row.
 ```sql
 CREATE TABLE "Team__roles" (
   row_id  BLOB    NOT NULL REFERENCES "Team" ("id") ON DELETE CASCADE,
-  key     BLOB    NOT NULL,          -- column type of K
-  value   INTEGER,                   -- column type of V; NULL when removed
+  key     BLOB    NOT NULL,          -- key form of K (section 3), here a reference
+  value   INTEGER,                   -- column type of V (2.2), here an enum ordinal; NULL when removed
   hlc     BLOB    NOT NULL,
   removed INTEGER NOT NULL CHECK (removed IN (0, 1)),
   PRIMARY KEY (row_id, key)
@@ -370,11 +394,11 @@ AC-56). There is no filtering after the query.
 | `signed` | constant `1` or `0` as a parameter |
 | `ref.f` (one hop) | `(SELECT r."f" FROM "Ref" AS r WHERE r."id" = t."ref")` |
 | `a.b.f` (two hops) | the same subquery nested once more |
-| `x in setField` | `EXISTS (SELECT 1 FROM "M__set" AS s WHERE s.row_id = <row> AND s.elem IS :x)` |
-| `x in mapField` | the same on the map side table with `key` |
-| `mapField[k]` | `(SELECT m.value FROM "M__map" AS m WHERE m.row_id = <row> AND m.key IS :k AND m.removed = 0)` |
+| `x in setField` | `EXISTS (SELECT 1 FROM "M__set" AS s WHERE s.row_id = <row> AND s.elem IS :x)`, `:x` in element form (section 3) |
+| `x in mapField` | the same on the map side table with `key`, `:x` in key form |
+| `mapField[k]` | `(SELECT m.value FROM "M__map" AS m WHERE m.row_id = <row> AND m.key IS :k AND m.removed = 0)`, `:k` in key form |
 | `e ?? c` | `COALESCE(e, :c)` |
-| enum variant `member` | its ordinal as a parameter |
+| enum variant `member` | its ordinal as a parameter when compared with a column or a map value; its name when used as a `Set` element or `Map` key (`member in tags`) |
 
 Here `<row>` is `t."id"` for a field of the queried model, or the reference column for a hop
 (`t."room"` in `me in room.members`).
@@ -407,7 +431,8 @@ logic, so the translation keeps `NULL` out of every boolean:
 * The driver contract still defines them, because a missing map key (`mapField[k]` without `??`)
   is `NULL` too: an ordered comparison with `NULL` is false, and `not` of it is true
   (`crates/ostrel_db/src/api/query.rs`, filter semantics). Where an operand can be `NULL`, the
-  translation wraps the comparison as `COALESCE(<cmp>, 0)` so that `NOT` sees a boolean.
+  translation wraps the comparison as `COALESCE(<cmp>, 0)` so that `NOT` sees a boolean. This is
+  the SQLite form; PostgreSQL has a real boolean type and writes `COALESCE(<cmp>, false)`.
 * The remaining source of `NULL` is a hop through a non optional reference whose target row was
   deleted. The translation adds `EXISTS (SELECT 1 FROM "Ref" WHERE "id" = t."ref")` as a top level
   conjunct for every such hop, so the whole rule is false and the row is not readable. This fails
@@ -542,9 +567,11 @@ These are proposals for `tests/db-conformance/` (owner T6-2); each is adapter in
   `DbError::VersionMismatch`, missing row `DbError::NotFound`.
 * **A3.** `Capabilities.sequences = false` means the driver emulates sequences inside the
   transaction; `next_in_sequence` must still work.
-* **A4.** Resolved by T6-1b: `MigrationPlan` carries `from` (hash of the schema it was planned
-  from, `None` for a new database), `to` and the canonical JSON of the target schema. How the
-  planner reads the stored schema is open (no contract method yet).
+* **A4.** Resolved by T6-1b and D79: `MigrationPlan` carries `from` (hash of the schema it was
+  planned from, `None` for a new database), `to`, the canonical JSON of the target schema and the
+  enum columns. The planner reads the stored hash and schema JSON with
+  `Connection::applied_schema` (`None` if never migrated, unchanged by a refused plan) and plans
+  the next steps from it. SQLite reads it from `ostrel_schema`.
 * **A5.** A hop through a non optional reference to a deleted row makes the whole rule false
   (fail closed, S-9), even where short circuit evaluation in the VM would not reach the hop.
 * **A6.** The id tie break follows the direction of the sort field, and one query has one sort
