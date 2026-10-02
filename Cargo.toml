@@ -7,6 +7,7 @@ members = [
     "crates/ostrel_ir",
     "crates/ostrel_vm",
     "crates/ostrel_cli",
+    "crates/ostrel_db",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ ostrel_syntax = { path = "crates/ostrel_syntax" }
 ostrel_sema = { path = "crates/ostrel_sema" }
 ostrel_ir = { path = "crates/ostrel_ir" }
 ostrel_vm = { path = "crates/ostrel_vm" }
+ostrel_db = { path = "crates/ostrel_db" }
 
 # Every crate opts in with `[lints] workspace = true`. Crates that read user
 # input (ostrel_syntax, ostrel_cli) additionally deny unwrap, expect, panic and
