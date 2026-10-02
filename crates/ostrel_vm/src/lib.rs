@@ -3,8 +3,10 @@
 //! This file fixes the v0.1 contract of the VM (freeze wave F1a, ARCHITECTURE 3.4
 //! and 13): the entry point [`run`], the [`Host`] through which the VM reaches the
 //! outside world, the [`Limits`] it enforces and the [`RuntimeError`] it reports.
-//! The bytecode [`Image`] and the compiler from `ostrel_ir` are added behind this
-//! contract; until then an image holds no code and [`run`] returns `Ok(())`.
+//! [`compile`] turns a validated `ostrel_ir::Program` into a bytecode [`Image`].
+//!
+//! Frames live on the heap, never on the native stack, so deep recursion in a
+//! program ends in `CallDepth` or `HeapLimit`, never in a native stack overflow.
 
 // This crate executes programs derived from untrusted input: no unwrap, expect,
 // panic or unchecked indexing.
@@ -17,6 +19,10 @@
 
 use std::fmt;
 
+mod bytecode;
+mod exec;
+
+pub use bytecode::CompileError;
 pub use ostrel_ir::Span;
 
 /// Everything the VM needs from its embedder. The CLI writes to stdout; the
@@ -99,11 +105,22 @@ pub struct RuntimeError {
     pub span: Span,
 }
 
-/// Executable bytecode of one program, produced from `ostrel_ir::Program` by the
-/// bytecode compiler. Its contents are private to this crate.
+/// Executable bytecode of one program, produced from `ostrel_ir::Program` by
+/// [`compile`]. Its contents are private to this crate. The default image holds no
+/// program; running it does nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Image {
-    _code: (),
+    code: bytecode::Code,
+}
+
+/// Compiles a lowered program to bytecode.
+///
+/// The IR is validated completely (indexes, operand types, call arity, the shape of
+/// `main`), so a malformed program is a [`CompileError`] here and never undefined
+/// behaviour or a panic in [`run`]. The checker and the lowering never produce
+/// malformed IR, so a `CompileError` always indicates a compiler bug.
+pub fn compile(program: &ostrel_ir::Program) -> Result<Image, CompileError> {
+    bytecode::compile_program(program).map(|code| Image { code })
 }
 
 /// Runs `fn main()` of `image` to completion within `limits`.
@@ -114,8 +131,7 @@ pub fn run<H: Host + ?Sized>(
     host: &mut H,
     limits: Limits,
 ) -> Result<(), RuntimeError> {
-    let _ = (image, host, limits);
-    Ok(())
+    exec::run(&image.code, host, limits)
 }
 
 #[cfg(test)]
