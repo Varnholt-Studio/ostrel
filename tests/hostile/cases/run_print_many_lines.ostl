@@ -1,0 +1,8 @@
+fn burst(n: Int) -> Int
+  if n == 0
+    print("line")
+    return 1
+  return burst(n - 1) + burst(n - 1)
+
+fn main()
+  print(burst(16))

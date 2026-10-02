@@ -1,0 +1,5 @@
+fn twice(n: Integer) -> Int
+  return n * 2
+
+fn main()
+  print("ok")

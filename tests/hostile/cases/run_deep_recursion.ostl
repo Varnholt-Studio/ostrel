@@ -1,0 +1,5 @@
+fn down(n: Int) -> Int
+  return down(n + 1)
+
+fn main()
+  print(down(0))

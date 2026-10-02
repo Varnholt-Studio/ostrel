@@ -1,0 +1,5 @@
+fn inc(n: Int) -> Int
+  return n + 1
+
+fn main()
+  print(inc(1, 2))

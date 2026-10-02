@@ -1,0 +1,1 @@
+tests/errors/parse_comparison_chain.ostl:5:15: error[E0027]: comparisons do not chain; write `a < b and b < c`

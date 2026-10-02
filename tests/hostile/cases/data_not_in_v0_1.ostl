@@ -1,0 +1,5 @@
+data Room
+  name: Text
+
+fn main()
+  print(1)
