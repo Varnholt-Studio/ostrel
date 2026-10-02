@@ -1,0 +1,1 @@
+tests/errors/type_condition_not_bool.ostl:2:6: error[E0301]: condition must be `Bool`, found `Int`
