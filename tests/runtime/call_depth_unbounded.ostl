@@ -1,0 +1,10 @@
+// CallDepth for recursion without a base case: the program ends with exit code 1 and a
+// runtime error, never with a crash of the process.
+
+fn forever(n: Int) -> Int
+  forever(n + 1)
+
+fn main()
+  print("start")
+  print(forever(0))
+  print("not reached")
