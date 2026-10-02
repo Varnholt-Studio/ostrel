@@ -53,9 +53,12 @@
 //! Each can be lowered with [`ParseLimits`] to test the exact boundary.
 
 pub mod codes;
+mod expr;
 
 #[cfg(test)]
 mod tests;
+
+pub use expr::{Exprs, parse};
 
 use crate::ast::{
     AstError, BlockId, ExprId, ExprKind, FnDecl, Ident, Limits, Module, Param, StmtId, StmtKind,
