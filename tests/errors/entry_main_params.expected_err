@@ -1,0 +1,1 @@
+tests/errors/entry_main_params.ostl:1:9: error[E0401]: `fn main` takes no parameters

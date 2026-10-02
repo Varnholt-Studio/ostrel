@@ -1,0 +1,4 @@
+fn main()
+  let x = 1
+  if x is 1
+    print(x)

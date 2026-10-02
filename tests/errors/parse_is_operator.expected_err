@@ -1,0 +1,1 @@
+tests/errors/parse_is_operator.ostl:3:8: error[E0021]: `is` is not Ostrel; to unwrap an optional write `if let y = x`

@@ -1,0 +1,1 @@
+tests/errors/lex_semicolon.ostl:2:12: error[E0009]: `;` is not used in Ostrel; write one statement per line
