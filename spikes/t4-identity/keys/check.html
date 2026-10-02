@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Identity spike: user key checks</title>
+<script type="module">
+  import { generateUserKey, exportUserKey, importUserKey, publicKeyBytes } from './keys.mjs';
+  import { RFC8032_TEST1 } from './vector.mjs';
+
+  const ALG = { name: 'Ed25519' };
+  const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
+  const checks = [];
+  async function check(name, fn) {
+    try {
+      checks.push({ name, ok: (await fn()) === true });
+    } catch (e) {
+      checks.push({ name, ok: false, error: String(e) });
+    }
+  }
+
+  // Stores a value in IndexedDB database `ostrel-keys` and reads it back (structured clone).
+  function idbRoundTrip(value) {
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open('ostrel-keys', 1);
+      open.onupgradeneeded = () => open.result.createObjectStore('keys');
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const db = open.result;
+        const tx = db.transaction('keys', 'readwrite');
+        tx.objectStore('keys').put(value, 'user');
+        const get = tx.objectStore('keys').get('user');
+        tx.oncomplete = () => resolve(get.result);
+        tx.onerror = () => reject(tx.error);
+      };
+    });
+  }
+
+  const kp = await generateUserKey();
+  const text = await exportUserKey(kp);
+  const msg = new TextEncoder().encode('device link statement');
+
+  await check('generate: Ed25519 key is extractable', () => kp.privateKey.extractable && kp.privateKey.algorithm.name === 'Ed25519');
+  await check('export and import keep the same public key', async () => {
+    const back = await importUserKey(text);
+    return hex(await publicKeyBytes(back)) === hex(await publicKeyBytes(kp));
+  });
+  await check('imported key signs like the original', async () => {
+    const back = await importUserKey(text);
+    const a = await crypto.subtle.sign(ALG, kp.privateKey, msg);
+    const b = await crypto.subtle.sign(ALG, back.privateKey, msg);
+    return hex(a) === hex(b) && (await crypto.subtle.verify(ALG, kp.publicKey, b, msg));
+  });
+  await check('RFC 8032 TEST 1 signature matches', async () => {
+    const k = await importUserKey(RFC8032_TEST1.bundle);
+    return hex(await crypto.subtle.sign(ALG, k.privateKey, new Uint8Array())) === RFC8032_TEST1.signature;
+  });
+  await check('mismatched bundle is rejected', async () => {
+    const [, x] = text.split('.');
+    const [, , d] = (await exportUserKey(await generateUserKey())).split('.');
+    try {
+      await importUserKey(`ostrel-user-key-v1.${x}.${d}`);
+      return false;
+    } catch (e) {
+      return /inconsistent/.test(e.message);
+    }
+  });
+  await check('CryptoKey survives IndexedDB ostrel-keys and still signs and exports', async () => {
+    const stored = await idbRoundTrip(kp);
+    const sig = await crypto.subtle.sign(ALG, stored.privateKey, msg);
+    return (await crypto.subtle.verify(ALG, kp.publicKey, sig, msg)) && (await exportUserKey(stored)) === text;
+  });
+
+  await fetch('/report', { method: 'POST', body: JSON.stringify({ userAgent: navigator.userAgent, checks }) });
+</script>
