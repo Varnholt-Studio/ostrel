@@ -53,9 +53,11 @@ export declare function parseId<K extends keyof typeof HEX_WIDTH>(kind: K, text:
 //
 // The in memory form of every Ostrel value in JS. It equals the wire form of the type table
 // except `Bytes`, which is a `Uint8Array` in memory and a base64url string on the wire.
-// ASSUMPTION A1: `Set[T]` is a readonly array in canonical order and `Map[K, V]` a readonly
-// array of `[key, value]` pairs in canonical key order, so equality is order independent and
-// matches the canonical encoding. `docs/types.md` (architect) is authoritative once it exists.
+// `Set[T]` is a readonly array and `Map[K, V]` a readonly array of `[key, value]` pairs, both
+// ordered by `compareKey` (wire value order, ARCHITECTURE 6.2, D61): booleans before numbers
+// before strings, `false` before `true`, numbers numerically (`-0` equals `0`), strings by code
+// point. The same order holds for `state()`, `value()` and set iteration in a program. It is
+// not the order of the canonical encoding (which would put 10 before 9).
 
 /** `Int`: a safe integer, plus or minus (2^53 minus 1). Leaving the range is `IntOverflow`. */
 export type Int = number;
@@ -97,6 +99,13 @@ export declare const INT_MIN: -9007199254740991;
  */
 export declare function compareText(a: string, b: string): -1 | 0 | 1;
 
+/**
+ * Compares two set elements or map keys by wire value (ARCHITECTURE 6.2, D61). Defines the
+ * order of `Set[T]` elements and `Map[K, V]` keys on every replica; the Rust side is
+ * `ostrel_core::value::compare_key`. Implemented in `runtime/js/crdt/canon/`.
+ */
+export declare function compareKey(a: Value, b: Value): -1 | 0 | 1;
+
 // ---------------------------------------------------------------------------------------
 // 3. Errors
 //
@@ -115,11 +124,15 @@ export type RuntimeErrorKind =
 /** Reason codes of a server `Reject` (ARCHITECTURE 5.4). `ClockSkew` does not exist (AC-57 g). */
 export type RejectReason = "Denied" | "Conflict" | "Forged" | "Invalid" | "Limit";
 
-/** Bridge errors: client side (7.1) and Node sidecar (7.2). */
+/**
+ * Bridge errors: client side (7.1) and Node sidecar (7.2, D60). `TooLarge`: a sidecar request
+ * or answer over 1 MiB, or a result check over 1 048 576 values.
+ */
 export type ExternErrorKind =
   | "Type"
   | "Threw"
   | "Undefined"
+  | "TooLarge"
   | "Busy"
   | "Crashed"
   | "Timeout";
@@ -163,15 +176,20 @@ export interface RowMeta {
 export type Row<Fields extends Rec = Rec> = RowMeta & Readonly<Fields>;
 
 /**
- * Query description produced by the JS backend from `where`, `sort` and `limit`. The filter
- * is query IR as JSON (ARCHITECTURE 6); the store treats it as opaque data.
+ * Query description produced by the JS backend from `where`, `sort` and `limit n` or `last n`
+ * (SYNTAX 3, G14, B2-14). The filter is query IR as JSON (ARCHITECTURE 6); the store treats it
+ * as opaque data. Every sort ends with `id` as tie break, so the order is total and identical on
+ * all replicas. `take.first` is `limit n` (the first n rows in sort order); `take.last` is
+ * `last n` (the last n rows, still returned in sort order). Without `take` all rows match.
  * ASSUMPTION A2: the query IR JSON form is fixed with `ostrel_db::api` in F1b and shared here.
  */
 export interface Query {
   readonly model: string;
   readonly filter?: unknown;
   readonly sort?: readonly { readonly field: string; readonly desc?: boolean }[];
-  readonly limit?: number;
+  readonly take?:
+    | { readonly first: number; readonly last?: never }
+    | { readonly last: number; readonly first?: never };
 }
 
 export type Unsubscribe = () => void;
@@ -358,8 +376,11 @@ export interface ShellWorkerScope extends EventTarget {
   skipWaiting(): Promise<void>;
 }
 
-/** Worker side: called once by the generated `sw.js`. */
-export declare function attachShell(self: ShellWorkerScope, manifest: ShellManifest): void;
+/**
+ * Worker side: called once by the generated `sw.js`. The manifest is untrusted input: it is
+ * validated against `ShellManifest` and a malformed one throws before any handler is installed.
+ */
+export declare function attachShell(self: ShellWorkerScope, rawManifest: unknown): void;
 
 // ---------------------------------------------------------------------------------------
 // 9. App entry (generated client)
