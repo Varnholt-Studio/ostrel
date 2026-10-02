@@ -1,0 +1,1 @@
+tests/errors/lex_bidi_in_comment.ostl:2:16: error[E0011]: bidirectional control character U+202E is not allowed in source; write `\u{202E}` inside a string if it is needed

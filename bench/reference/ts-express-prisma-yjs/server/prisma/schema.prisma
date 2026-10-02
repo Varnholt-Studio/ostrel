@@ -1,0 +1,52 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  handle    String   @unique
+  name      String
+  publicKey String   @unique
+  createdAt DateTime @default(now())
+  rooms     Member[]
+  clients   Client[]
+}
+
+model Room {
+  id        String       @id @default(uuid())
+  name      String
+  createdAt DateTime     @default(now())
+  members   Member[]
+  updates   RoomUpdate[]
+}
+
+model Member {
+  room   Room   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  roomId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+
+  @@id([roomId, userId])
+}
+
+// Yjs client ids are bound to the first user that writes with them.
+model Client {
+  id     BigInt @id
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+}
+
+// Append only log of accepted Yjs updates per room.
+model RoomUpdate {
+  seq    BigInt @id @default(autoincrement())
+  room   Room   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  roomId String
+  data   Bytes
+
+  @@index([roomId, seq])
+}

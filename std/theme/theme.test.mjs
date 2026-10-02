@@ -194,3 +194,52 @@ test('the documented name mapping is stable', () => {
   assert.equal(cssVar('space2'), '--ostrel-space-2');
   assert.equal(cssVar('line'), '--ostrel-line');
 });
+
+// Declarations of every rule whose selector list contains `selector`, in source order.
+function declsFor(selector) {
+  const body = stripComments(css).replace(/@media[^{]*\{/g, '');
+  const re = /([^{}]+)\{([^{}]*)\}/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(body)) !== null) {
+    if (m[1].split(',').some((s) => s.trim() === selector)) out.push(m[2]);
+  }
+  return out.join('\n');
+}
+
+function decl(decls, prop) {
+  let value;
+  for (const m of decls.matchAll(/(^|[;\s])([a-z-]+)\s*:\s*([^;]+);/g)) {
+    if (m[2] === prop) value = m[3].trim();
+  }
+  return value;
+}
+
+// The std element `pick` renders as a native select with option children (allowlist in
+// runtime/js/view/safe/attrs.js). It must look and behave like the other controls.
+test('pick (select) shares the control look of button and input', () => {
+  const sel = declsFor('select');
+  const inp = declsFor('input');
+  assert.ok(sel, 'select is not styled');
+  for (const prop of ['font', 'border-radius', 'border', 'padding', 'color', 'background']) {
+    assert.equal(decl(sel, prop), decl(inp, prop), `select ${prop}`);
+  }
+  assert.equal(decl(sel, 'min-width'), '0');
+  assert.equal(decl(sel, 'cursor'), 'pointer');
+});
+
+test('pick (select) has the focus ring and the disabled state of the other controls', () => {
+  assert.equal(decl(declsFor('select:focus-visible'), 'outline'), decl(declsFor('input:focus-visible'), 'outline'));
+  assert.equal(decl(declsFor('select:focus-visible'), 'outline-offset'), decl(declsFor('input:focus-visible'), 'outline-offset'));
+  const off = declsFor('select:disabled');
+  assert.equal(decl(off, 'opacity'), 'var(--ostrel-pending-opacity)');
+  assert.equal(decl(off, 'cursor'), 'default');
+  assert.equal(decl(declsFor('input:disabled'), 'opacity'), 'var(--ostrel-pending-opacity)');
+});
+
+test('pick (select) hover and option colors follow the tokens in both schemes', () => {
+  assert.equal(decl(declsFor('select:hover'), 'border-color'), 'var(--ostrel-accent)');
+  const opt = declsFor('option');
+  assert.equal(decl(opt, 'background'), 'var(--ostrel-bg)');
+  assert.equal(decl(opt, 'color'), 'var(--ostrel-text)');
+});

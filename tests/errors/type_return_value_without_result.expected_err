@@ -1,0 +1,1 @@
+tests/errors/type_return_value_without_result.ostl:3:3: error[E0304]: this function returns nothing, found `Int`
