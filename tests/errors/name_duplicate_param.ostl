@@ -1,0 +1,5 @@
+fn add(a: Int, a: Int) -> Int
+  return a
+
+fn main()
+  print("ok")

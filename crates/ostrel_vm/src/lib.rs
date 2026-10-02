@@ -1,4 +1,176 @@
 //! Bytecode compiler and virtual machine for the Ostrel programming language.
 //!
-//! This crate is an empty placeholder of the workspace skeleton. Its owners fill it
-//! according to the v0.1 build plan.
+//! This file fixes the v0.1 contract of the VM (freeze wave F1a, ARCHITECTURE 3.4
+//! and 13): the entry point [`run`], the [`Host`] through which the VM reaches the
+//! outside world, the [`Limits`] it enforces and the [`RuntimeError`] it reports.
+//! The bytecode [`Image`] and the compiler from `ostrel_ir` are added behind this
+//! contract; until then an image holds no code and [`run`] returns `Ok(())`.
+
+// This crate executes programs derived from untrusted input: no unwrap, expect,
+// panic or unchecked indexing.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
+use std::fmt;
+
+pub use ostrel_ir::Span;
+
+/// Everything the VM needs from its embedder. The CLI writes to stdout; the
+/// server (ARCHITECTURE 4.1) adds database, RPC and clock access by addition.
+pub trait Host {
+    /// Writes one line of program output; `text` carries no trailing newline.
+    fn print(&mut self, text: &str);
+}
+
+/// Resource limits of one run. Every limit is checked before the work or the
+/// allocation it guards, so exceeding one is a [`RuntimeError`], never an abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum number of executed instructions (`StepLimit`, flag `--max-steps`).
+    pub max_steps: u64,
+    /// Maximum number of frames held at once; `main` is frame 1 (`CallDepth`).
+    pub max_frames: u32,
+    /// Maximum VM heap size in bytes (`HeapLimit`).
+    pub max_heap_bytes: u64,
+    /// Maximum size of one `Text` value in UTF 8 bytes (`TextLimit`).
+    pub max_text_bytes: u64,
+}
+
+impl Default for Limits {
+    /// The v0.1 defaults of ARCHITECTURE 3.4 and SPEC 12.4.
+    fn default() -> Self {
+        Limits {
+            max_steps: 100_000_000,
+            max_frames: 10_000,
+            max_heap_bytes: 256 * 1024 * 1024,
+            max_text_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// The kinds of runtime error of v0.1 (ARCHITECTURE 3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuntimeErrorKind {
+    /// An `Int` result left [`ostrel_ir::INT_MIN`, `ostrel_ir::INT_MAX`] (D24).
+    IntOverflow,
+    /// `/` or `%` with a zero divisor.
+    DivisionByZero,
+    /// A call would create more frames than [`Limits::max_frames`].
+    CallDepth,
+    /// More instructions than [`Limits::max_steps`].
+    StepLimit,
+    /// An allocation would grow the heap beyond [`Limits::max_heap_bytes`].
+    HeapLimit,
+    /// A `Text` would exceed [`Limits::max_text_bytes`].
+    TextLimit,
+}
+
+impl RuntimeErrorKind {
+    /// The name printed in `runtime error[Kind]`.
+    pub fn name(self) -> &'static str {
+        match self {
+            RuntimeErrorKind::IntOverflow => "IntOverflow",
+            RuntimeErrorKind::DivisionByZero => "DivisionByZero",
+            RuntimeErrorKind::CallDepth => "CallDepth",
+            RuntimeErrorKind::StepLimit => "StepLimit",
+            RuntimeErrorKind::HeapLimit => "HeapLimit",
+            RuntimeErrorKind::TextLimit => "TextLimit",
+        }
+    }
+}
+
+impl fmt::Display for RuntimeErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A runtime error at the source location of the failing instruction. The CLI
+/// renders it as `file:line:column: runtime error[Kind]: message`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeError {
+    /// What went wrong.
+    pub kind: RuntimeErrorKind,
+    /// Where: the failing instruction, or the call expression for `CallDepth`.
+    pub span: Span,
+}
+
+/// Executable bytecode of one program, produced from `ostrel_ir::Program` by the
+/// bytecode compiler. Its contents are private to this crate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Image {
+    _code: (),
+}
+
+/// Runs `fn main()` of `image` to completion within `limits`.
+///
+/// Output goes through `host`. Output written before an error stays written.
+pub fn run<H: Host + ?Sized>(
+    image: &Image,
+    host: &mut H,
+    limits: Limits,
+) -> Result<(), RuntimeError> {
+    let _ = (image, host, limits);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Capture(Vec<String>);
+
+    impl Host for Capture {
+        fn print(&mut self, text: &str) {
+            self.0.push(text.to_string());
+        }
+    }
+
+    #[test]
+    fn default_limits_match_the_architecture() {
+        let limits = Limits::default();
+        assert_eq!(limits.max_steps, 100_000_000);
+        assert_eq!(limits.max_frames, 10_000);
+        assert_eq!(limits.max_heap_bytes, 268_435_456);
+        assert_eq!(limits.max_text_bytes, 16_777_216);
+    }
+
+    #[test]
+    fn kind_names_are_stable() {
+        let names: Vec<String> = [
+            RuntimeErrorKind::IntOverflow,
+            RuntimeErrorKind::DivisionByZero,
+            RuntimeErrorKind::CallDepth,
+            RuntimeErrorKind::StepLimit,
+            RuntimeErrorKind::HeapLimit,
+            RuntimeErrorKind::TextLimit,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "IntOverflow",
+                "DivisionByZero",
+                "CallDepth",
+                "StepLimit",
+                "HeapLimit",
+                "TextLimit"
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_image_runs_without_output() {
+        let mut host = Capture(Vec::new());
+        assert_eq!(run(&Image::default(), &mut host, Limits::default()), Ok(()));
+        assert!(host.0.is_empty());
+        let dyn_host: &mut dyn Host = &mut host;
+        assert_eq!(run(&Image::default(), dyn_host, Limits::default()), Ok(()));
+    }
+}

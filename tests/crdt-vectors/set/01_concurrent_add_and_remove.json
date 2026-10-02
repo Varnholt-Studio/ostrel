@@ -1,0 +1,15 @@
+{
+  "strategy": "set",
+  "description": "B removes x after seeing only A's add; C's concurrent add has a tag B never named, so x stays (add wins).",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "add": "x" } },
+    { "id": "000000000000000c00000001", "hlc": "018bcfe568010000000000000000000c", "op": { "add": "x" } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568020000000000000000000b",
+      "op": { "remove": "x", "tags": ["000000000000000a00000001"] } }
+  ],
+  "deliveries": [[0, 1, 2], [1, 0, 2], [0, 2, 1]],
+  "expect": {
+    "value": ["x"],
+    "state": [["x", ["000000000000000c00000001"]]]
+  }
+}
