@@ -86,17 +86,82 @@ test('rejects a message id that already exists', () => {
   assert.equal(check(twice.diff(), 'bob').ok, false);
 });
 
-test('rejects timestamps in the future and before the own last message', () => {
+test('rejects timestamps in the future', () => {
   const { server, owners } = room();
   const bob = client(server, 2);
   messagesOf(bob.doc).push([msg('bob', 'late', NOW + 2001)]);
   assert.deepEqual(checkUpdate(server, bob.diff(), 'bob', owners, NOW), { ok: false, reason: 'timestamp in the future' });
-  const alice = client(server, 5);
-  messagesOf(alice.doc).push([msg('alice', 'back', NOW - 3_600_000)]);
-  assert.deepEqual(checkUpdate(server, alice.diff(), 'alice', owners, NOW), { ok: false, reason: 'timestamp before your last message' });
   const ok = client(server, 6);
   messagesOf(ok.doc).push([msg('alice', 'soon', NOW + 2000)]);
   assert.ok(checkUpdate(server, ok.diff(), 'alice', owners, NOW).ok);
+});
+
+// MEASUREMENT 1.6 and AC-57 (e): a clock set back must not place a message earlier.
+test('rejects a clock set back by one hour or ten years on a fresh client id', () => {
+  for (const back of [3_600_000, 10 * 365 * 86_400_000]) {
+    const { server, owners } = room();
+    const skewed = client(server, 7);
+    messagesOf(skewed.doc).push([msg('bob', 'skewed', NOW - back)]);
+    assert.deepEqual(checkUpdate(server, skewed.diff(), 'bob', owners, NOW), { ok: false, reason: 'timestamp before a message it follows' });
+
+    const empty = new Y.Doc({ gc: false });
+    const first = client(empty, 8);
+    messagesOf(first.doc).push([msg('bob', 'first in room', NOW - back)]);
+    const update = Y.encodeStateAsUpdate(first.doc);
+    assert.deepEqual(checkUpdate(empty, update, 'bob', new Map(), NOW, NOW - 60_000), { ok: false, reason: 'timestamp before the room was created' });
+  }
+});
+
+test('rejects a message placed before a message it was inserted in front of', () => {
+  const { server, owners } = room();
+  const front = client(server, 9);
+  messagesOf(front.doc).insert(0, [msg('bob', 'front', NOW - 3_600_000)]);
+  assert.deepEqual(checkUpdate(server, front.diff(), 'bob', owners, NOW), { ok: false, reason: 'timestamp before a message it follows' });
+});
+
+test('rejects a message before the last accepted message of the same client id', () => {
+  const { server, owners } = room();
+  const bob = client(server, 2);
+  messagesOf(bob.doc).push([msg('bob', 'one', NOW)]);
+  Y.applyUpdate(server, bob.diff());
+  owners.set(2, 'bob');
+  const replica = client(server, 2);
+  messagesOf(replica.doc).insert(0, [msg('bob', 'equal', NOW)]);
+  assert.ok(checkUpdate(server, replica.diff(), 'bob', owners, NOW).ok, 'same time is allowed');
+  const back = client(server, 2);
+  messagesOf(back.doc).insert(0, [msg('bob', 'back', NOW - 1)]);
+  assert.deepEqual(checkUpdate(server, back.diff(), 'bob', owners, NOW), { ok: false, reason: 'timestamp before your last message' });
+  const inOne = client(server, 3);
+  messagesOf(inOne.doc).push([msg('bob', 'b', NOW), msg('bob', 'a', NOW - 1)]);
+  assert.deepEqual(checkUpdate(server, inOne.diff(), 'bob', owners, NOW), { ok: false, reason: 'timestamp before your last message' });
+});
+
+// Review of T60: an honest offline message must not be rejected because the same user wrote
+// later from another client (that would close the socket on every reconnect).
+test('accepts honest offline messages of a second client of the same user', () => {
+  const { server, owners } = room();
+  const laptop = client(server, 2);
+  const phone = client(server, 3);
+  messagesOf(laptop.doc).push([msg('bob', 'offline', NOW - 5000)]);
+  messagesOf(phone.doc).push([msg('bob', 'online', NOW - 1000)]);
+  assert.ok(checkUpdate(server, phone.diff(), 'bob', owners, NOW).ok);
+  Y.applyUpdate(server, phone.diff());
+  owners.set(3, 'bob');
+  assert.ok(checkUpdate(server, laptop.diff(), 'bob', owners, NOW).ok);
+});
+
+test('accepts a message written offline hours ago after the messages it had seen', () => {
+  const alice = new Y.Doc({ gc: false });
+  alice.clientID = 1;
+  messagesOf(alice).push([msg('alice', 'first', NOW - 4 * 3_600_000)]);
+  const server = new Y.Doc({ gc: false });
+  Y.applyUpdate(server, Y.encodeStateAsUpdate(alice));
+  const traveller = client(server, 4);
+  messagesOf(traveller.doc).push([msg('bob', 'from the train', NOW - 3 * 3_600_000)]);
+  messagesOf(alice).push([msg('alice', 'meanwhile', NOW - 60_000)]);
+  Y.applyUpdate(server, Y.encodeStateAsUpdate(alice));
+  const owners = new Map([[1, 'alice']]);
+  assert.ok(checkUpdate(server, traveller.diff(), 'bob', owners, NOW, NOW - 5 * 3_600_000).ok);
 });
 
 test('rejects malformed messages', () => {

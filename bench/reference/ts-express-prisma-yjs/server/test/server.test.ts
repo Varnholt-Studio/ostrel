@@ -111,6 +111,8 @@ async function until(cond: () => boolean, what: string) {
 }
 
 const message = (author: string, text: string): Message => ({ id: randomUUID(), author, text, ts: Date.now() });
+// Close code of a connection, or -1 if it is still open after two seconds.
+const closeCode = (conn: { closed: Promise<number> }) => Promise.race([conn.closed, new Promise<number>((r) => setTimeout(() => r(-1), 2000))]);
 const updateCount = () => store.db.roomUpdate.count();
 
 test('chat server end to end on PostgreSQL', { skip: enabled ? false : 'DATABASE_URL not set' }, async (t) => {
@@ -213,6 +215,40 @@ test('chat server end to end on PostgreSQL', { skip: enabled ? false : 'DATABASE
       assert.equal(await conn.closed, CLOSE.invalid, name);
       assert.equal(await updateCount(), before, `${name} stored nothing`);
     }
+  });
+
+  // MEASUREMENT 1.6: a client clock set back is rejected even for the first message of a room.
+  await t.test('a clock set back is rejected in an empty room', async () => {
+    const quiet = await http('POST', '/api/rooms', { name: 'quiet' }, bob.token);
+    for (const back of [3_600_000, 10 * 365 * 86_400_000]) {
+      const before = await updateCount();
+      const conn = connect(quiet.body.id, bob.token);
+      await conn.ready;
+      messagesOf(conn.doc).push([{ ...message(bob.id, 'skewed'), ts: Date.now() - back }]);
+      assert.equal(await closeCode(conn), CLOSE.invalid, `${back} ms back`);
+      assert.equal(await updateCount(), before);
+      conn.ws.close();
+    }
+  });
+
+  await t.test('an offline message of a second client of the same user is kept', async () => {
+    const laptop = connect(roomId, bob.token);
+    await laptop.ready;
+    laptop.ws.close();
+    await laptop.closed;
+    messagesOf(laptop.doc).push([message(bob.id, 'written on the laptop')]);
+    await new Promise((r) => setTimeout(r, 20)); // the phone writes later, with a larger ts
+    const phone = connect(roomId, bob.token);
+    await phone.ready;
+    messagesOf(phone.doc).push([message(bob.id, 'written on the phone')]);
+    const watcher = connect(roomId, alice.token);
+    await watcher.ready;
+    await until(() => watcher.messages().some((m) => m.text === 'written on the phone'), 'phone message');
+    const back = connect(roomId, bob.token, laptop.doc);
+    await back.ready;
+    await until(() => watcher.messages().some((m) => m.text === 'written on the laptop'), 'laptop message');
+    assert.equal(back.ws.readyState, WebSocket.OPEN);
+    for (const c of [phone, watcher, back]) c.ws.close();
   });
 
   await t.test('a client id used by alice cannot be reused by bob', async () => {

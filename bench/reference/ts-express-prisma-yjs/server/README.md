@@ -63,8 +63,23 @@ The server rejects an update, stores nothing and closes the socket with:
 |---|---|
 | 4401 | missing, invalid or expired token |
 | 4403 | not a member of the room, or evicted after leaving |
-| 4400 | the update deletes content, writes anything other than new messages, uses a message id that exists, names another author, writes with a Yjs client id bound to another user, has a `ts` more than 2 s in the future or before the author's last message, or has text that is empty or longer than 2000 characters |
+| 4400 | the update deletes content, writes anything other than new messages, uses a message id that exists, names another author, writes with a Yjs client id bound to another user, has a `ts` outside its window (see below), or has text that is empty or longer than 2000 characters |
 | 4429 | operation rate or row quota exceeded |
+
+The window of a message `ts` uses only facts an honest offline client cannot contradict, so
+an honest outbox is never rejected for its clock (ARCHITECTURE 5.5, AC-57):
+
+* at most server time plus 2 s;
+* not before the last accepted message of the same Yjs client id (one client id is one
+  document instance, which writes its messages in order);
+* not before a message it was inserted next to (its Yjs origin or right origin) minus 4 s, since
+  the writer saw that message before writing;
+* not before the creation of the room minus 2 s.
+
+A client whose clock is set back therefore cannot place a message before what it had already
+seen, also with its first message in a room. Messages of other clients of the same user do not
+narrow the window, so an offline message stays valid when the user wrote from another device in
+the meantime.
 
 A client id is bound to the first user whose accepted update uses it, so a replica cannot be
 taken over by another user (for example an outbox drained after sign out).
@@ -81,7 +96,7 @@ and reset on restart.
 | Messages per user | 1 000 per hour | yes, close 4429 |
 | Sign in challenges per IP | 10 per min | yes, 429 |
 | New users per IP | 5 per hour | yes, 429 |
-| Clock tolerance (future) | 2 000 ms | rejected, not re-stamped |
+| Clock tolerance | 2 000 ms | rejected, not re-stamped |
 | Message text | 2 000 characters | yes, close 4400 |
 
 ## Known differences to the Ostrel chat
@@ -90,7 +105,9 @@ and reset on restart.
   whole and the connection is closed; the client keeps the rejected content in its local
   document. Ostrel rejects or re-stamps single operations.
 * Timestamps outside the window are rejected instead of re-stamped (MEASUREMENT 1.6 allows
-  either).
+  either): re-stamping Yjs content on the server would diverge from the writer's copy.
+* The lower bound is weaker than Ostrel's: a new client id that writes into an empty room
+  created long ago is bounded only by the creation of the room.
 * Every incoming update is validated on a copy of the room document, which costs time linear
   in the room size.
 * One key per user. Device links, key revocation and invite registration are not part of the

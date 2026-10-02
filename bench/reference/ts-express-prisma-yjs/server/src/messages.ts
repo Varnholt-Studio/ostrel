@@ -37,8 +37,30 @@ function isMessage(v: unknown): v is Message {
   );
 }
 
+// A new message value of the update with the Yjs ids of what its writer had seen next to it.
+type Written = { client: number; clock: number; value: unknown; seen: string[] };
+const key = (client: number, clock: number) => `${client}:${clock}`;
+
 // `owners` maps every writer client id to its bound user id (unbound ids are absent).
-export function checkUpdate(doc: Y.Doc, update: Uint8Array, user: string, owners: Map<number, string>, now = Date.now()): Verdict {
+// `roomCreated` is the server time the room was created; nobody can write into it earlier.
+//
+// Yjs content cannot be re-stamped by the server without diverging from the writer's copy, so
+// a timestamp outside its window rejects the update. The window is built only from facts an
+// honest offline writer cannot contradict, so an honest outbox is never rejected for its clock:
+// * at most the server time plus the tolerance;
+// * not before the last accepted message of the same Yjs client id (one client id is one
+//   document instance, and its messages are written in clock order);
+// * not before a message the writer inserted it next to, minus twice the tolerance (that
+//   message was stamped at most one tolerance late and seen by a clock at most one early);
+// * not before the creation of the room, minus the tolerance.
+export function checkUpdate(
+  doc: Y.Doc,
+  update: Uint8Array,
+  user: string,
+  owners: Map<number, string>,
+  now = Date.now(),
+  roomCreated = -Infinity,
+): Verdict {
   let decoded;
   try {
     decoded = Y.decodeUpdate(update);
@@ -75,23 +97,43 @@ export function checkUpdate(doc: Y.Doc, update: Uint8Array, user: string, owners
   if (after._map.size > 0) return { ok: false, reason: 'unexpected map entries' };
 
   // Every new item must be a value of the messages array.
-  const added: unknown[] = [];
+  const values = new Map<string, unknown>();
+  const lastOfClient = new Map<number, number>();
+  const written: Written[] = [];
   for (let item = after._start; item; item = item.right) {
     const known = sv.get(item.id.client) ?? 0;
-    item.content.getContent().forEach((v, i) => {
-      if (item.id.clock + i >= known) added.push(v);
+    const { client, clock } = item.id;
+    const right = item.rightOrigin ? [key(item.rightOrigin.client, item.rightOrigin.clock)] : [];
+    item.content.getContent().forEach((value, i) => {
+      values.set(key(client, clock + i), value);
+      if (clock + i < known) {
+        const ts = (value as Message).ts;
+        lastOfClient.set(client, Math.max(lastOfClient.get(client) ?? -Infinity, ts));
+        return;
+      }
+      const left = i > 0 ? key(client, clock + i - 1) : item.origin ? key(item.origin.client, item.origin.clock) : null;
+      written.push({ client, clock: clock + i, value, seen: left ? [left, ...right] : right });
     });
   }
-  if (added.length !== newItems) return { ok: false, reason: 'update carries content that is not a new message' };
-  let lastTs = Math.max(-Infinity, ...before.filter((m) => m.author === user).map((m) => m.ts));
+  if (written.length !== newItems) return { ok: false, reason: 'update carries content that is not a new message' };
+  const added = written.map((w) => w.value);
   if (!added.every(isMessage)) return { ok: false, reason: 'invalid message' };
-  for (const m of [...added].sort((a, b) => a.ts - b.ts)) {
+  written.sort((a, b) => a.client - b.client || a.clock - b.clock);
+  for (const w of written) {
+    const m = w.value as Message;
     if (ids.has(m.id)) return { ok: false, reason: 'duplicate message id' };
     if (m.author !== user) return { ok: false, reason: 'author must be the signed in user' };
     if (m.ts > now + LIMITS.clockToleranceMs) return { ok: false, reason: 'timestamp in the future' };
-    if (m.ts < lastTs) return { ok: false, reason: 'timestamp before your last message' };
+    if (m.ts < roomCreated - LIMITS.clockToleranceMs) return { ok: false, reason: 'timestamp before the room was created' };
+    if (m.ts < (lastOfClient.get(w.client) ?? -Infinity)) return { ok: false, reason: 'timestamp before your last message' };
+    for (const k of w.seen) {
+      const seen = values.get(k) as Message | undefined;
+      if (seen && Number.isSafeInteger(seen.ts) && m.ts < seen.ts - 2 * LIMITS.clockToleranceMs) {
+        return { ok: false, reason: 'timestamp before a message it follows' };
+      }
+    }
     ids.add(m.id);
-    lastTs = m.ts;
+    lastOfClient.set(w.client, m.ts);
   }
   return { ok: true, added, clients: [...clients] };
 }

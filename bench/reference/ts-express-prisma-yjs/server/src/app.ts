@@ -17,7 +17,7 @@ const HANDLE = /^[a-z0-9_]{3,20}$/;
 // WebSocket close codes sent to the client.
 export const CLOSE = { unauthorized: 4401, forbidden: 4403, invalid: 4400, limit: 4429 };
 
-type Room = { id: string; doc: Y.Doc; conns: Map<WebSocket, User>; queue: Promise<void> };
+type Room = { id: string; created: number; doc: Y.Doc; conns: Map<WebSocket, User>; queue: Promise<void> };
 type Authed = Request & { user: User };
 
 export function createApp(store: Store, serverKey: KeyObject, limits: typeof LIMITS = LIMITS) {
@@ -132,10 +132,10 @@ export function createApp(store: Store, serverKey: KeyObject, limits: typeof LIM
   function openRoom(id: string): Promise<Room> {
     let room = rooms.get(id);
     if (!room) {
-      room = store.updates(id).then((updates) => {
+      room = Promise.all([store.updates(id), store.roomCreated(id)]).then(([updates, created]) => {
         const doc = new Y.Doc({ gc: false });
         if (updates.length) Y.applyUpdate(doc, Y.mergeUpdates(updates));
-        return { id, doc, conns: new Map(), queue: Promise.resolve() };
+        return { id, created: created ?? Date.now(), doc, conns: new Map(), queue: Promise.resolve() };
       });
       rooms.set(id, room);
     }
@@ -153,7 +153,7 @@ export function createApp(store: Store, serverKey: KeyObject, limits: typeof LIM
     if (ws.readyState !== WebSocket.OPEN) return; // a rejected connection sends nothing more
     if (!(await store.isMember(room.id, user.id))) return ws.close(CLOSE.forbidden, 'not a member');
     const owners = await store.clientOwners(writersOf(room.doc, update));
-    const verdict = checkUpdate(room.doc, update, user.id, owners);
+    const verdict = checkUpdate(room.doc, update, user.id, owners, Date.now(), room.created);
     if (!verdict.ok) return ws.close(CLOSE.invalid, verdict.reason);
     if (verdict.added.length === 0) return;
     const n = verdict.added.length;

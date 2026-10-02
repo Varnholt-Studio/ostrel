@@ -12,6 +12,8 @@ export interface Store {
   renameUser(id: string, name: string): Promise<User>;
   rooms(): Promise<RoomView[]>;
   room(id: string): Promise<RoomView | null>;
+  // Server time the room was created, in epoch milliseconds.
+  roomCreated(id: string): Promise<number | null>;
   createRoom(name: string, ownerId: string): Promise<RoomView>;
   join(roomId: string, userId: string): Promise<void>;
   leave(roomId: string, userId: string): Promise<void>;
@@ -58,6 +60,11 @@ export class PrismaStore implements Store {
   async room(id: string) {
     const row = await this.db.room.findUnique({ where: { id }, select: roomSelect });
     return row && toView(row);
+  }
+
+  async roomCreated(id: string) {
+    const row = await this.db.room.findUnique({ where: { id }, select: { createdAt: true } });
+    return row && row.createdAt.getTime();
   }
 
   async createRoom(name: string, ownerId: string) {
