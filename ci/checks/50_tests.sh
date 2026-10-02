@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs every test suite found in the repository, offline and without package installs.
-#   Rust:       cargo test --workspace --locked --no-fail-fast (when Cargo.toml exists)
+#   Rust:       cargo test --workspace --locked --no-fail-fast (when Cargo.toml exists);
+#               with GATE_SCOPE=quick only the crates in GATE_CRATES (set by ci/gate.sh)
 #   JavaScript: node --test on *.test.js and *.test.mjs (built in runner, no npm)
 #   Python:     unittest (or pytest when available) on test_*.py
 #   Go:         go test ./... (when go.mod exists)
@@ -34,9 +35,36 @@ list() {
   mapfile -d '' out < <(repo_find "$@" | not_data | sort -z)
 }
 
+# rust_picks: the cargo test arguments for GATE_SCOPE=quick. The crate selection is the
+# one of ci/gate.sh (GATE_CRATES), so fmt, clippy and tests see the same set: "all" or
+# unset gives "--workspace"; a space separated list of package names gives "-p NAME" per
+# name; an empty list gives nothing (no crate touched). A malformed name falls back to
+# "--workspace", never to a test filter.
+rust_picks() {
+  local name
+  local -a names=() out=()
+  read -ra names <<< "${GATE_CRATES-all}"
+  for name in "${names[@]}"; do
+    if [ "$name" = all ] || ! [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+      echo --workspace
+      return
+    fi
+    out+=(-p "$name")
+  done
+  [ ${#out[@]} -gt 0 ] && printf '%s\n' "${out[@]}"
+  return 0
+}
+
 # Rust
 list rs_code -name '*.rs'
-if [ -f Cargo.toml ]; then
+if [ -f Cargo.toml ] && [ "${GATE_SCOPE:-full}" = quick ]; then
+  mapfile -t picks < <(rust_picks)
+  if [ ${#picks[@]} -gt 0 ]; then
+    run cargo test --locked --no-fail-fast "${picks[@]}"
+  else
+    echo "   (GATE_SCOPE=quick: no crate changed, Rust tests skipped)"
+  fi
+elif [ -f Cargo.toml ]; then
   run cargo test --workspace --locked --no-fail-fast
 elif [ ${#rs_code[@]} -gt 0 ]; then
   echo "Rust code without a Cargo workspace: ${rs_code[0]}"

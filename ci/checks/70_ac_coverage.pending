@@ -1,0 +1,56 @@
+# Criteria of ci/ac-list.txt that have no test named ac_NN_<topic> yet (70_ac_coverage.sh).
+# One `AC-NN` per line. The check fails when a listed criterion gets a test, so this list
+# only shrinks: whoever adds the first ac_NN_ test removes AC-NN here in the same change.
+# A milestone cannot be signed off while any of its criteria is listed here (SPEC 3).
+# Keeping uncovered criteria visible but not blocking needs a decision of the QA lead
+# (Refs #57).
+AC-01
+AC-05
+AC-07
+AC-09
+AC-10
+AC-11
+AC-12
+AC-13
+AC-14
+AC-16
+AC-17
+AC-18
+AC-20
+AC-21
+AC-22
+AC-23
+AC-24
+AC-27
+AC-28
+AC-29
+AC-30
+AC-31
+AC-32
+AC-33
+AC-34
+AC-35
+AC-36
+AC-37
+AC-38
+AC-39
+AC-40
+AC-42
+AC-43
+AC-44
+AC-46
+AC-47
+AC-48
+AC-51
+AC-54
+AC-55
+AC-56
+AC-57
+AC-58
+AC-59
+AC-60
+AC-61
+AC-62
+AC-63
+AC-64
+AC-65
