@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { compareKey, compareText, encode, InvalidValue } from './canon.mjs';
+import { compareCodePoints, compareKey, compareText, encode, InvalidValue } from './canon.mjs';
 
 test('rejects numbers without a canonical form', () => {
   for (const number of [NaN, Infinity, -Infinity]) {
@@ -33,6 +33,11 @@ test('compareText orders astral characters after the BMP', () => {
   assert.equal(compareText('a', 'ab'), -1);
   assert.equal(compareText('b', 'ab'), 1);
   assert.equal(compareText('same', 'same'), 0);
+});
+
+test('compareCodePoints stays exported as an alias of compareText', () => {
+  // runtime/js/view/list/sorted_index.js still imports the old name.
+  assert.equal(compareCodePoints, compareText);
 });
 
 test('compareKey orders booleans, then numbers, then strings (D61)', () => {

@@ -51,6 +51,13 @@ export function compareText(a, b) {
   return Math.sign(left.length - right.length);
 }
 
+/**
+ * Deprecated alias of `compareText`, kept so existing importers such as
+ * `runtime/js/view/list/sorted_index.js` keep working. New code should use `compareText` for
+ * strings or `compareKey` for `Set` elements and `Map` keys.
+ */
+export { compareText as compareCodePoints };
+
 // Kinds of `Set` elements and `Map` keys in the order of D61.
 const KEY_KIND_ORDER = { boolean: 0, number: 1, string: 2 };
 
