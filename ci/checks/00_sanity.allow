@@ -1,3 +1,4 @@
 # Files that may contain key material on purpose, used only by 00_sanity.sh.
 # One entry per line: exact repository path, whitespace, reason (decision or task id).
 # Directories and patterns are not supported, so every exempt file is named here.
+crates/ostrel_auth/tests/vectors/v4.json  #950 T50: upstream PASETO v4 test vectors, public test keys (secret-key-pem)
