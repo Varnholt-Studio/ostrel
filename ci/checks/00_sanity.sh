@@ -11,6 +11,9 @@
 # not tracked are skipped, so a second local run after a build stays green. A build directory
 # equal to or above the repository root exempts nothing. The server gate builds outside the
 # exported tree, so there a committed target/ or node_modules/ is still checked in full.
+# Limit: a local export run with the gate.sh default (CARGO_TARGET_DIR=$PWD/target) skips a
+# shipped target/ that carries a cargo CACHEDIR.TAG completely, key material included; only
+# the server gate run is evidence.
 #
 # Key material that must be committed on purpose (for example published test vectors) is
 # listed with its exact path and a reason in ci/checks/00_sanity.allow; nothing else is
