@@ -10,18 +10,21 @@
 //! #[path = "../../../tests/db-conformance/harness/mod.rs"]
 //! mod harness;
 //!
+//! use ostrel_db_memory::MemoryDriver;
+//!
 //! #[test]
 //! fn ac_18_conformance_memory() {
-//!     let driver = ostrel_db_memory::MemoryDriver::default();
-//!     let run = harness::run_dir(&harness::cases_dir(), &|| driver.connect("memory:"));
-//!     harness::block_on(run).assert_passed();
+//!     let dir = harness::cases_dir();
+//!     let fresh = harness::new_driver_per_case(MemoryDriver::default, "memory:");
+//!     harness::block_on(harness::run_dir(&dir, &fresh)).assert_passed();
 //! }
 //! ```
 //!
-//! The closure must return a connection to a new, empty database for every call; the harness
-//! migrates it and runs one case on it. A driver whose futures wait on I/O runs `run_dir` on
-//! its own runtime instead of [`block_on`]. The tests of the harness itself (`selftest.rs`)
-//! run in every test target that includes it.
+//! [`run_dir`] takes a [`Fresh`] closure that must return a connection to a new, empty
+//! database for every call; the harness migrates it and runs one case on it. Connections of one
+//! driver share a database, so [`new_driver_per_case`] builds a new driver for every case. A
+//! driver whose futures wait on I/O runs `run_dir` on its own runtime instead of [`block_on`].
+//! The tests of the harness itself (`selftest.rs`) run in every test target that includes it.
 
 mod cases;
 mod json;
@@ -34,12 +37,24 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::task::{Context, Poll, Waker};
 
-use ostrel_db::api::{BoxFuture, Connection, DbError, MigrationPlan, Row, Value};
+use ostrel_db::api::{BoxFuture, Connection, DbError, Driver, MigrationPlan, Row, Value};
 
 use cases::{Action, Case, Expect};
 
 /// Opens a connection to a new, empty database.
 pub type Fresh<'a> = dyn Fn() -> BoxFuture<'a, Result<Box<dyn Connection>, DbError>> + 'a;
+
+/// A [`Fresh`] closure that builds a new driver with `make` for every case and connects it to
+/// `url`. Use it for a driver whose connections share one database, as the in memory driver.
+pub fn new_driver_per_case<'a, D: Driver + 'a>(
+    make: impl Fn() -> D + 'a,
+    url: &'a str,
+) -> impl Fn() -> BoxFuture<'a, Result<Box<dyn Connection>, DbError>> + 'a {
+    move || {
+        let driver = make();
+        Box::pin(async move { driver.connect(url).await })
+    }
+}
 
 /// Longest rendering of a value in a failure message.
 const SHOW_MAX: usize = 120;

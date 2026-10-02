@@ -4,18 +4,19 @@
 //! against a reference driver with one injected fault each and check that the harness reports
 //! exactly the case that the fault breaks.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use ostrel_db::api::{
-    BoxFuture, Connection, DbError, Dir, FieldId, MigrationPlan, ModelId, Query, Row, RowId, Rows,
-    ServerSeq, StoredOp, Transaction, Value, Write,
+    BoxFuture, Capabilities, Connection, DbError, Dir, Driver, FieldId, MigrationPlan, ModelId,
+    Query, Row, RowId, Rows, ServerSeq, StoredOp, Transaction, Value, Write,
 };
 
 use super::cases::{self, Expect};
 use super::json::{self, Json};
-use super::{Report, block_on, run_dir, run_text};
+use super::{Report, block_on, new_driver_per_case, run_dir, run_text};
 
 // ---------------------------------------------------------------------------------------------
 // Reference driver with injectable faults
@@ -49,9 +50,11 @@ struct Stored {
 
 type State = BTreeMap<RowId, Stored>;
 
+/// A connection. Connections opened by one [`RefDriver`] share its state, as the connections of
+/// a real driver share one database.
 struct RefConn {
     faults: Faults,
-    state: State,
+    state: Rc<RefCell<State>>,
 }
 
 struct RefTx<'c> {
@@ -63,9 +66,41 @@ fn fresh_ref(faults: Faults) -> BoxFuture<'static, Result<Box<dyn Connection>, D
     Box::pin(async move {
         Ok(Box::new(RefConn {
             faults,
-            state: State::new(),
+            state: Rc::default(),
         }) as Box<dyn Connection>)
     })
+}
+
+/// Reference driver: one database, shared by every connection it opens.
+#[derive(Default)]
+struct RefDriver {
+    state: Rc<RefCell<State>>,
+}
+
+impl Driver for RefDriver {
+    fn name(&self) -> &'static str {
+        "ref"
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            transactions: true,
+            sequences: false,
+            subqueries: false,
+            json_fields: false,
+            max_in_list: 1000,
+        }
+    }
+    fn connect<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Box<dyn Connection>, DbError>> {
+        Box::pin(async move {
+            if url != "ref:" {
+                return Err(DbError::Unsupported("url"));
+            }
+            Ok(Box::new(RefConn {
+                faults: Faults::default(),
+                state: Rc::clone(&self.state),
+            }) as Box<dyn Connection>)
+        })
+    }
 }
 
 fn cmp_value(a: &Value, b: &Value, utf16: bool) -> std::cmp::Ordering {
@@ -193,11 +228,11 @@ impl Connection for RefConn {
         Box::pin(async { Ok(()) })
     }
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>> {
-        Box::pin(async move { Ok(scan(&self.state, q, self.faults)) })
+        Box::pin(async move { Ok(scan(&self.state.borrow(), q, self.faults)) })
     }
     fn begin<'c>(&'c mut self) -> BoxFuture<'c, Result<Box<dyn Transaction<'c> + 'c>, DbError>> {
         Box::pin(async move {
-            let work = self.state.clone();
+            let work = self.state.borrow().clone();
             Ok(Box::new(RefTx { conn: self, work }) as Box<dyn Transaction<'c> + 'c>)
         })
     }
@@ -233,7 +268,7 @@ impl<'c> Transaction<'c> for RefTx<'c> {
     fn commit(self: Box<Self>) -> BoxFuture<'c, Result<(), DbError>> {
         Box::pin(async move {
             let tx = *self;
-            tx.conn.state = tx.work;
+            *tx.conn.state.borrow_mut() = tx.work;
             Ok(())
         })
     }
@@ -241,7 +276,7 @@ impl<'c> Transaction<'c> for RefTx<'c> {
         Box::pin(async move {
             let tx = *self;
             if tx.conn.faults.rollback_commits {
-                tx.conn.state = tx.work;
+                *tx.conn.state.borrow_mut() = tx.work;
             }
             Ok(())
         })
@@ -773,4 +808,38 @@ fn shared_cases_pass_on_the_reference_driver() {
         fresh_ref(Faults::default())
     }));
     report.assert_passed();
+}
+
+/// The entry documented in the README and in `mod.rs`, written the same way with the reference
+/// driver. Its connections share one database, so this passes only if every case gets a driver
+/// of its own.
+#[test]
+fn documented_entry_runs_the_shared_cases() {
+    let dir = super::cases_dir();
+    let fresh = new_driver_per_case(RefDriver::default, "ref:");
+    block_on(run_dir(&dir, &fresh)).assert_passed();
+}
+
+/// Connections of one driver share a database, so reusing one driver for every case lets
+/// earlier cases leak into later ones. This is why the entry builds a driver per case.
+#[test]
+fn one_driver_for_every_case_fails() {
+    let driver = RefDriver::default();
+    let mut report = Report::default();
+    block_on(run_text(
+        "suite.json",
+        SUITE,
+        &|| driver.connect("ref:"),
+        &mut report,
+    ));
+    assert!(!report.is_ok(), "{report}");
+}
+
+#[test]
+fn new_driver_per_case_passes_the_connect_error_on() {
+    let fresh = new_driver_per_case(RefDriver::default, "other:");
+    let mut report = Report::default();
+    block_on(run_text("suite.json", SUITE, &fresh, &mut report));
+    assert_eq!(report.failures.len(), 7, "{report}");
+    assert!(report.failures[0].message.contains("connect failed with Unsupported"));
 }

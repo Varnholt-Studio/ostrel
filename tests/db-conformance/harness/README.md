@@ -12,16 +12,22 @@ driver crate in `crates/<name>/` includes it from one integration test:
 #[path = "../../../tests/db-conformance/harness/mod.rs"]
 mod harness;
 
+use ostrel_db_memory::MemoryDriver;
+
 #[test]
 fn ac_18_conformance_memory() {
-    let driver = ostrel_db_memory::MemoryDriver::default();
-    let run = harness::run_dir(&harness::cases_dir(), &|| driver.connect("memory:"));
-    harness::block_on(run).assert_passed();
+    let dir = harness::cases_dir();
+    let fresh = harness::new_driver_per_case(MemoryDriver::default, "memory:");
+    harness::block_on(harness::run_dir(&dir, &fresh)).assert_passed();
 }
 ```
 
-* The closure returns a connection to a new, empty database on every call. The harness calls
-  `migrate` with an empty plan and runs one case on it.
+* `run_dir` takes a closure that returns a connection to a new, empty database on every call.
+  The harness calls `migrate` with an empty plan and runs one case on it.
+* All connections of one driver share a database, so one driver must not serve two cases.
+  `new_driver_per_case` builds a new driver for every case and connects it to the URL. A driver
+  that can create an empty database per connection (for example a new schema in PostgreSQL)
+  may pass its own closure instead.
 * `block_on` serves drivers whose futures complete without waiting (in memory, SQLite). It
   panics if a future waits; a driver with real I/O (PostgreSQL) runs `run_dir` on its own
   runtime.
@@ -51,4 +57,4 @@ values that do not fit the field type and `text_repeat` values over 16 MiB make 
 a reference driver with one injected fault each (upsert, reused tombstone id, missing version
 increase, lost NUL, UTF-16 order, rollback that keeps writes, ignored limit) and checks that
 exactly the affected cases fail. It also runs the shared case files against the fault free
-reference driver.
+reference driver, once through the entry shown above.
