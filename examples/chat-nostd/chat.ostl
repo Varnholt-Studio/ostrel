@@ -1,0 +1,95 @@
+app Chat
+  auth paseto open
+
+data Room
+  name: Text
+  members: Set[User] = {me}
+  check name.len in 1..40
+  see if signed
+  make if members == {me}
+  edit members if added == {me} or removed == {me}
+
+data Message
+  room: Room
+  text: Text
+  check text.len in 1..2000
+  see if me in room.members
+  make if me in room.members
+
+var current: Room?
+var roomDraft = ""
+var messageDraft = ""
+
+fn createRoom()
+  let name = roomDraft.trim
+  if name.len > 0
+    current = make Room { name: name }
+    roomDraft = ""
+
+fn send(r: Room)
+  let text = messageDraft.trim
+  if text.len > 0
+    make Message { room: r, text: text }
+    messageDraft = ""
+
+view Main
+  row ~app
+    col
+      for r in Room sort name
+        button r.name ~active(r == current) on click current = r
+      row
+        input bind: roomDraft hint: "New room" on enter createRoom()
+        button "Create" on click createRoom()
+      text sync.state ~muted
+    col
+      if let r = current
+        row
+          text r.name ~title
+          if me in r.members
+            button "Leave" on click r.members.remove(me)
+          else
+            button "Join" on click r.members.add(me)
+        col ~log
+          for m in Message where room == r sort made desc limit 200
+            row ~mine(m.author == me) ~pending(m.pending) ~rejected(m.rejected)
+              text m.author.handle ~strong
+              text m.text
+              text m.made.clock ~muted
+        if me in r.members
+          row
+            input bind: messageDraft hint: "Message" on enter send(r)
+            button "Send" on click send(r)
+      else
+        text "Pick or create a room" ~muted
+
+style
+  .app {
+    display: grid;
+    grid-template-columns: 16rem 1fr;
+    height: 100vh;
+  }
+  .log {
+    display: flex;
+    flex-direction: column-reverse;
+    overflow-y: auto;
+  }
+  .mine {
+    align-self: flex-end;
+    background: $accentSoft;
+  }
+  .pending {
+    opacity: 0.5;
+  }
+  .rejected {
+    text-decoration: line-through;
+  }
+  .active,
+  .strong {
+    font-weight: 600;
+  }
+  .title {
+    font-size: 1.25rem;
+  }
+  .muted {
+    color: $muted;
+  }
