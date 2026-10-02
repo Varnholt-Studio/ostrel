@@ -6,15 +6,35 @@
 //!
 //! # Layout
 //!
-//! * Indentation is two spaces per level (SYNTAX 3, P1). The lexer emits `Nl` at
-//!   the end of every logical line, one `Indent` per level the next line is
-//!   deeper and one `Dedent` per level it is shallower.
+//! * Indentation is two spaces per level (SYNTAX 3, P1). The lexer keeps a
+//!   stack of indentation columns, starting with column 0 (ARCHITECTURE 3.5,
+//!   D68). It emits `Nl` at the end of every logical line. A line deeper than
+//!   the top of the stack opens exactly one block: one `Indent`, its column is
+//!   pushed. A line more than two columns deeper is E0013; it still opens one
+//!   block with its real column, so the following lines of that block get no
+//!   further diagnostic. A shallower line pops columns with one `Dedent` each
+//!   until the top is not deeper than the line; a column that is not on the
+//!   stack (only possible after a recovery) closes to the next outer level
+//!   without a second diagnostic.
+//! * A tab in the indentation is E0001 and an odd column E0002. Recovery
+//!   counts a tab as two columns and rounds an odd column up, then applies the
+//!   stack rules above without a further diagnostic.
 //! * Blank lines and lines holding only a comment produce no `Nl`, `Indent` or
 //!   `Dedent`, and their leading whitespace is not checked (SPEC 12.2).
 //! * While a `(` is open, line ends and indentation are ignored. From v0.2 `[`
 //!   and `{` continue lines as well (SPEC 12.2); see [`continues_line`].
 //! * At the end of the input the lexer closes the last line with `Nl`, emits a
-//!   `Dedent` for every open level and ends with `Eof`.
+//!   `Dedent` for every open block and ends with `Eof`. A last line without a
+//!   line end is valid, and an empty input gives only `Eof`.
+//!
+//! # Line ends and code points
+//!
+//! * `\r\n` is a line end like `\n`; mixed line ends are allowed. A lone
+//!   carriage return is E0008 in code and in comments (in string text the
+//!   literal scanner reports it).
+//! * Exactly one U+FEFF at byte 0 is skipped. Anywhere else it is E0008 in code
+//!   and allowed in comments and string text.
+//! * Raw bidirectional control characters are E0011 everywhere (D53).
 //!
 //! # Split with the literal scanner
 //!
@@ -31,6 +51,7 @@
 //! line end, so the statements on both sides still parse.
 
 pub mod codes;
+mod literal;
 mod token;
 
 #[cfg(test)]
@@ -91,6 +112,14 @@ pub trait LiteralScan {
     ) -> (usize, TextStop);
 }
 
+/// Lexes `src` with the literal scanner of this crate.
+///
+/// The token stream always ends with exactly one [`TokenKind::Eof`] token, and
+/// every `Indent` has a matching `Dedent` before it.
+pub fn lex(src: &str, file: FileId) -> (Vec<Token>, Vec<Diagnostic>) {
+    lex_with(src, file, &literal::Literals)
+}
+
 /// Lexes `src` with the given literal scanner.
 ///
 /// The token stream always ends with exactly one [`TokenKind::Eof`] token, and
@@ -107,7 +136,7 @@ pub fn lex_with<L: LiteralScan + ?Sized>(
         pos: 0,
         tokens: Vec::new(),
         diags: Vec::new(),
-        level: 0,
+        indents: vec![0],
         open: 0,
         line_has_tokens: false,
         at_line_start: true,
@@ -131,8 +160,9 @@ struct Lexer<'a, L: ?Sized> {
     pos: usize,
     tokens: Vec<Token>,
     diags: Vec<Diagnostic>,
-    /// Current indentation level, in steps of two spaces.
-    level: u32,
+    /// Stack of indentation columns of the open blocks. The first entry is
+    /// column 0 and is never popped.
+    indents: Vec<u32>,
     /// Number of open brackets that continue a line.
     open: u32,
     /// The current logical line has a token other than trivia.
@@ -146,7 +176,8 @@ struct Lexer<'a, L: ?Sized> {
 impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
     fn run(&mut self) {
         if self.src.starts_with('\u{FEFF}') {
-            // ASSUMPTION: a byte order mark at the start of the file is skipped.
+            // Exactly one byte order mark at byte 0 is skipped (D68). A second
+            // one is an unexpected character like any U+FEFF in code.
             self.pos = '\u{FEFF}'.len_utf8();
         }
         loop {
@@ -165,10 +196,10 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         if self.line_has_tokens {
             self.push(TokenKind::Nl, end, end);
         }
-        for _ in 0..self.level {
+        while self.indents.len() > 1 {
+            self.indents.pop();
             self.push(TokenKind::Dedent, end, end);
         }
-        self.level = 0;
         self.push(TokenKind::Eof, end, end);
     }
 
@@ -211,24 +242,35 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         } else {
             false
         };
-        let target = if faulty {
-            // Recovery: at most one level deeper, so a faulty first line of a
-            // block still opens the block and causes no follow up diagnostic.
-            width.div_ceil(2).min(self.level.saturating_add(1))
+        // Recovery for E0001 and E0002: the column rounded up to a multiple of
+        // two. The stack rules below then hold without a second diagnostic.
+        let column = if faulty {
+            width.div_ceil(2).saturating_mul(2)
         } else {
-            width / 2
+            width
         };
-        // ASSUMPTION (QUESTION #136 (3) open): every multiple of two spaces is a
-        // level, so a jump of several levels gives several `Indent` tokens and a
-        // dedent to any even column is valid. The parser judges the jump.
-        while self.level < target {
+        let top = self.top();
+        if column > top {
+            if !faulty && column - top > 2 {
+                self.error(codes::DEEP_INDENT, start, ws_end, codes::MSG_DEEP_INDENT);
+            }
+            // Exactly one block opens, with the real column, so the following
+            // lines of that block are not reported again (D68).
             self.push(TokenKind::Indent, start, ws_end);
-            self.level += 1;
+            self.indents.push(column);
+            return;
         }
-        while self.level > target {
+        while self.top() > column {
+            self.indents.pop();
             self.push(TokenKind::Dedent, ws_end, ws_end);
-            self.level -= 1;
         }
+        // A column between two stack entries can only follow a recovery; the
+        // line belongs to the block that is now on top, without a diagnostic.
+    }
+
+    /// The column of the innermost open block.
+    fn top(&self) -> u32 {
+        self.indents.last().copied().unwrap_or(0)
     }
 
     /// Handles a line end of `len` bytes at the current position.
@@ -356,6 +398,16 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             }
             if codes::is_bidi_control(c) {
                 self.bidi(c);
+            } else if c == '\r' {
+                // A lone carriage return is not a line end (D68). Some editors
+                // show it as one, so the rest of the comment could pass for code.
+                let at = self.pos;
+                self.error(
+                    codes::UNEXPECTED_CHAR,
+                    at,
+                    at + 1,
+                    codes::msg_unexpected_char(c),
+                );
             }
             self.pos += c.len_utf8();
         }
@@ -630,5 +682,288 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
     fn error(&mut self, code: ostrel_core::Code, start: usize, end: usize, msg: impl Into<String>) {
         let span = self.span(start, end);
         self.diags.push(Diagnostic::error(code, span, msg));
+    }
+}
+
+/// Tests of the D68 layout, line end and code point rules (ARCHITECTURE 3.5).
+#[cfg(test)]
+mod d68_tests {
+    use super::{TokenKind, codes, lex};
+    use TokenKind::{Dedent, Eof, Error, Ident, Indent, Nl};
+    use ostrel_core::{Code, FileId};
+
+    fn run(src: &str) -> (Vec<TokenKind>, Vec<(Code, u32, u32)>) {
+        let (tokens, diags) = lex(src, FileId::from_raw(0));
+        let kinds = tokens.iter().map(|t| t.kind).collect();
+        let diags = diags
+            .iter()
+            .map(|d| (d.code, d.span.start, d.span.end))
+            .collect();
+        (kinds, diags)
+    }
+
+    fn kinds(src: &str) -> Vec<TokenKind> {
+        run(src).0
+    }
+
+    fn texts(src: &str) -> Vec<String> {
+        let (tokens, _) = lex(src, FileId::from_raw(0));
+        tokens
+            .iter()
+            .map(|t| {
+                let r = t.span.start as usize..t.span.end as usize;
+                src.get(r).unwrap_or("<bad span>").to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_level_deeper_opens_one_block_without_diagnostic() {
+        let (k, d) = run("a\n  b\n    c\n");
+        assert_eq!(
+            k,
+            vec![
+                Ident, Nl, Indent, Ident, Nl, Indent, Ident, Nl, Dedent, Dedent, Eof
+            ]
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn jump_of_more_than_one_level_is_e0013_with_one_indent() {
+        // a, then a line six columns deeper: one diagnostic on the leading
+        // spaces, one `Indent`, one `Dedent` at the end.
+        let src = "a\n      b\n";
+        let (k, d) = run(src);
+        assert_eq!(k, vec![Ident, Nl, Indent, Ident, Nl, Dedent, Eof]);
+        assert_eq!(d, vec![(codes::DEEP_INDENT, 2, 8)]);
+    }
+
+    #[test]
+    fn e0013_message_is_the_architecture_text() {
+        let (_, diags) = lex("a\n    b\n", FileId::from_raw(0));
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "indentation is more than one level deeper than the line above; \
+              indent a block by two spaces"
+            ]
+        );
+        assert_eq!(codes::DEEP_INDENT.number(), 13);
+    }
+
+    #[test]
+    fn lines_of_a_recovered_block_get_no_further_diagnostic() {
+        // The real column 4 is pushed, so `c` and `d` stay in the block, and the
+        // nested block of `d` at column 6 is one level deeper again.
+        let src = "a\n    b\n    c\n      d\ne\n";
+        let (k, d) = run(src);
+        assert_eq!(
+            k,
+            vec![
+                Ident, Nl, Indent, Ident, Nl, Ident, Nl, Indent, Ident, Nl, Dedent, Dedent, Ident,
+                Nl, Eof,
+            ]
+        );
+        assert_eq!(d, vec![(codes::DEEP_INDENT, 2, 6)]);
+    }
+
+    #[test]
+    fn column_not_on_the_stack_closes_to_the_outer_level() {
+        // Stack [0, 4] after the E0013 recovery; column 2 is not on it. It pops
+        // the block of `b` and belongs to the outer level, without a diagnostic.
+        let src = "a\n    b\n  c\n";
+        let (k, d) = run(src);
+        assert_eq!(
+            k,
+            vec![Ident, Nl, Indent, Ident, Nl, Dedent, Ident, Nl, Eof]
+        );
+        assert_eq!(d, vec![(codes::DEEP_INDENT, 2, 6)]);
+    }
+
+    #[test]
+    fn dedent_pops_one_dedent_per_closed_block() {
+        let src = "a\n  b\n    c\n      d\ne\n";
+        let (k, d) = run(src);
+        assert_eq!(
+            k,
+            vec![
+                Ident, Nl, Indent, Ident, Nl, Indent, Ident, Nl, Indent, Ident, Nl, Dedent, Dedent,
+                Dedent, Ident, Nl, Eof,
+            ]
+        );
+        assert!(d.is_empty(), "{d:?}");
+        // Dedent to a middle level.
+        let (k, _) = run("a\n  b\n    c\n  d\n");
+        assert_eq!(
+            k,
+            vec![
+                Ident, Nl, Indent, Ident, Nl, Indent, Ident, Nl, Dedent, Ident, Nl, Dedent, Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn odd_column_is_only_e0002_even_when_it_jumps() {
+        // Column 5 under column 0: E0002, no E0013; recovery opens one block
+        // with the rounded column 6, so a following line at 6 is in that block.
+        let src = "a\n     b\n      c\n";
+        let (k, d) = run(src);
+        assert_eq!(
+            k,
+            vec![Ident, Nl, Indent, Ident, Nl, Ident, Nl, Dedent, Eof]
+        );
+        assert_eq!(d, vec![(codes::ODD_INDENT, 2, 7)]);
+    }
+
+    #[test]
+    fn odd_column_rounds_up_like_t8() {
+        let (k, d) = run("a\n  b\n    c\n   d\n");
+        assert_eq!(
+            k,
+            vec![
+                Ident, Nl, Indent, Ident, Nl, Indent, Ident, Nl, Ident, Nl, Dedent, Dedent, Eof
+            ]
+        );
+        assert_eq!(d, vec![(codes::ODD_INDENT, 12, 15)]);
+    }
+
+    #[test]
+    fn tab_jump_is_only_e0001() {
+        let (k, d) = run("a\n\t\tb\n");
+        assert_eq!(k, vec![Ident, Nl, Indent, Ident, Nl, Dedent, Eof]);
+        assert_eq!(d, vec![(codes::TAB_INDENT, 2, 3)]);
+    }
+
+    #[test]
+    fn blank_and_comment_lines_do_not_count_for_the_jump() {
+        let src = "a\n\n          // deep\n  b\n";
+        let (k, d) = run(src);
+        assert_eq!(
+            k,
+            vec![
+                Ident,
+                Nl,
+                TokenKind::Comment,
+                Indent,
+                Ident,
+                Nl,
+                Dedent,
+                Eof
+            ]
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn crlf_is_a_line_end_in_layout_and_spans() {
+        let src = "a\r\n  b\r\n    c\n  d\r\n";
+        let (k, d) = run(src);
+        assert_eq!(
+            k,
+            vec![
+                Ident, Nl, Indent, Ident, Nl, Indent, Ident, Nl, Dedent, Ident, Nl, Dedent, Eof
+            ]
+        );
+        assert!(d.is_empty(), "{d:?}");
+        let t = texts(src);
+        assert_eq!(t.get(1).map(String::as_str), Some("\r\n"));
+        assert_eq!(t.get(2).map(String::as_str), Some("  "));
+        assert_eq!(t.get(3).map(String::as_str), Some("b"));
+        // Mixed line ends after a jump: still one E0013 at the leading spaces.
+        let (_, d) = run("a\r\n    b\n");
+        assert_eq!(d, vec![(codes::DEEP_INDENT, 3, 7)]);
+    }
+
+    #[test]
+    fn lone_cr_is_e0008_in_code_and_in_comments() {
+        let (k, d) = run("a\rb\n");
+        assert_eq!(k, vec![Ident, Error, Nl, Eof]);
+        assert_eq!(d, vec![(codes::UNEXPECTED_CHAR, 1, 2)]);
+        // In a comment: reported, the comment goes on to the real line end.
+        let (k, d) = run("// x\ry\nz\n");
+        assert_eq!(k, vec![TokenKind::Comment, Ident, Nl, Eof]);
+        assert_eq!(d, vec![(codes::UNEXPECTED_CHAR, 4, 5)]);
+        // A lone CR does not end a line, so it does not start layout.
+        let (k, _) = run("a\r  b\n");
+        assert!(!k.contains(&Indent), "{k:?}");
+        // CR CR LF: the first CR is lone, the pair is a line end.
+        let (k, d) = run("a\r\r\nb\n");
+        assert_eq!(k, vec![Ident, Error, Nl, Ident, Nl, Eof]);
+        assert_eq!(d, vec![(codes::UNEXPECTED_CHAR, 1, 2)]);
+    }
+
+    #[test]
+    fn lone_cr_message_names_the_code_point() {
+        let (_, diags) = lex("a\r", FileId::from_raw(0));
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(messages, ["unexpected character U+000D"]);
+    }
+
+    #[test]
+    fn bom_only_at_byte_zero_is_skipped() {
+        let (k, d) = run("\u{FEFF}a\n  b\n");
+        assert_eq!(k, vec![Ident, Nl, Indent, Ident, Nl, Dedent, Eof]);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(texts("\u{FEFF}a").first().map(String::as_str), Some("a"));
+        // A second BOM is code.
+        let (_, d) = run("\u{FEFF}\u{FEFF}a\n");
+        assert_eq!(d, vec![(codes::UNEXPECTED_CHAR, 3, 6)]);
+        // A BOM later in code, also at the start of a line.
+        let (_, d) = run("a \u{FEFF}\n");
+        assert_eq!(d, vec![(codes::UNEXPECTED_CHAR, 2, 5)]);
+        let (_, d) = run("a\n\u{FEFF}b\n");
+        assert_eq!(d, vec![(codes::UNEXPECTED_CHAR, 2, 5)]);
+    }
+
+    #[test]
+    fn bom_is_allowed_in_comments_and_strings() {
+        let (_, d) = run("a // \u{FEFF}\nb = \"\u{FEFF}\"\n");
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn last_line_without_line_end_is_valid() {
+        let (k, d) = run("a\n  b");
+        assert_eq!(k, vec![Ident, Nl, Indent, Ident, Nl, Dedent, Eof]);
+        assert!(d.is_empty(), "{d:?}");
+        let (k, _) = run("a\n    b");
+        assert_eq!(k, vec![Ident, Nl, Indent, Ident, Nl, Dedent, Eof]);
+    }
+
+    #[test]
+    fn empty_input_gives_only_eof() {
+        for src in ["", "\u{FEFF}", "\n", "\r\n", "  \n\n", "// c"] {
+            let (k, d) = run(src);
+            let k: Vec<TokenKind> = k.into_iter().filter(|t| *t != TokenKind::Comment).collect();
+            assert_eq!(k, vec![Eof], "{src:?}");
+            assert!(d.is_empty(), "{src:?}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn indents_and_dedents_always_balance() {
+        for src in [
+            "a\n      b\n  c\n    d\n e\n\tf\ng",
+            "a\n    b\n  c\n      d\n",
+            "a\n\t\t\tb\n c\n   d",
+            "\u{FEFF}a\r\n        b\r  c\n",
+        ] {
+            let k = kinds(src);
+            let indents = k.iter().filter(|t| **t == Indent).count();
+            let dedents = k.iter().filter(|t| **t == Dedent).count();
+            assert_eq!(indents, dedents, "{src:?}");
+            assert_eq!(k.last(), Some(&Eof), "{src:?}");
+            let mut depth: i64 = 0;
+            for t in &k {
+                match t {
+                    Indent => depth += 1,
+                    Dedent => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0, "{src:?}");
+            }
+        }
     }
 }

@@ -26,11 +26,12 @@ pub const UNEXPECTED_CHAR: Code = Code::new(8);
 pub const SEMICOLON: Code = Code::new(9);
 /// Integer literal outside the `Int` range (G9).
 pub const INT_OUT_OF_RANGE: Code = Code::new(10);
-/// Raw bidirectional control character (D53).
-///
-/// ASSUMPTION: E0011 is the next free lexer code. It enters the catalog with
-/// its first golden (tests/errors, D53).
+/// Raw bidirectional control character (D53, D68).
 pub const BIDI_CONTROL: Code = Code::new(11);
+/// `}` in string text outside an interpolation (D68).
+pub const LONE_CLOSE_BRACE: Code = Code::new(12);
+/// Indentation more than one level deeper than the line above (D68).
+pub const DEEP_INDENT: Code = Code::new(13);
 
 /// Deepest accepted interpolation brace depth (G1, SPEC 12.1).
 pub const MAX_INTERPOLATION_DEPTH: u32 = 32;
@@ -52,20 +53,48 @@ pub const MSG_SEMICOLON: &str = "`;` is not used in Ostrel; write one statement 
 pub const MSG_INT_OUT_OF_RANGE: &str =
     "integer literal is outside the `Int` range of -9007199254740991 to 9007199254740991";
 
+/// Message of [`LONE_CLOSE_BRACE`] (ARCHITECTURE 3.5).
+pub const MSG_LONE_CLOSE_BRACE: &str = "`}` in a string literal must be written as `\\}`";
+/// Message of [`DEEP_INDENT`] (ARCHITECTURE 3.5).
+pub const MSG_DEEP_INDENT: &str =
+    "indentation is more than one level deeper than the line above; indent a block by two spaces";
+
 /// Message of [`UNEXPECTED_CHAR`] for the character `c`.
+///
+/// A control character such as a lone carriage return is named by its code
+/// point, so the message never carries an invisible character.
 pub fn msg_unexpected_char(c: char) -> String {
-    format!("unexpected character `{c}`")
+    if c.is_control() {
+        format!("unexpected character U+{:04X}", u32::from(c))
+    } else {
+        format!("unexpected character `{c}`")
+    }
 }
 
-/// Message of [`BIDI_CONTROL`] for the character `c`.
+/// Message of [`BIDI_CONTROL`] for the character `c` (ARCHITECTURE 3.5).
 ///
 /// The character is named by its code point, never written raw.
 pub fn msg_bidi_control(c: char) -> String {
+    let value = u32::from(c);
     format!(
-        "bidirectional control character U+{:04X} is not allowed; write it as an escape `\\u{{{:X}}}` inside a string",
-        u32::from(c),
-        u32::from(c)
+        "bidirectional control character U+{value:04X} is not allowed in source; \
+         write `\\u{{{value:X}}}` inside a string if it is needed"
     )
+}
+
+/// Message of [`BAD_ESCAPE`] for an escape that does not exist, as written.
+pub fn msg_unknown_escape(escape: &str) -> String {
+    format!("unknown escape sequence `{escape}`")
+}
+
+/// Message of [`BAD_ESCAPE`] for a malformed `\u{...}` escape, as written.
+pub fn msg_malformed_unicode_escape(escape: &str) -> String {
+    format!("malformed escape `{escape}`; write 1 to 6 hex digits between the braces")
+}
+
+/// Message of [`NOT_SCALAR`] for a `\u{...}` escape, as written.
+pub fn msg_not_scalar(escape: &str) -> String {
+    format!("`{escape}` is not a Unicode scalar value")
 }
 
 /// True for the nine bidirectional control characters of D53:

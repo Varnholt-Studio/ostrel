@@ -47,10 +47,11 @@ pub enum TokenKind {
     /// End of a logical line. Span: the line end (`\n` or `\r\n`), or an
     /// empty span at the end of the input when the last line has no line end.
     Nl,
-    /// The next line is indented one level deeper. Span: the indentation.
+    /// The line opens a block: it is deeper than the line above. Always one
+    /// token, however deep the line is (D68). Span: the indentation.
     Indent,
-    /// Indentation decreased by one level; one token per level. Span: empty, at
-    /// the start of the first token of the line (or at the end of the input).
+    /// One block closed; one token per closed block. Span: empty, at the start
+    /// of the first token of the line (or at the end of the input).
     Dedent,
     /// End of the input. Always the last token. Span: empty, at the end.
     Eof,

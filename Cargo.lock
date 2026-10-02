@@ -189,11 +189,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostrel_db_memory"
+version = "0.0.0"
+dependencies = [
+ "ostrel_db",
+]
+
+[[package]]
 name = "ostrel_ir"
 version = "0.0.0"
 dependencies = [
  "ostrel_core",
  "ostrel_sema",
+ "ostrel_syntax",
 ]
 
 [[package]]

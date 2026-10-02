@@ -299,14 +299,23 @@ fn crlf_is_a_line_end() {
 
 #[test]
 fn dedent_by_several_levels_and_multi_level_indent() {
+    // D68: a dedent may close several blocks at once, but a line more than one
+    // level deeper is E0013 on its leading spaces and opens exactly one block.
     let src = "a\n  b\n    c\nd\n      e\n";
+    let (tokens, diags) = lex(src);
+    let kinds: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
     assert_eq!(
-        kinds(src),
+        kinds,
         vec![
             Ident, Nl, Indent, Ident, Nl, Indent, Ident, Nl, Dedent, Dedent, Ident, Nl, Indent,
-            Indent, Indent, Ident, Nl, Dedent, Dedent, Dedent, Eof,
+            Ident, Nl, Dedent, Eof,
         ]
     );
+    let found: Vec<(Code, u32, u32)> = diags
+        .iter()
+        .map(|d| (d.code, d.span.start, d.span.end))
+        .collect();
+    assert_eq!(found, vec![(codes::DEEP_INDENT, 14, 20)]);
 }
 
 #[test]
@@ -711,15 +720,17 @@ fn hostile_inputs_end_with_eof_and_valid_spans() {
     }
 }
 
+/// Lexing time must grow linearly with the input (AC-04). The check compares
+/// two input sizes instead of using a time limit, so it holds under any
+/// machine load (D74).
 #[test]
 fn large_input_is_linear() {
     let line = "  let x = add(1, 2) + \"v {y} w\" // c\n";
-    let src = format!("fn main()\n{}", line.repeat(200_000));
-    let start = std::time::Instant::now();
-    let (tokens, diags) = lex(&src);
+    let source = |lines: usize| format!("fn main()\n{}", line.repeat(lines));
+    let (tokens, diags) = lex(&source(20_000));
     assert!(diags.is_empty());
-    assert!(tokens.len() > 3_000_000);
-    assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
+    assert!(tokens.len() > 300_000);
+    crate::test_support::assert_linear(4_000, source, |src| lex(src));
 }
 
 macro_rules! golden {

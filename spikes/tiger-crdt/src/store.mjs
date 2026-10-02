@@ -5,12 +5,14 @@ import { compareText } from './text.mjs';
 
 const LWW = ['title', 'status', 'priority', 'assignee', 'rank'];
 
+export class BatchError extends Error {}
+
 // Client replica of the issue model with incremental live queries.
 // Step 2 (merge) is `apply`, step 3 (live query invalidation) is `invalidate`.
 export class Store {
   constructor() {
     this.rows = new Map();
-    this.applied = new Map(); // replica -> highest applied seq (contiguous per replica)
+    this.appliedServerSeq = ''; // ServerSeq high water mark (D62), '' = nothing applied
     this.queries = [];
   }
 
@@ -30,15 +32,18 @@ export class Store {
     return row[field].v;
   }
 
-  // Applies decoded ops in order. Returns the touched rows and the fields that changed.
+  // Applies one decoded batch in order and returns the touched rows and changed fields.
+  // Exactly once delivery is the sync layer's job (D62): ops at or below the ServerSeq
+  // high water mark were applied before and are dropped; the mark advances only when the
+  // whole batch is applied. A batch whose text op names an element that does not exist is
+  // refused as a whole before anything changes (BatchError), so a bad op never leaves a
+  // half applied batch or an advanced mark behind.
   apply(ops) {
+    const fresh = ops.filter((op) => op.ss > this.appliedServerSeq);
+    this.checkReferences(fresh);
     const touched = new Map();
-    for (const op of ops) {
+    for (const op of fresh) {
       const replica = op.id.slice(0, 16);
-      const seq = parseInt(op.id.slice(16), 16);
-      const last = this.applied.get(replica) || 0;
-      if (seq <= last) continue; // idempotent replay
-      this.applied.set(replica, seq);
       const row = this.rows.get(op.row);
       if (!row) continue; // unknown row: not in this replica's scope
       let t = touched.get(op.row);
@@ -72,7 +77,29 @@ export class Store {
       }
       if (changed) t.fields.add(op.f);
     }
+    if (fresh.length) this.appliedServerSeq = fresh[fresh.length - 1].ss;
     return touched;
+  }
+
+  // Every text origin and delete target must exist in the row or be inserted earlier in
+  // the same batch. Runs before any mutation.
+  checkReferences(ops) {
+    const added = new Map(); // row id -> element ids inserted earlier in this batch
+    for (const op of ops) {
+      if (op.k !== 'ins' && op.k !== 'del') continue;
+      const row = this.rows.get(op.row);
+      if (!row) continue;
+      let mine = added.get(op.row);
+      if (!mine) {
+        mine = new Set();
+        added.set(op.row, mine);
+      }
+      const ref = op.k === 'ins' ? op.after : op.at;
+      if (ref !== null && !row.desc.has(ref) && !mine.has(ref)) {
+        throw new BatchError(`${op.id}: unknown element ${ref}`);
+      }
+      if (op.k === 'ins') mine.add(seqId(op.c, op.id.slice(0, 16)));
+    }
   }
 
   query(filterField, filterValue, sortField) {

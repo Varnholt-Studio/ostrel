@@ -1,0 +1,1 @@
+tests/errors/lex_lone_close_brace.ostl:2:10: error[E0012]: `}` in a string literal must be written as `\}`

@@ -1,0 +1,6 @@
+fn log(n: Int)
+  print(n)
+  return n
+
+fn main()
+  log(1)

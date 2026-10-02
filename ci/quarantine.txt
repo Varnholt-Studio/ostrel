@@ -1,0 +1,11 @@
+# Quarantined tests (ci/checks/75_no_skips.sh, team rule 7).
+#
+# A skipped, disabled or focused test needs one entry here, created only after a decision of
+# the QA lead. Format: one entry per line, `PATH NAME TICKET OWNER`:
+#   PATH    file path from the repository root
+#   NAME    Rust function or module, JS test title with spaces replaced by `_`, Python
+#           function or class; `line:N` when the check finds no name (75_no_skips.sh prints
+#           the key of every finding)
+#   TICKET  task id, for example T57
+#   OWNER   team id of the person who removes the quarantine
+# Entries that match no skipped test fail the check, so remove the entry with the skip.

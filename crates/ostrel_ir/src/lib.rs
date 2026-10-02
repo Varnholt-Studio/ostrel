@@ -7,8 +7,8 @@
 //! string interpolation, calls, `print`, `if`/`else` and `return`. Short circuit
 //! `and`/`or` are lowered to branches, so they need no instruction of their own.
 //!
-//! The slice grows by addition only. Lowering from the checked program is added
-//! in its own module.
+//! The slice grows by addition only. [`lower`] builds it from the checked
+//! program.
 
 // This crate processes data derived from untrusted input: no unwrap, expect,
 // panic or unchecked indexing.
@@ -18,6 +18,10 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+
+mod lower;
+
+pub use lower::{LowerError, lower};
 
 /// Source location of an instruction, in byte offsets of one source file.
 ///
