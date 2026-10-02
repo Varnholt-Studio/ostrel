@@ -7,7 +7,8 @@
 #            #[ignore] (`-- --list --ignored`) do not count
 #   JS / TS  test files *.test.* and *.spec.* (node tests and browser job tests): the title
 #            of test(), it(), describe() or suite() starts with `ac_NN_`; .skip and .todo
-#            calls do not count
+#            calls, calls inside // or /* */ comments and titles quoted outside such a
+#            call do not count
 #   Python   test_*.py: a function `test_ac_NN_<topic>` (unittest needs the `test_` prefix)
 #   Shell    ci/checks/*.sh and tests/**/*.sh: a function `ac_NN_<topic>` that is defined and
 #            also called in the same file
@@ -39,12 +40,43 @@ prune_find() {
     -o -type f \( "$@" \) -print0
 }
 
+# JS_TITLES: perl program for js_names. It reads one JS or TS file and prints the `ac_NN_...`
+# titles of test calls. Line and block comments are dropped (a commented out test is a skip,
+# not coverage), and string and template literals are blanked unless they are the first
+# argument of test(), it(), describe() or suite() (optionally `.only`), so a title quoted
+# elsewhere does not count. A call may span lines. Known limit: regular expression literals
+# are not recognised; a quote inside one can hide later titles (the check then fails, it
+# never invents coverage).
+JS_TITLES='
+  local $/; my $s = <>; my $o = ""; my $n = length $s; my $i = 0;
+  my $call = qr/\b(?:test|it|describe|suite)(?:\.only)?\s*\(\s*\z/;
+  while ($i < $n) {
+    my $c = substr($s, $i, 1); my $d = substr($s, $i, 2);
+    if ($d eq "//") { my $e = index($s, "\n", $i); $i = $e < 0 ? $n : $e; next }
+    if ($d eq "/*") { my $e = index($s, "*/", $i + 2); $i = $e < 0 ? $n : $e + 2; $o .= " "; next }
+    if ($c eq "\x27" || $c eq "\"" || $c eq "`") {
+      my $j = $i + 1;
+      while ($j < $n) {
+        my $x = substr($s, $j, 1);
+        if ($x eq "\\") { $j += 2; next }
+        last if $x eq $c;
+        last if $x eq "\n" && $c ne "`";
+        $j++;
+      }
+      my $body = substr($s, $i + 1, $j - $i - 1);
+      $o .= (substr($o, -80) =~ $call) ? $c . $body . $c : $c . $c;
+      $i = $j + 1; next;
+    }
+    $o .= $c; $i++;
+  }
+  while ($o =~ /\b(?:test|it|describe|suite)(?:\.only)?\s*\(\s*[\x27"`](ac_[0-9]{2}_[A-Za-z0-9_]*)/g) { print "$1\n" }
+'
+
 # js_names: `ac_NN_...` titles of running JS and TS tests, one per line.
 js_names() {
   local f
   while IFS= read -r -d '' f; do
-    grep -oE '\b(test|it|describe|suite)(\.only)?[[:space:]]*\([[:space:]]*['"'"'"`]ac_[0-9]{2}_[A-Za-z0-9_]*' "$f" |
-      grep -oE 'ac_[0-9]{2}_[A-Za-z0-9_]*$'
+    perl -e "$JS_TITLES" "$f"
   done < <(prune_find -name '*.test.js' -o -name '*.test.mjs' -o -name '*.test.cjs' \
     -o -name '*.test.ts' -o -name '*.test.mts' -o -name '*.spec.js' -o -name '*.spec.mjs' \
     -o -name '*.spec.ts' -o -name '*.spec.mts')
@@ -227,6 +259,11 @@ coverage_selftest() {
   sel "clean tree passes" 0 true || bad=1
   sel "JS title missing" 1 "sed -i 's/ac_01_js_title/js_title/; s/ac_01_other/other/' runtime/x/a.test.mjs" || bad=1
   sel "JS skipped test does not count" 1 "sed -i 's/test(/test.skip(/; s/^it(/it.todo(/' runtime/x/a.test.mjs" || bad=1
+  sel "JS test in line comment does not count" 1 "printf \"// test('ac_01_js_title', () => {});\n// it(\\\`ac_01_other\\\`, () => {});\n\" >runtime/x/a.test.mjs" || bad=1
+  sel "JS test in block comment does not count" 1 "printf \"/*\ntest('ac_01_js_title', () => {});\n*/ /* it('ac_01_other') */\n\" >runtime/x/a.test.mjs" || bad=1
+  sel "JS title quoted outside a call does not count" 1 "printf \"const t = \\\"test('ac_01_js_title'\\\";\nconst u = 'it(\\\"ac_01_other';\n\" >runtime/x/a.test.mjs" || bad=1
+  sel "JS comment marker inside a string is no comment" 0 "printf \"const u = 'http://x/*';\ntest('ac_01_js_title', () => {}); // */\n\" >runtime/x/a.test.mjs" || bad=1
+  sel "JS call over two lines counts" 0 "printf \"test(\n  'ac_01_js_title',\n  () => {},\n);\n\" >runtime/x/a.test.mjs" || bad=1
   sel "Python test without test_ prefix" 1 "sed -i 's/test_ac_02/ac_02/' tests/a/test_x.py" || bad=1
   sel "shell function never called" 1 "sed -i '\$d' tests/b/c.sh" || bad=1
   sel "shell call only in a comment" 1 "sed -i 's/^ac_03_sh_case ||/# ac_03_sh_case ||/' tests/b/c.sh" || bad=1

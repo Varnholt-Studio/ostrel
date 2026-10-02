@@ -50,10 +50,14 @@ scan_rust() {
       }
       if (++gap > 10) { emit(pending); pending = "" }
     }
-    /^[[:space:]]*#!?\[[[:space:]]*(ignore([[:space:]]*[]=(])|cfg_attr[[:space:]]*\(.*[,(][[:space:]]*ignore([[:space:]]*[]=,)])|cfg[[:space:]]*\([[:space:]]*(any[[:space:]]*\([[:space:]]*\)|not[[:space:]]*\([[:space:]]*all[[:space:]]*\([[:space:]]*\)[[:space:]]*\)|false|FALSE)[[:space:]]*\))/ {
+    /^[[:space:]]*(#\[[^]]*\][[:space:]]*)*#!?\[[[:space:]]*(ignore([[:space:]]*[]=(])|cfg_attr[[:space:]]*\(.*[,(][[:space:]]*ignore([[:space:]]*[]=,)])|cfg[[:space:]]*\([[:space:]]*(any[[:space:]]*\([[:space:]]*\)|not[[:space:]]*\([[:space:]]*all[[:space:]]*\([[:space:]]*\)[[:space:]]*\)|false|FALSE)[[:space:]]*\))/ {
       if (pending != "") emit(pending)
       pending = "line:" NR; gap = 0
       if ($0 ~ /^[[:space:]]*#!\[/) { emit("line:" NR); pending = "" }
+      # Attribute and item on one line, as in `#[test] #[ignore] fn name() {}`.
+      else if (match($0, /\][[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/)) {
+        s = substr($0, RSTART, RLENGTH); sub(/^.*fn[[:space:]]+/, "", s); emit(s); pending = ""
+      }
     }
     END { if (pending != "") emit(pending) }
   ' "$1"
@@ -182,6 +186,7 @@ no_skips_selftest() {
   }
   sel "clean tree passes" 0 true || bad=1
   sel "rust ignore without entry" 1 "printf '#[test]\n#[ignore]\nfn other() {}\n' >>crates/a/src/lib.rs" || bad=1
+  sel "rust ignore on one line" 1 "printf '#[test] #[ignore] fn other() {}\n' >>crates/a/src/lib.rs" || bad=1
   sel "rust cfg_attr ignore" 1 "printf '#[cfg_attr(unix, ignore)]\n#[test]\nfn other() {}\n' >>crates/a/src/lib.rs" || bad=1
   sel "rust cfg any()" 1 "printf '#[cfg(any())]\nmod disabled {}\n' >>crates/a/src/lib.rs" || bad=1
   sel "rust cfg not all()" 1 "printf '#[cfg(not(all()))]\n#[test]\nfn other() {}\n' >>crates/a/src/lib.rs" || bad=1
