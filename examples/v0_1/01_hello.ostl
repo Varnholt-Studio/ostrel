@@ -1,0 +1,4 @@
+// Smallest script program: fn main and a single print of a Text literal.
+
+fn main()
+  print("Hello, world!")

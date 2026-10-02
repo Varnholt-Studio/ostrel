@@ -1,0 +1,53 @@
+app Chat
+  auth paseto open
+
+data Room
+  name: Text
+  members: Set[User] = {me}
+  check name.len in 1..40
+  see if signed
+  make if members == {me}
+  edit members if added == {me} or removed == {me}
+
+data Message
+  room: Room
+  text: Text
+  check text.len in 1..2000
+  see if me in room.members
+  make if me in room.members
+
+var current: Room?
+
+view Main
+  split
+    col
+      for r in Room sort name
+        button r.name selected: r == current on click current = r
+      entry hint: "New room" submit: "Create"
+        on submit current = make Room { name: it }
+      text sync.state look: muted
+    col
+      if let r = current
+        row
+          text r.name look: title
+          if me in r.members
+            button "Leave" on click r.members.remove(me)
+          else
+            button "Join" on click r.members.add(me)
+        col scroll: end
+          for m in Message where room == r sort made last 200
+            row ~mine(m.author == me)
+              text m.author.handle look: strong
+              text m.text
+              text m.made.clock look: muted
+        if me in r.members
+          entry hint: "Message" submit: "Send"
+            on submit make Message { room: r, text: it }
+      else
+        text "Pick or create a room" look: muted
+
+style
+  .mine {
+    align-self: flex-end;
+    background: $accentSoft;
+  }

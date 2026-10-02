@@ -1,0 +1,21 @@
+// FizzBuzz from 1 to 15 without loops: nested if/else and a recursive function without a result.
+
+fn say(i: Int)
+  if i % 15 == 0
+    print("FizzBuzz")
+  else
+    if i % 3 == 0
+      print("Fizz")
+    else
+      if i % 5 == 0
+        print("Buzz")
+      else
+        print(i)
+
+fn fizzBuzz(i: Int, upTo: Int)
+  if i <= upTo
+    say(i)
+    fizzBuzz(i + 1, upTo)
+
+fn main()
+  fizzBuzz(1, 15)

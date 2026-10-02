@@ -1,0 +1,14 @@
+# Build settings shared by every checkout of this repository.
+#
+# The target directory and the number of build jobs are intentionally not set
+# here. Each environment provides them through CARGO_TARGET_DIR and
+# CARGO_BUILD_JOBS, so that several checkouts can share one build cache.
+# Profiles live in the root Cargo.toml.
+
+[resolver]
+# Never pick a dependency version that needs a newer compiler than the pinned
+# toolchain in rust-toolchain.toml.
+incompatible-rust-versions = "fallback"
+
+[alias]
+lint = "clippy --workspace --all-targets --locked -- -D warnings"

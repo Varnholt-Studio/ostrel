@@ -1,0 +1,12 @@
+// let bindings of Int and Text, and string interpolation of names, expressions and other Text values.
+
+fn main()
+  let name = "Ada"
+  let born = 1815
+  let died = 1852
+  print("{name} lived {died - born} years.")
+  let greeting = "Hello, {name}"
+  print("{greeting}!")
+  print(born)
+  let total = born + died
+  print("sum: {total}")

@@ -1,0 +1,14 @@
+// Division truncates toward zero; the remainder takes the sign of the dividend (SYNTAX 4.11, AC-52).
+
+fn main()
+  print(7 / 2)
+  print(-7 / 2)
+  print(7 / -2)
+  print(-7 / -2)
+  print(7 % 3)
+  print(-7 % 3)
+  print(7 % -3)
+  print(-7 % -3)
+  print(0 / 5)
+  print(6 / 3)
+  print((-7 / 2) * 2 + (-7 % 2))

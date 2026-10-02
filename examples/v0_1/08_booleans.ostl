@@ -1,0 +1,26 @@
+// Bool literals and printing, not/and/or precedence, Int comparisons, == and != on Bool,
+// and a function with a Bool result.
+
+fn isLeap(y: Int) -> Bool
+  y % 4 == 0 and y % 100 != 0 or y % 400 == 0
+
+fn main()
+  print(true)
+  print(false)
+  print(not true)
+  print(true and false)
+  print(true or false)
+  print(3 < 5)
+  print(5 <= 5)
+  print(7 > 9)
+  print(4 >= 5)
+  print(1 == 1)
+  print(1 != 1)
+  print(1 < 2 and 3 > 4 or true)
+  print(not 1 == 2)
+  print(true == false)
+  print(false != true)
+  print(isLeap(1900))
+  print(isLeap(2000))
+  print(isLeap(2024))
+  print(isLeap(2023))
