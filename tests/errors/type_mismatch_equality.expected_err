@@ -1,0 +1,1 @@
+tests/errors/type_mismatch_equality.ostl:3:11: error[E0304]: expected `Int`, found `Text`

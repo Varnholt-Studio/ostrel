@@ -1,7 +1,7 @@
 // Fixed width lowercase hex ids (ARCHITECTURE 5.3). String order equals value order.
 const HEX = /^[0-9a-f]+$/;
 
-export const WIDTH = { replica: 16, opId: 24, rowId: 32, hlc: 32, seqId: 24 };
+export const WIDTH = { replica: 16, opId: 24, rowId: 32, hlc: 32, seqId: 24, serverSeq: 16 };
 
 export function isHex(s, width) {
   return typeof s === 'string' && s.length === width && HEX.test(s);

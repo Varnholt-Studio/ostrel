@@ -30,6 +30,24 @@ export class Seq {
     this.plain = null;
   }
 
+  // True if element `id` exists (visible or deleted). Answers for an unexpanded snapshot
+  // without expanding it: its elements are counters 1..n of the seed replica.
+  has(id) {
+    if (this.ids) return this.ids.has(id);
+    if (id.slice(8) !== this.seed) return false;
+    const c = seqCounter(id);
+    return c >= 1 && c <= this.snapshotLength();
+  }
+
+  snapshotLength() {
+    if (this.plainLength === undefined) {
+      let n = 0;
+      for (const _ of this.plain) n++;
+      this.plainLength = n;
+    }
+    return this.plainLength;
+  }
+
   indexOf(id) {
     const elems = this.elems;
     for (let i = 0; i < elems.length; i++) if (elems[i].id === id) return i;

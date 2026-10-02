@@ -1,5 +1,5 @@
-import { seqId } from './ids.mjs';
 import { handleMessage } from './pipeline.mjs';
+import { RgaReference } from './rga.mjs';
 import { STATUSES } from './schema.mjs';
 import { summary } from './stats.mjs';
 import { Store } from './store.mjs';
@@ -28,20 +28,30 @@ export const DEFAULTS = {
 const MIX = ['scalar', 'scalar', 'text', 'text', 'reorder']; // 40 / 40 / 20
 
 // Expected state computed independently of the receiving replica: scalar and rank by
-// the HLC rule, text by replaying the two editors' ops in the opposite delivery order on
-// a copy.
-function oracle(kind, first, second, row) {
+// the HLC rule, text by a separate tree model (rga.mjs) built from the snapshot text and
+// every text op the row received, with the two editors' ops in the opposite delivery order.
+function oracle(kind, first, second, base, history) {
   if (kind !== 'text') {
     const x = first[0];
     const y = second[0];
     return x.hlc > y.hlc ? x.v : y.v;
   }
-  const copy = row.desc.clone();
-  for (const op of [...second, ...first]) {
-    if (op.k === 'ins') copy.insert(op.after, seqId(op.c, op.id.slice(0, 16)), op.s);
-    else copy.remove(op.at);
+  const ref = new RgaReference(base, SEED_REPLICA);
+  ref.applyOps(history);
+  ref.applyOps([...second, ...first]);
+  return ref.text();
+}
+
+function record(log, ops) {
+  for (const op of ops) {
+    if (op.f !== 'desc') continue;
+    let list = log.get(op.row);
+    if (!list) {
+      list = [];
+      log.set(op.row, list);
+    }
+    list.push(op);
   }
-  return copy.text();
 }
 
 function sortedAround(query, row) {
@@ -59,7 +69,10 @@ export async function runSpike(env, options = {}) {
   const r = rng(o.seed);
   const tSetup = env.now();
   const store = new Store();
-  store.load(makeDataset(o.seed, o.count), SEED_HLC, SEED_REPLICA);
+  const dataset = makeDataset(o.seed, o.count);
+  store.load(dataset, SEED_HLC, SEED_REPLICA);
+  const baseText = new Map(dataset.map((it) => [it.id, it.desc]));
+  const textLog = new Map(); // row id -> text ops delivered so far, for the oracle
   const board = new Board(env.doc, env.root, store, STATUSES, o.windowSize);
   const setupMs = env.now() - tSetup;
   const rows = [...store.rows.values()];
@@ -75,7 +88,9 @@ export async function runSpike(env, options = {}) {
     for (let b = 0; b < o.background; b++) {
       wall += 5;
       const ed = editors[r.int(3)];
-      handleMessage(message(backgroundEdit(r, ed, wall, store, rows, queries)), store, board, env.now);
+      const ops = backgroundEdit(r, ed, wall, store, rows, queries);
+      record(textLog, ops);
+      handleMessage(message(ops), store, board, env.now);
     }
 
     // Pick a target inside a column's viewport and show it in the detail panel.
@@ -89,7 +104,9 @@ export async function runSpike(env, options = {}) {
     wall += 5;
     const p = probe(kind, r, editors[0], editors[1], wall, row, col.query);
     const [first, second] = r.int(2) ? [p.a, p.b] : [p.b, p.a];
-    const expected = oracle(kind, first, second, row);
+    const history = textLog.get(row.id) || [];
+    const expected = oracle(kind, first, second, baseText.get(row.id), history);
+    record(textLog, [...first, ...second]);
     const text = message([...first, ...second]);
     if (o.pauseMs) await env.sleep(o.pauseMs);
 

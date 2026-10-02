@@ -85,8 +85,17 @@ export class Editor {
   }
 }
 
+// Stand in for the server op log: every op the relay forwards for the first time gets the
+// next log position `ss` (ServerSeq). An op that already carries one keeps it, which is how
+// tests model a reconnect overlap redelivering an op (D62).
+let serverSeq = 0;
+
+export function relay(ops) {
+  return ops.map((op) => (op.ss === undefined ? { ...op, ss: hex(++serverSeq, 16) } : op));
+}
+
 export function message(ops) {
-  return JSON.stringify({ v: 0, t: 'Ops', ops });
+  return JSON.stringify({ v: 0, t: 'Ops', ops: relay(ops) });
 }
 
 // Text edit against the current state of `row.desc`: delete `del` visible chars at `pos`,
