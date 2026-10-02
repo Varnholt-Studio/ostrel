@@ -66,6 +66,7 @@ use crate::ast::{
 };
 use crate::lex::{Keyword, Token, TokenKind};
 use ostrel_core::{Code, Diagnostic, FileId, Span};
+use std::borrow::Cow;
 
 /// Deepest allowed nesting of brackets and blocks (ARCHITECTURE 3.4). A
 /// function body is level 1.
@@ -166,7 +167,7 @@ pub struct Parser<'a> {
     src: &'a str,
     file: FileId,
     exprs: &'a dyn ExprParse,
-    toks: Vec<Token>,
+    toks: Tokens<'a>,
     /// Logical line of every token, as an index into `unclosed`.
     line_of: Vec<u32>,
     /// Per logical line: token index of the outermost `(` not closed on it.
@@ -190,16 +191,12 @@ impl<'a> Parser<'a> {
     fn new(
         src: &'a str,
         file: FileId,
-        tokens: &[Token],
+        tokens: &'a [Token],
         lexed: &[Diagnostic],
         limits: ParseLimits,
         exprs: &'a dyn ExprParse,
     ) -> Parser<'a> {
-        let mut toks: Vec<Token> = tokens.iter().copied().filter(|t| !t.is_trivia()).collect();
-        if toks.last().map(|t| t.kind) != Some(TokenKind::Eof) {
-            let end = u32::try_from(src.len()).unwrap_or(u32::MAX);
-            toks.push(Token::new(TokenKind::Eof, Span::point(file, end)));
-        }
+        let toks = Tokens::new(src, file, tokens);
         let lines = scan_lines(src, &toks, lexed);
         Parser {
             src,
@@ -341,11 +338,10 @@ impl<'a> Parser<'a> {
     fn nth_token(&self, n: usize) -> Token {
         self.step();
         let eof = Token::new(TokenKind::Eof, Span::point(self.file, 0));
-        let last = self.toks.last().copied().unwrap_or(eof);
+        let last = self.toks.last().unwrap_or(eof);
         self.pos
             .checked_add(n)
             .and_then(|i| self.toks.get(i))
-            .copied()
             .unwrap_or(last)
     }
 
@@ -401,11 +397,7 @@ impl<'a> Parser<'a> {
     fn check_unclosed(&mut self) -> Result<(), Stop> {
         match self.unclosed_on_line(self.pos) {
             Some(index) if index as usize >= self.pos => {
-                let at = self
-                    .toks
-                    .get(index as usize)
-                    .copied()
-                    .unwrap_or(self.current());
+                let at = self.toks.get(index as usize).unwrap_or(self.current());
                 Err(self.report(codes::UNCLOSED_PAREN, at, codes::MSG_UNCLOSED_PAREN))
             }
             _ => Ok(()),
@@ -921,7 +913,7 @@ impl<'a> Parser<'a> {
     /// written as two adjacent tokens by the lexer.
     fn check_assign_operator(&mut self) -> Result<(), Stop> {
         let mut i = self.pos;
-        while let (Some(a), Some(b)) = (self.toks.get(i).copied(), self.toks.get(i + 1).copied()) {
+        while let (Some(a), Some(b)) = (self.toks.get(i), self.toks.get(i + 1)) {
             self.step();
             if matches!(a.kind, TokenKind::Nl | TokenKind::Eof) {
                 break;
@@ -968,6 +960,68 @@ fn starts_expr(kw: Keyword) -> bool {
     )
 }
 
+/// The tokens the parser reads: every token except trivia, ending with `EOF`.
+///
+/// The token stream of the lexer is borrowed, never copied, because a hostile
+/// file can have millions of tokens (AC-04, memory limit of
+/// `tests/hostile/README`). If it has trivia, only the indexes of the other
+/// tokens are kept, a quarter of the size of a copy. Only a stream without a
+/// final `EOF`, which the lexer never produces, is copied to append one.
+struct Tokens<'a> {
+    all: Cow<'a, [Token]>,
+    /// Indexes into `all` of the tokens that are not trivia, or `None` if
+    /// `all` has no trivia.
+    kept: Option<Vec<u32>>,
+}
+
+impl<'a> Tokens<'a> {
+    fn new(src: &str, file: FileId, tokens: &'a [Token]) -> Tokens<'a> {
+        let has_eof = tokens
+            .iter()
+            .rev()
+            .find(|t| !t.is_trivia())
+            .is_some_and(|t| t.kind == TokenKind::Eof);
+        let all = if has_eof {
+            Cow::Borrowed(tokens)
+        } else {
+            let end = u32::try_from(src.len()).unwrap_or(u32::MAX);
+            let mut owned = tokens.to_vec();
+            owned.push(Token::new(TokenKind::Eof, Span::point(file, end)));
+            Cow::Owned(owned)
+        };
+        let kept = all.iter().any(|t| t.is_trivia()).then(|| {
+            all.iter()
+                .enumerate()
+                .filter(|(_, t)| !t.is_trivia())
+                .filter_map(|(i, _)| u32::try_from(i).ok())
+                .collect()
+        });
+        Tokens { all, kept }
+    }
+
+    fn len(&self) -> usize {
+        self.kept.as_ref().map_or(self.all.len(), Vec::len)
+    }
+
+    fn get(&self, index: usize) -> Option<Token> {
+        match &self.kept {
+            None => self.all.get(index).copied(),
+            Some(kept) => kept
+                .get(index)
+                .and_then(|&i| self.all.get(i as usize))
+                .copied(),
+        }
+    }
+
+    fn last(&self) -> Option<Token> {
+        self.len().checked_sub(1).and_then(|i| self.get(i))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Token> + '_ {
+        (0..self.len()).filter_map(|i| self.get(i))
+    }
+}
+
 /// The range `start..end`, or `end..start` if the two are swapped.
 pub fn text_range(start: u32, end: u32) -> TextRange {
     TextRange::empty(start).cover(TextRange::empty(end))
@@ -993,7 +1047,7 @@ fn in_ranges(ranges: &[(u32, u32)], at: u32) -> bool {
 /// comment lines before it are not part of it. The last line also holds the
 /// offset at the very end of the source. A line is faulty if a diagnostic in
 /// `lexed` starts in its range.
-fn scan_lines(src: &str, toks: &[Token], lexed: &[Diagnostic]) -> Lines {
+fn scan_lines(src: &str, toks: &Tokens<'_>, lexed: &[Diagnostic]) -> Lines {
     let mut lines = Lines {
         line_of: Vec::with_capacity(toks.len()),
         ..Lines::default()
