@@ -1,0 +1,1 @@
+tests/errors/lex_bidi_in_string.ostl:2:12: error[E0011]: bidirectional control character U+2066 is not allowed in source; write `\u{2066}` inside a string if it is needed
