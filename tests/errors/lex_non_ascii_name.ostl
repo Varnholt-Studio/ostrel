@@ -1,3 +1,3 @@
 fn main()
-  let xs = [1, 2]
+  let grüße = 1
   print(1)

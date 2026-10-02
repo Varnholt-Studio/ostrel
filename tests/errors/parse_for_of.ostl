@@ -1,4 +1,0 @@
-fn main()
-  let xs = 1
-  for x of xs
-    print(x)
