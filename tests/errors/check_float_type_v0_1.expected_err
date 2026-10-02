@@ -1,0 +1,1 @@
+tests/errors/check_float_type_v0_1.ostl:1:14: error[E0100]: type `Float` is not available in v0.1

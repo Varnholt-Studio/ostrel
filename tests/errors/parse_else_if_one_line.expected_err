@@ -1,0 +1,1 @@
+tests/errors/parse_else_if_one_line.ostl:5:8: error[E0024]: `else` ends its line; put the `if` on the next line and indent it

@@ -1,0 +1,1 @@
+tests/errors/parse_compound_assign.ostl:3:5: error[E0020]: Ostrel assigns with `=`; compound assignment does not exist

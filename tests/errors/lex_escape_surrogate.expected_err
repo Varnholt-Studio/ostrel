@@ -1,0 +1,1 @@
+tests/errors/lex_escape_surrogate.ostl:2:12: error[E0005]: `\u{D800}` is not a Unicode scalar value

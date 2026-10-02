@@ -1,0 +1,2 @@
+fn main()
+  print("\u{10FFFF}\u{10ffff}\u{1F600}")

@@ -1,0 +1,8 @@
+fn ping(n: Int) -> Int
+  return pong(n + 1)
+
+fn pong(n: Int) -> Int
+  return ping(n + 1)
+
+fn main()
+  print(ping(0))

@@ -1,0 +1,1 @@
+tests/errors/type_text_plus.ostl:2:13: error[E0300]: `+` does not join text; join text with interpolation

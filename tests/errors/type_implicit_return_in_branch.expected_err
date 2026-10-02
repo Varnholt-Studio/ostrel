@@ -1,0 +1,1 @@
+tests/errors/type_implicit_return_in_branch.ostl:5:5: error[E0303]: add `return`; a function body with branches returns only through `return`

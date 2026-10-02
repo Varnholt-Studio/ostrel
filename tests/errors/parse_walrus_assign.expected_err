@@ -1,0 +1,1 @@
+tests/errors/parse_walrus_assign.ostl:2:5: error[E0020]: Ostrel assigns with `=`; `:=` does not exist, declare a new name with `let`

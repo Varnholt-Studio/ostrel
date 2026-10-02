@@ -1,0 +1,1 @@
+tests/errors/name_unknown_type.ostl:1:13: error[E0203]: unknown type `Integer`; v0.1 has `Int`, `Text` and `Bool`
