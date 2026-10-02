@@ -250,8 +250,9 @@ impl Param {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Item {
-    /// `fn name(params) -> Type` with a body.
-    Fn(FnDecl),
+    /// `fn name(params) -> Type` with a body. Boxed so that an item stays
+    /// within the node size budget of ARCHITECTURE 3.4.
+    Fn(Box<FnDecl>),
 }
 
 /// A function declaration: `fn name(a: Int, b: Int) -> Int` and its body.
@@ -272,9 +273,11 @@ pub struct FnDecl {
 /// An indented sequence of statements.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Block {
-    /// Statements in source order; may be empty in trees built by hand.
+    /// Statements in source order; may be empty (SYNTAX 7 allows a block
+    /// without statements, and trees built by hand may have one too).
     pub stmts: Box<[StmtId]>,
-    /// From the first to the last statement.
+    /// From the first to the last statement; for an empty block an empty
+    /// range at the position where the block would start.
     pub range: TextRange,
     height: u32,
 }
@@ -466,6 +469,15 @@ pub struct Module {
     limits: Limits,
 }
 
+/// Children marked as attached while a node is being added, so the marks
+/// can be cleared if the node is rejected.
+#[derive(Default)]
+struct Attached {
+    exprs: Vec<u32>,
+    stmts: Vec<u32>,
+    blocks: Vec<u32>,
+}
+
 impl Default for Module {
     fn default() -> Self {
         Module::new()
@@ -479,7 +491,9 @@ impl Module {
     }
 
     /// An empty module with the given limits. The empty module already counts
-    /// its root: one node, height 1.
+    /// its root: one node, height 1. A `max_nodes` of 0 or a `max_height`
+    /// below 2 is accepted but leaves no room for any further node, so every
+    /// `add_*` call fails.
     pub fn with_limits(limits: Limits) -> Module {
         Module {
             items: Vec::new(),
@@ -571,189 +585,218 @@ impl Module {
         u32::try_from(len).map_err(|_| AstError::NodeLimit)
     }
 
-    fn child_expr_height(&self, id: ExprId, seen: &mut Vec<u32>) -> Result<u32, AstError> {
-        let attached = self
+    // Attaching children. Each child is marked as attached as soon as it is
+    // checked, so a repeated child is found in O(1) and adding a node is
+    // linear in its number of children. If the node is rejected later, the
+    // marks recorded in `Attached` are cleared again.
+
+    fn attach_expr(&mut self, id: ExprId, att: &mut Attached) -> Result<u32, AstError> {
+        let height = self.expr_height(id).ok_or(AstError::UnknownId)?;
+        let flag = self
             .expr_attached
-            .get(id.index())
-            .copied()
+            .get_mut(id.index())
             .ok_or(AstError::UnknownId)?;
-        if attached || seen.contains(&id.0) {
+        if *flag {
             return Err(AstError::AlreadyAttached);
         }
-        seen.push(id.0);
-        self.expr_height(id).ok_or(AstError::UnknownId)
+        *flag = true;
+        att.exprs.push(id.0);
+        Ok(height)
     }
 
-    fn child_stmt_height(&self, id: StmtId, seen: &mut Vec<u32>) -> Result<u32, AstError> {
-        let attached = self
+    fn attach_stmt(&mut self, id: StmtId, att: &mut Attached) -> Result<u32, AstError> {
+        let height = self.stmt_height(id).ok_or(AstError::UnknownId)?;
+        let flag = self
             .stmt_attached
-            .get(id.index())
-            .copied()
+            .get_mut(id.index())
             .ok_or(AstError::UnknownId)?;
-        if attached || seen.contains(&id.0) {
+        if *flag {
             return Err(AstError::AlreadyAttached);
         }
-        seen.push(id.0);
-        self.stmt_height(id).ok_or(AstError::UnknownId)
+        *flag = true;
+        att.stmts.push(id.0);
+        Ok(height)
     }
 
-    fn child_block_height(&self, id: BlockId, seen: &mut Vec<u32>) -> Result<u32, AstError> {
-        let attached = self
+    fn attach_block(&mut self, id: BlockId, att: &mut Attached) -> Result<u32, AstError> {
+        let height = self.block_height(id).ok_or(AstError::UnknownId)?;
+        let flag = self
             .block_attached
-            .get(id.index())
-            .copied()
+            .get_mut(id.index())
             .ok_or(AstError::UnknownId)?;
-        if attached || seen.contains(&id.0) {
+        if *flag {
             return Err(AstError::AlreadyAttached);
         }
-        seen.push(id.0);
-        self.block_height(id).ok_or(AstError::UnknownId)
+        *flag = true;
+        att.blocks.push(id.0);
+        Ok(height)
     }
 
-    fn mark(flags: &mut [bool], ids: &[u32]) {
-        for id in ids {
-            if let Some(flag) = flags.get_mut(*id as usize) {
-                *flag = true;
+    /// Clears the marks of a rejected node, so its children stay free.
+    fn detach(&mut self, att: &Attached) {
+        let tables = [
+            (&mut self.expr_attached, &att.exprs),
+            (&mut self.stmt_attached, &att.stmts),
+            (&mut self.block_attached, &att.blocks),
+        ];
+        for (flags, ids) in tables {
+            for id in ids {
+                if let Some(flag) = flags.get_mut(*id as usize) {
+                    *flag = false;
+                }
             }
         }
+    }
+
+    /// Runs `add` and clears the attach marks it set if it fails.
+    fn transact<T>(
+        &mut self,
+        add: impl FnOnce(&mut Module, &mut Attached) -> Result<T, AstError>,
+    ) -> Result<T, AstError> {
+        let mut att = Attached::default();
+        let result = add(self, &mut att);
+        if result.is_err() {
+            self.detach(&att);
+        }
+        result
     }
 
     /// Adds an expression and returns its id. All child ids must come from
-    /// this module and must not have a parent yet.
+    /// this module and must not have a parent yet. On error the module is
+    /// unchanged.
     pub fn add_expr(&mut self, kind: ExprKind, range: TextRange) -> Result<ExprId, AstError> {
-        let mut seen = Vec::new();
-        let child_height = match &kind {
-            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Name(_) => 0,
-            ExprKind::Str(parts) => {
-                let mut max = 0;
-                for part in parts.iter() {
-                    if let StrPart::Interp(id) = part {
-                        max = max.max(self.child_expr_height(*id, &mut seen)?);
+        self.transact(|m, att| {
+            let child_height = match &kind {
+                ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Name(_) => 0,
+                ExprKind::Str(parts) => {
+                    let mut max = 0;
+                    for part in parts.iter() {
+                        if let StrPart::Interp(id) = part {
+                            max = max.max(m.attach_expr(*id, att)?);
+                        }
                     }
+                    max
                 }
-                max
-            }
-            ExprKind::Unary { operand, .. } => self.child_expr_height(*operand, &mut seen)?,
-            ExprKind::Binary { lhs, rhs, .. } => {
-                let l = self.child_expr_height(*lhs, &mut seen)?;
-                let r = self.child_expr_height(*rhs, &mut seen)?;
-                l.max(r)
-            }
-            ExprKind::Call { callee, args } => {
-                let mut max = self.child_expr_height(*callee, &mut seen)?;
-                for arg in args.iter() {
-                    max = max.max(self.child_expr_height(*arg, &mut seen)?);
+                ExprKind::Unary { operand, .. } => m.attach_expr(*operand, att)?,
+                ExprKind::Binary { lhs, rhs, .. } => {
+                    let l = m.attach_expr(*lhs, att)?;
+                    let r = m.attach_expr(*rhs, att)?;
+                    l.max(r)
                 }
-                max
-            }
-            ExprKind::Paren(inner) => self.child_expr_height(*inner, &mut seen)?,
-        };
-        let height = child_height.checked_add(1).ok_or(AstError::HeightLimit)?;
-        self.check_height(height)?;
-        let nodes = self.reserve_nodes(1)?;
-        let id = Self::next_id(self.exprs.len())?;
-        Self::mark(&mut self.expr_attached, &seen);
-        self.exprs.push(Expr {
-            kind,
-            range,
-            height,
-        });
-        self.expr_attached.push(false);
-        self.nodes = nodes;
-        self.height = self.height.max(height + 1);
-        Ok(ExprId(id))
+                ExprKind::Call { callee, args } => {
+                    let mut max = m.attach_expr(*callee, att)?;
+                    for arg in args.iter() {
+                        max = max.max(m.attach_expr(*arg, att)?);
+                    }
+                    max
+                }
+                ExprKind::Paren(inner) => m.attach_expr(*inner, att)?,
+            };
+            let height = child_height.checked_add(1).ok_or(AstError::HeightLimit)?;
+            m.check_height(height)?;
+            let nodes = m.reserve_nodes(1)?;
+            let id = Self::next_id(m.exprs.len())?;
+            m.exprs.push(Expr {
+                kind,
+                range,
+                height,
+            });
+            m.expr_attached.push(false);
+            m.nodes = nodes;
+            m.height = m.height.max(height + 1);
+            Ok(ExprId(id))
+        })
     }
 
     /// Adds a statement and returns its id. All child ids must come from
-    /// this module and must not have a parent yet.
+    /// this module and must not have a parent yet. On error the module is
+    /// unchanged.
     pub fn add_stmt(&mut self, kind: StmtKind, range: TextRange) -> Result<StmtId, AstError> {
-        let mut expr_seen = Vec::new();
-        let mut block_seen = Vec::new();
-        let child_height = match &kind {
-            StmtKind::Let { value, .. } => self.child_expr_height(*value, &mut expr_seen)?,
-            StmtKind::Return { value } => self.child_expr_height(*value, &mut expr_seen)?,
-            StmtKind::Expr(value) => self.child_expr_height(*value, &mut expr_seen)?,
-            StmtKind::If {
-                cond,
-                then_block,
-                else_block,
-            } => {
-                let mut max = self.child_expr_height(*cond, &mut expr_seen)?;
-                max = max.max(self.child_block_height(*then_block, &mut block_seen)?);
-                if let Some(else_block) = else_block {
-                    max = max.max(self.child_block_height(*else_block, &mut block_seen)?);
+        self.transact(|m, att| {
+            let child_height = match &kind {
+                StmtKind::Let { value, .. } => m.attach_expr(*value, att)?,
+                StmtKind::Return { value } => m.attach_expr(*value, att)?,
+                StmtKind::Expr(value) => m.attach_expr(*value, att)?,
+                StmtKind::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    let mut max = m.attach_expr(*cond, att)?;
+                    max = max.max(m.attach_block(*then_block, att)?);
+                    if let Some(else_block) = else_block {
+                        max = max.max(m.attach_block(*else_block, att)?);
+                    }
+                    max
                 }
-                max
-            }
-        };
-        let height = child_height.checked_add(1).ok_or(AstError::HeightLimit)?;
-        self.check_height(height)?;
-        let nodes = self.reserve_nodes(1)?;
-        let id = Self::next_id(self.stmts.len())?;
-        Self::mark(&mut self.expr_attached, &expr_seen);
-        Self::mark(&mut self.block_attached, &block_seen);
-        self.stmts.push(Stmt {
-            kind,
-            range,
-            height,
-        });
-        self.stmt_attached.push(false);
-        self.nodes = nodes;
-        self.height = self.height.max(height + 1);
-        Ok(StmtId(id))
+            };
+            let height = child_height.checked_add(1).ok_or(AstError::HeightLimit)?;
+            m.check_height(height)?;
+            let nodes = m.reserve_nodes(1)?;
+            let id = Self::next_id(m.stmts.len())?;
+            m.stmts.push(Stmt {
+                kind,
+                range,
+                height,
+            });
+            m.stmt_attached.push(false);
+            m.nodes = nodes;
+            m.height = m.height.max(height + 1);
+            Ok(StmtId(id))
+        })
     }
 
     /// Adds a block of statements and returns its id. An empty block has
-    /// height 1.
+    /// height 1. On error the module is unchanged.
     pub fn add_block(&mut self, stmts: Vec<StmtId>, range: TextRange) -> Result<BlockId, AstError> {
-        let mut seen = Vec::with_capacity(stmts.len());
-        let mut max = 0;
-        for stmt in &stmts {
-            max = max.max(self.child_stmt_height(*stmt, &mut seen)?);
-        }
-        let height = max.checked_add(1).ok_or(AstError::HeightLimit)?;
-        self.check_height(height)?;
-        let nodes = self.reserve_nodes(1)?;
-        let id = Self::next_id(self.blocks.len())?;
-        Self::mark(&mut self.stmt_attached, &seen);
-        self.blocks.push(Block {
-            stmts: stmts.into_boxed_slice(),
-            range,
-            height,
-        });
-        self.block_attached.push(false);
-        self.nodes = nodes;
-        self.height = self.height.max(height + 1);
-        Ok(BlockId(id))
+        self.transact(|m, att| {
+            let mut max = 0;
+            for stmt in &stmts {
+                max = max.max(m.attach_stmt(*stmt, att)?);
+            }
+            let height = max.checked_add(1).ok_or(AstError::HeightLimit)?;
+            m.check_height(height)?;
+            let nodes = m.reserve_nodes(1)?;
+            let id = Self::next_id(m.blocks.len())?;
+            m.blocks.push(Block {
+                stmts: stmts.into_boxed_slice(),
+                range,
+                height,
+            });
+            m.block_attached.push(false);
+            m.nodes = nodes;
+            m.height = m.height.max(height + 1);
+            Ok(BlockId(id))
+        })
     }
 
     /// Appends a function declaration as the next top level item. Counts one
     /// node for the item, two per parameter (the parameter and its type) and
-    /// one for the result type.
+    /// one for the result type. On error the module is unchanged.
     pub fn add_fn(&mut self, decl: FnDecl) -> Result<(), AstError> {
-        let mut seen = Vec::new();
-        let body = self.child_block_height(decl.body, &mut seen)?;
-        // A parameter has its type below it, so it is two levels high.
-        let params_height = if decl.params.is_empty() { 0 } else { 2 };
-        let result_height = u32::from(decl.result.is_some());
-        let height = body
-            .max(params_height)
-            .max(result_height)
-            .checked_add(1)
-            .ok_or(AstError::HeightLimit)?;
-        self.check_height(height)?;
-        let extra = decl
-            .params
-            .len()
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(1 + usize::from(decl.result.is_some())))
-            .ok_or(AstError::NodeLimit)?;
-        let nodes = self.reserve_nodes(extra)?;
-        Self::mark(&mut self.block_attached, &seen);
-        self.items.push(Item::Fn(decl));
-        self.nodes = nodes;
-        self.height = self.height.max(height + 1);
-        Ok(())
+        self.transact(|m, att| {
+            let body = m.attach_block(decl.body, att)?;
+            // A parameter has its type below it, so it is two levels high.
+            let params_height = if decl.params.is_empty() { 0 } else { 2 };
+            let result_height = u32::from(decl.result.is_some());
+            let height = body
+                .max(params_height)
+                .max(result_height)
+                .checked_add(1)
+                .ok_or(AstError::HeightLimit)?;
+            m.check_height(height)?;
+            let extra = decl
+                .params
+                .len()
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(1 + usize::from(decl.result.is_some())))
+                .ok_or(AstError::NodeLimit)?;
+            let nodes = m.reserve_nodes(extra)?;
+            m.items.push(Item::Fn(Box::new(decl)));
+            m.nodes = nodes;
+            m.height = m.height.max(height + 1);
+            Ok(())
+        })
     }
 
     // Constructors for tests and tools. Every node gets an empty range at
@@ -892,7 +935,9 @@ mod tests {
         assert!(std::mem::size_of::<Expr>() <= 64);
         assert!(std::mem::size_of::<Stmt>() <= 64);
         assert!(std::mem::size_of::<Block>() <= 64);
-        assert!(std::mem::size_of::<Item>() <= 128);
+        assert!(std::mem::size_of::<Item>() <= 64);
+        assert!(std::mem::size_of::<Param>() <= 64);
+        assert!(std::mem::size_of::<TypeRef>() <= 64);
     }
 
     #[test]
@@ -1131,6 +1176,73 @@ mod tests {
         );
         let s = m.string(vec![StrPart::Text("a".into()), StrPart::Interp(x)])?;
         assert_eq!(m.expr_height(s), Some(2));
+        Ok(())
+    }
+
+    /// Wide nodes must be linear in their number of children (AC-04). With
+    /// the old quadratic check 200 000 children took several seconds.
+    #[test]
+    fn wide_call_and_block_are_linear() -> R {
+        const WIDE: usize = 200_000;
+        let start = std::time::Instant::now();
+        let mut m = Module::new();
+        let args = (0..WIDE).map(|_| m.int(1)).collect::<Result<Vec<_>, _>>()?;
+        let call = m.call("f", args)?;
+        let stmts = (0..WIDE)
+            .map(|i| {
+                let e = m.int(i as i64)?;
+                m.expr_stmt(e)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let last = m.expr_stmt(call)?;
+        let mut all = stmts;
+        all.push(last);
+        let body = m.block_of(all)?;
+        m.fn_item("main", &[], None, body)?;
+        assert_eq!(
+            m.node_count(),
+            1 + 2 * WIDE as u32 + 2 + WIDE as u32 + 1 + 1 + 1
+        );
+        // Generous bound for unoptimised builds on a loaded machine.
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_wide_node_releases_all_children() -> R {
+        let mut m = Module::new();
+        let args = (0..1_000)
+            .map(|_| m.int(1))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut dup = args.clone();
+        dup.extend(args.first().copied());
+        assert_eq!(m.call("f", dup), Err(AstError::AlreadyAttached));
+        // Every argument is free again and can be used once.
+        m.call("f", args)?;
+
+        // A rejection after all children were marked also rolls back.
+        let mut small = Module::with_limits(Limits {
+            max_nodes: 3,
+            max_height: MAX_HEIGHT,
+        });
+        let a = small.int(1)?;
+        let b = small.int(2)?;
+        assert_eq!(small.binary(BinaryOp::Add, a, b), Err(AstError::NodeLimit));
+        let s = small.add_stmt(StmtKind::Expr(a), TextRange::default());
+        assert_eq!(s, Err(AstError::NodeLimit));
+        let mut wide = Module::with_limits(Limits {
+            max_nodes: MAX_NODES,
+            max_height: 3,
+        });
+        let x = wide.int(1)?;
+        let neg = wide.unary(UnaryOp::Neg, x)?;
+        assert_eq!(wide.expr_stmt(neg), Err(AstError::HeightLimit));
+        // `neg` was released by the rejected statement.
+        assert_eq!(wide.paren(neg), Err(AstError::HeightLimit));
+        assert_eq!(
+            wide.add_block(vec![], TextRange::default()).map(|_| ()),
+            Ok(())
+        );
         Ok(())
     }
 
