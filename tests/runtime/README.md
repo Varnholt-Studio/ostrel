@@ -14,7 +14,7 @@ to this directory says otherwise. `examples/v0_1/` holds only programs that exit
 
 ## Contract checked by the golden runner (`ci/checks/55_golden.sh`, suite `ac_52_runtime_goldens`)
 
-1. `ostrel run [ARGS] tests/runtime/NAME.ostl` exits with code 1 (never 0, 2, 101 or a signal).
+1. `ostrel run [ARGS] tests/runtime/NAME.ostl` exits with code 1 (never 0, 2, 70, 101 or a signal).
 2. stdout equals `NAME.expected` and stderr equals `NAME.expected_err`, byte for byte.
 3. Line format: `PATH:LINE:COLUMN: runtime error[KIND]: MESSAGE`, `PATH` exactly as given on
    the command line, `LINE` and `COLUMN` 1 based and counted in Unicode scalar values (SPEC 12.1).
@@ -49,19 +49,19 @@ to this directory says otherwise. `examples/v0_1/` holds only programs that exit
 | TextLimit | `` `Text` value would be longer than 16777216 bytes `` |
 | HeapLimit | `VM heap would grow beyond 268435456 bytes` (no golden, see rule 4) |
 
-## Assumptions (open question in `#spec`, Refs #16)
+## Binding rules (D83, ARCHITECTURE v1.8 3.4)
 
-The language documents fix the kind names and the line format, but not the message texts and
-not every position. Until the spec owner answers, these cases rely on:
+The message texts and positions above are fixed by D83 (answer to #821, Refs #16):
 
-* ASSUMPTION 1: one fixed message per kind, the texts above. `StepLimit` names no number, so the
-  text does not change with `--max-steps`.
-* ASSUMPTION 2: `IntOverflow`, `DivisionByZero` and `TextLimit` are reported at the start of the
-  expression whose evaluation fails: for a binary operator the start of its left operand, for an
-  interpolated string its opening quote. `CallDepth` is reported at the start of the call
-  expression (SPEC 12.4).
-* ASSUMPTION 3: `StepLimit` is reported at the start of the call expression in `fn main` that is
-  running when the limit is reached (at the failing instruction only when it is in `main`
-  itself). SPEC 12.4 forbids goldens that depend on the exact boundary, and the position of the
-  failing instruction inside a recursive function does depend on it, so a byte exact stderr
-  golden needs a position that does not.
+* One fixed message per kind, the texts above, owned by `ostrel_vm` as
+  `RuntimeErrorKind::message()`. The CLI only renders the line. No text depends on a flag, so
+  `--max-steps` does not change stderr.
+* `IntOverflow` and `DivisionByZero` are reported at the start of the expression whose operation
+  fails: for a binary operator the start of its left operand. `TextLimit` is reported at the
+  start of the expression that would produce the text, for an interpolated string its opening
+  quote. `CallDepth` is reported at the start of the call expression that would create frame
+  10 001 (SPEC 12.4).
+* `StepLimit` is reported at the start of the call expression in `fn main` that is running when
+  the limit is reached (at the failing instruction only when `main` itself is the running
+  frame). This position does not depend on the exact boundary, as SPEC 12.4 requires.
+* Exit code 70 (internal error) is a defect like 101 and never accepted here (D84).
