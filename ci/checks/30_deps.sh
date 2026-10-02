@@ -23,18 +23,20 @@
 #      GATE_BASE defaults to origin/dev when that ref exists. Needs the git history, so it
 #      runs only in a git checkout (branch gates); the server gate checks an export without
 #      .git and prints that the rule was not checked there.
-#   6. No package.json outside bench/ declares dependencies (11.1). bench/package.json, if
-#      present, has a committed bench/package-lock.json with integrity hashes and only
-#      direct dependencies from the bench list of ARCHITECTURE section 11.
+#   6. No package.json outside bench/ declares dependencies (11.1). Every package.json
+#      anywhere under bench/ (D75) has a committed package-lock.json next to it with
+#      integrity hashes and only direct dependencies from the bench list of ARCHITECTURE
+#      section 11 (D70).
 #
 # Rules 1 to 4 and 6 do not need git: in a checkout without .git (the server gate runs on a
 # git archive export) the files are found with find(1) instead of git ls-files.
 # Uses bash, awk, sed, grep, find, sort and git only; no network.
 set -uo pipefail
 
-# Bench only npm packages (ARCHITECTURE section 11, architect decision for MEASUREMENT 4.5).
+# Bench only npm packages (ARCHITECTURE section 11, architect decision for MEASUREMENT 4.5, D70).
 BENCH_NPM="playwright @playwright/test typescript prettier express prisma @prisma/client yjs
-y-websocket @automerge/automerge react react-dom vite"
+y-websocket @automerge/automerge react react-dom vite ws y-protocols lib0 @types/node
+@types/express @types/ws"
 
 CRATES_IO_SOURCES="registry+https://github.com/rust-lang/crates.io-index sparse+https://index.crates.io/"
 
@@ -253,43 +255,47 @@ check_repo() {
   # Rule 5: commit messages of commits that add crates to the allowlist (D64).
   check_policy_commits "$dir" || bad=1
 
-  # Rule 6: npm.
-  local pj flat
+  # Rule 6: npm (D51, D75). Every package.json under bench/ is a bench package; any other
+  # package.json must not declare dependencies.
+  local pj flat pdir block pkg
   while IFS= read -r pj; do
     flat=$(tr -d ' \t\r\n' < "$dir/$pj")
     case "$pj" in
-      bench/package.json) ;;
+      bench/*) ;;
       *)
         if echo "$flat" | grep -qE '"(dependencies|devDependencies|peerDependencies|optionalDependencies)":\{[^}]' \
           || echo "$flat" | grep -qE '"bundled?Dependencies":\[[^]]'; then
           problem "$pj declares npm dependencies; npm packages are allowed only under bench/"
         fi
+        continue
         ;;
     esac
-  done < <(repo_files "$dir" package.json)
-
-  if [ -f "$dir/bench/package.json" ]; then
-    local block="$dir/bench/package-lock.json"
-    if [ ! -f "$block" ]; then
-      problem "bench/package.json without a committed bench/package-lock.json"
+    # A bench package: committed lockfile next to it, integrity for every resolved package,
+    # direct dependencies only from the bench list of ARCHITECTURE section 11.
+    pdir=$(dirname "$pj")
+    block="$pdir/package-lock.json"
+    if [ ! -f "$dir/$block" ]; then
+      problem "$pj without a committed $block"
     else
-      grep -qE '"lockfileVersion": *[23]' "$block" || problem "bench/package-lock.json: lockfileVersion 2 or 3 required"
+      grep -qE '"lockfileVersion": *[23]' "$dir/$block" || problem "$block: lockfileVersion 2 or 3 required"
       local resolved integrity
-      resolved=$(grep -cE '"resolved": *"' "$block")
-      integrity=$(grep -cE '"integrity": *"' "$block")
-      [ "$resolved" -eq "$integrity" ] || problem "bench/package-lock.json: $resolved resolved packages but $integrity integrity hashes"
+      resolved=$(grep -cE '"resolved": *"' "$dir/$block")
+      integrity=$(grep -cE '"integrity": *"' "$dir/$block")
+      [ "$resolved" -eq "$integrity" ] || problem "$block: $resolved resolved packages but $integrity integrity hashes"
     fi
-    local pkg
+    if echo "$flat" | grep -qE '"(peerDependencies|bundled?Dependencies)":[[{][^]}]'; then
+      problem "$pj: peer and bundled dependencies are not allowed in bench packages"
+    fi
     while IFS= read -r pkg; do
       [ -z "$pkg" ] && continue
       case " $(echo $BENCH_NPM) " in
         *" $pkg "*) ;;
-        *) problem "bench/package.json: $pkg is not in the bench list of ARCHITECTURE section 11" ;;
+        *) problem "$pj: $pkg is not in the bench list of ARCHITECTURE section 11" ;;
       esac
-    done < <(tr -d ' \t\r\n' < "$dir/bench/package.json" \
+    done < <(echo "$flat" \
       | grep -oE '"(dependencies|devDependencies|optionalDependencies)":\{[^}]*\}' \
       | sed -E 's/^"[A-Za-z]+":\{//; s/\}$//' | tr ',' '\n' | sed -nE 's/^"([^"]+)":.*/\1/p')
-  fi
+  done < <(repo_files "$dir" package.json)
 
   return $bad
 }

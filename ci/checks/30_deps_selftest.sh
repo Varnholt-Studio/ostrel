@@ -187,6 +187,45 @@ printf '{ "lockfileVersion": 3, "packages": { "node_modules/yjs": { "resolved": 
 git -C "$d" add -A
 expect bench_ok 0 "" "$d"
 
+# D75: package.json and lockfiles anywhere under bench/.
+d=$(case_dir bench_nested_ok)
+mkdir -p "$d/bench/ref/server"
+printf '{ "dependencies": { "express": "5.2.1", "ws": "8.0.0" }, "devDependencies": { "@types/ws": "8.0.0" } }\n' \
+  > "$d/bench/ref/server/package.json"
+printf '{ "lockfileVersion": 3, "packages": { "node_modules/express": { "resolved": "x", "integrity": "y" } } }\n' \
+  > "$d/bench/ref/server/package-lock.json"
+git -C "$d" add -A
+expect bench_nested_ok 0 "" "$d"
+
+d=$(case_dir bench_nested_without_lock)
+mkdir -p "$d/bench/ref/server"
+printf '{ "dependencies": { "express": "5.2.1" } }\n' > "$d/bench/ref/server/package.json"
+printf '{ "lockfileVersion": 3, "packages": {} }\n' > "$d/bench/package-lock.json"
+git -C "$d" add -A
+expect bench_nested_without_lock 1 "bench/ref/server/package.json without a committed bench/ref/server/package-lock.json" "$d"
+
+d=$(case_dir bench_nested_unlisted)
+mkdir -p "$d/bench/ref/server"
+printf '{ "dependencies": { "express": "5.2.1", "lodash": "4.0.0" } }\n' > "$d/bench/ref/server/package.json"
+printf '{ "lockfileVersion": 3, "packages": {} }\n' > "$d/bench/ref/server/package-lock.json"
+git -C "$d" add -A
+expect bench_nested_unlisted 1 "bench/ref/server/package.json: lodash is not in the bench list" "$d"
+
+d=$(case_dir bench_nested_no_integrity)
+mkdir -p "$d/bench/ref"
+printf '{ "devDependencies": { "yjs": "13.6.0" } }\n' > "$d/bench/ref/package.json"
+printf '{ "lockfileVersion": 3, "packages": { "node_modules/yjs": { "resolved": "x" } } }\n' \
+  > "$d/bench/ref/package-lock.json"
+git -C "$d" add -A
+expect bench_nested_no_integrity 1 "bench/ref/package-lock.json: 1 resolved packages but 0 integrity hashes" "$d"
+
+d=$(case_dir bench_peer)
+mkdir -p "$d/bench/ref"
+printf '{ "peerDependencies": { "yjs": "13.6.0" } }\n' > "$d/bench/ref/package.json"
+printf '{ "lockfileVersion": 3, "packages": {} }\n' > "$d/bench/ref/package-lock.json"
+git -C "$d" add -A
+expect bench_peer 1 "peer and bundled dependencies are not allowed" "$d"
+
 # A new workspace member needs no snapshot change (D58).
 d=$(case_dir new_member)
 mkdir -p "$d/crates/two"; printf '[package]\nname = "two"\nversion = "0.1.0"\n' > "$d/crates/two/Cargo.toml"
