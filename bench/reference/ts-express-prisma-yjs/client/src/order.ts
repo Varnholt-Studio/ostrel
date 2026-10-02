@@ -1,7 +1,7 @@
-// Display order of chat messages. Same rule as the Ostrel runtime (ARCHITECTURE 5.2):
-// acknowledged messages are ordered by (made, id), where `made` is the server clamped
-// creation time, so every client shows the same sequence regardless of local clocks.
-// Messages not yet acknowledged follow at the end in the order they were sent locally.
+// Display order of chat messages, as the REF-A server contract prescribes
+// (`../server/README.md`, Protocol): by `ts`, then by `id`. REF-A has no server clamp, so
+// `ts` is the author's client time as accepted by the server. Messages still waiting in the
+// outbox are ordered by the same rule, so a message keeps its place once it is delivered.
 
 import type { Message } from "./message.ts";
 
@@ -20,27 +20,21 @@ export function compareCodePoints(a: string, b: string): number {
 }
 
 export function compareMessages(a: Message, b: Message): number {
-  const aAck = a.made !== undefined;
-  const bAck = b.made !== undefined;
-  if (aAck !== bAck) return aAck ? -1 : 1;
-  if (aAck && bAck && a.made !== b.made) return (a.made as number) < (b.made as number) ? -1 : 1;
+  if (a.ts !== b.ts) return a.ts < b.ts ? -1 : 1;
   return compareCodePoints(a.id, b.id);
 }
 
-// Returns the acknowledged messages sorted, then the pending ones in local send order.
-// Duplicate ids keep the acknowledged copy.
-export function orderMessages(acked: Iterable<Message>, pending: readonly Message[]): Message[] {
-  const byId = new Map<string, Message>();
-  for (const m of acked) {
-    if (m.made !== undefined) byId.set(m.id, m);
-  }
-  const sorted = [...byId.values()].sort(compareMessages);
-  const seen = new Set(byId.keys());
-  for (const m of pending) {
-    if (!seen.has(m.id)) {
-      seen.add(m.id);
-      sorted.push(m);
-    }
-  }
-  return sorted;
+export interface Shown {
+  message: Message;
+  // True while the message is only in the local outbox.
+  pending: boolean;
+}
+
+// Merges the messages of the room document with the pending outbox entries of that room.
+// A duplicate id keeps the copy from the room document.
+export function orderMessages(room: Iterable<Message>, pending: Iterable<Message>): Shown[] {
+  const byId = new Map<string, Shown>();
+  for (const m of room) if (!byId.has(m.id)) byId.set(m.id, { message: m, pending: false });
+  for (const m of pending) if (!byId.has(m.id)) byId.set(m.id, { message: m, pending: true });
+  return [...byId.values()].sort((a, b) => compareMessages(a.message, b.message));
 }
