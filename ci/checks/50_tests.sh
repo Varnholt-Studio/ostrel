@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs every test suite found in the repository, offline and without package installs.
-#   Rust:       cargo test --workspace --locked --no-fail-fast (when Cargo.toml exists)
+#   Rust:       cargo test --workspace --locked --no-fail-fast (when Cargo.toml exists);
+#               with GATE_SCOPE=quick only the crates changed on the branch
 #   JavaScript: node --test on *.test.js and *.test.mjs (built in runner, no npm)
 #   Python:     unittest (or pytest when available) on test_*.py
 #   Go:         go test ./... (when go.mod exists)
@@ -34,9 +35,44 @@ list() {
   mapfile -d '' out < <(repo_find "$@" | not_data | sort -z)
 }
 
+# quick_crates: with GATE_SCOPE=quick, prints "-p NAME" for every workspace crate whose
+# files changed between GATE_BASE (default: merge base with origin/dev) and the working
+# tree, "all" when a workspace wide file changed or no base is known, and nothing when no
+# crate changed (MEASUREMENT 5.2: tests of the crates touched on the branch).
+quick_crates() {
+  local base="${GATE_BASE:-}" f crate
+  if [ -z "$base" ]; then
+    base=$(git merge-base HEAD origin/dev 2>/dev/null) || { echo all; return; }
+  fi
+  local -A seen=()
+  while IFS= read -r f; do
+    case "$f" in
+      Cargo.toml|Cargo.lock|rust-toolchain.toml|.cargo/*) echo all; return ;;
+      crates/*/*)
+        crate=${f#crates/}; crate=${crate%%/*}
+        if [ -z "${seen[$crate]:-}" ] && [ -f "crates/$crate/Cargo.toml" ]; then
+          seen[$crate]=1
+          echo "-p"
+          awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^name *=/{gsub(/[" ]/,"");sub(/name=/,"");print;exit}' \
+            "crates/$crate/Cargo.toml"
+        fi
+        ;;
+    esac
+  done < <({ git diff --name-only "$base" --; git ls-files --others --exclude-standard; } | sort -u)
+}
+
 # Rust
 list rs_code -name '*.rs'
-if [ -f Cargo.toml ]; then
+if [ -f Cargo.toml ] && [ "${GATE_SCOPE:-full}" = quick ]; then
+  mapfile -t picks < <(quick_crates)
+  if [ "${picks[0]:-}" = all ]; then
+    run cargo test --workspace --locked --no-fail-fast
+  elif [ ${#picks[@]} -gt 0 ]; then
+    run cargo test --locked --no-fail-fast "${picks[@]}"
+  else
+    echo "   (GATE_SCOPE=quick: no crate changed, Rust tests skipped)"
+  fi
+elif [ -f Cargo.toml ]; then
   run cargo test --workspace --locked --no-fail-fast
 elif [ ${#rs_code[@]} -gt 0 ]; then
   echo "Rust code without a Cargo workspace: ${rs_code[0]}"
