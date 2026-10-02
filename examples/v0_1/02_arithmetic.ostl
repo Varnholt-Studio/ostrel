@@ -1,0 +1,12 @@
+// Int arithmetic: precedence of * / % over + -, left associativity, parentheses, unary minus.
+
+fn main()
+  print(2 + 3 * 4)
+  print((2 + 3) * 4)
+  print(10 - 4 - 3)
+  print(100 / 10 / 5)
+  print(17 % 5)
+  print(2 * 3 + 4 * 5)
+  print(1 + 2 * 3 - 4 / 2 % 3)
+  print(-5 + 2)
+  print(-(2 + 3))

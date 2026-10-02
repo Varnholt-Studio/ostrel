@@ -1,0 +1,12 @@
+// The Int range is plus and minus (2^53 minus 1) (G9); values at the boundary are valid and
+// arithmetic that ends exactly on the boundary does not overflow.
+
+fn main()
+  let max = 9007199254740991
+  print(max)
+  print(-max)
+  print(9007199254740990 + 1)
+  print(-9007199254740990 - 1)
+  print(max / 2)
+  print(max % 10)
+  print(max - max)

@@ -1,0 +1,24 @@
+// Functions: implicit result of a body without branches, explicit return, a function without
+// a result type called as an expression statement, nested calls and a call inside interpolation.
+
+fn square(n: Int) -> Int
+  n * n
+
+fn add(a: Int, b: Int) -> Int
+  return a + b
+
+fn greet(who: Text)
+  print("Hello, {who}!")
+
+fn power(base: Int, exp: Int) -> Int
+  if exp == 0
+    return 1
+  return base * power(base, exp - 1)
+
+fn main()
+  print(square(12))
+  print(add(square(3), square(4)))
+  greet("Grace")
+  print(power(2, 10))
+  print(power(3, 13))
+  print("{square(5)} is five squared")

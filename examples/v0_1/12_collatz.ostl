@@ -1,0 +1,13 @@
+// Number of Collatz steps until 1, with two branches that return before the final return.
+
+fn steps(n: Int) -> Int
+  if n == 1
+    return 0
+  if n % 2 == 0
+    return 1 + steps(n / 2)
+  return 1 + steps(3 * n + 1)
+
+fn main()
+  print(steps(1))
+  print(steps(6))
+  print(steps(27))
