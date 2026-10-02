@@ -31,6 +31,7 @@
 //! line end, so the statements on both sides still parse.
 
 pub mod codes;
+mod literal;
 mod token;
 
 #[cfg(test)]
@@ -89,6 +90,14 @@ pub trait LiteralScan {
         file: FileId,
         diags: &mut Vec<Diagnostic>,
     ) -> (usize, TextStop);
+}
+
+/// Lexes `src` with the literal scanner of this crate.
+///
+/// The token stream always ends with exactly one [`TokenKind::Eof`] token, and
+/// every `Indent` has a matching `Dedent` before it.
+pub fn lex(src: &str, file: FileId) -> (Vec<Token>, Vec<Diagnostic>) {
+    lex_with(src, file, &literal::Literals)
 }
 
 /// Lexes `src` with the given literal scanner.

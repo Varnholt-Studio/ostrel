@@ -1,240 +1,81 @@
-//! Scanning of integer literals (G9) and string literals with interpolation (G1).
+//! The literal scanner: contents of integer literals (G9) and of string text (G1).
 //!
-//! The lexer calls [`scan_int`] when it sees an ASCII digit and [`scan_string`] when it
-//! sees a `"`. Both functions read only the literal itself, never recurse and never
-//! allocate more than the literal needs, so hostile input is handled in linear time.
+//! [`Literals`] implements [`LiteralScan`], the seam to the lexer driver in `mod.rs`. The
+//! driver owns the structure of a string literal: its quotes, the interpolations and the
+//! brace count inside them. This module reads only one piece of string text at a time,
+//! from just after a `"` or a closing `}` up to the next `"`, the next unescaped `{` or the
+//! line end, and checks what is written there (escapes, raw characters).
 //!
-//! A string literal is returned as a list of [`StringPart`]s. Text parts carry the decoded
-//! characters. An interpolation part carries only the span between its braces: the lexer
-//! tokenizes that range like any other code, so there is no lexer mode stack (G1). An
-//! interpolation that contains an error is not returned as a part, which keeps the lexer
-//! from reporting follow up errors for the same fault.
+//! Every function reads each byte at most a constant number of times and never looks
+//! back, so a scan is linear in the length of what it consumes. That keeps the whole
+//! lexer linear on hostile input (AC-04, AC-36).
 //!
-//! Rules: `docs/grammar.md` sections 2.5 and 2.6, SPEC 12.1 and 12.4, ARCHITECTURE 3.1
-//! (D53) and 3.2 (G1, G9). Codes and messages: `tests/errors/README.md`.
+//! Rules: `docs/grammar.md` sections 2.5 and 2.6, SPEC 12.1 and 12.4, ARCHITECTURE 3.2
+//! (G1, G9) and 3.5 (D53, D68). Codes and messages come from [`codes`] only.
 
-// This module reads untrusted input: no unwrap, expect, panic or unchecked indexing.
-#![deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
+use ostrel_core::value::INT_MAX;
 use ostrel_core::{Code, Diagnostic, FileId, Span};
 
-/// Largest value of `Int`: 2^53 minus 1 (G9, D24). The smallest value is its negation.
-pub const INT_MAX: i64 = 9_007_199_254_740_991;
-
-/// Deepest accepted brace nesting inside one interpolation (G1, SPEC 12.1). The brace that
-/// opens the interpolation is depth 1.
-pub const MAX_INTERPOLATION_DEPTH: u32 = 32;
+use super::{LiteralScan, TextStop, codes};
 
 /// Number of hex digits shown in a malformed `\u{...}` escape before it is shortened.
 const MAX_SHOWN_HEX_DIGITS: usize = 8;
 
-/// The result of [`scan_int`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IntLiteral {
-    /// The digits of the literal.
-    pub span: Span,
-    /// The value, or `E0010` when the literal is outside the `Int` range.
-    pub value: Result<i64, LiteralError>,
-}
+/// Most characters after the hex digits of a broken `\u{...}` that still count as part
+/// of the escape when a `}` follows (see [`TextScanner::stray_escape_tail`]).
+const MAX_STRAY_TAIL_CHARS: usize = 8;
 
-/// The result of [`scan_string`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StringLiteral {
-    /// The whole literal including both quotes. For an unterminated literal it ends
-    /// before the line end (or at the end of the file), so the lexer continues there.
-    pub span: Span,
-    /// Text and interpolations in source order. Adjacent text is merged into one part.
-    pub parts: Vec<StringPart>,
-    /// Every fault found in the literal, in source order. Empty for a valid literal.
-    pub errors: Vec<LiteralError>,
-}
+/// The literal scanner used by [`super::lex`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Literals;
 
-/// One piece of a string literal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StringPart {
-    /// Literal text with escapes already decoded.
-    Text {
-        /// The decoded characters.
-        value: String,
-        /// The source of this text, escapes included.
-        span: Span,
-    },
-    /// An interpolation `{expr}` without errors.
-    Interpolation {
-        /// The source between the opening and the closing brace, braces excluded. The
-        /// lexer tokenizes this range as an expression.
-        inner: Span,
-    },
-}
-
-/// A fault in a literal, with the position the diagnostic points to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LiteralError {
-    /// What is wrong.
-    pub kind: LiteralErrorKind,
-    /// The offending character, escape or token. Diagnostics use its start.
-    pub span: Span,
-}
-
-/// The kinds of literal faults. Each has one code of `tests/errors/README.md`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LiteralErrorKind {
-    /// `E0003`: the line or the file ends before the closing quote. The span is the
-    /// opening quote.
-    UnterminatedString,
-    /// `E0004`: a backslash followed by a character that starts no escape, for example
-    /// `\q`, `\r` or `\0`. Holds the escape as written.
-    UnknownEscape(String),
-    /// `E0004`: `\u` without `{`, without hex digits, with more than 6 digits or without
-    /// the closing `}`. Holds the escape as written, shortened when very long.
-    MalformedUnicodeEscape(String),
-    /// `E0005`: a well formed `\u{...}` whose value is a surrogate or above 10FFFF.
-    /// Holds the escape as written.
-    NotUnicodeScalar(String),
-    /// `E0006`: a `"` inside an interpolation. The span is that quote.
-    StringInInterpolation,
-    /// `E0007`: the brace that would reach depth 33 inside an interpolation.
-    InterpolationTooDeep,
-    /// `E0010`: an integer literal above [`INT_MAX`].
-    IntOutOfRange,
-    /// A raw bidirectional control character (D53). The span is the character.
-    BidiControl(char),
-    /// A `}` in the text of a string literal outside any interpolation.
-    UnescapedCloseBrace,
-}
-
-impl LiteralErrorKind {
-    /// The diagnostic code.
-    ///
-    /// ASSUMPTION: `E0011` for bidirectional control characters (D53) and `E0012` for a
-    /// lone `}` are the next free lexer codes. They enter `tests/errors/README.md` with
-    /// their first golden, which may still renumber them.
-    pub fn code(&self) -> Code {
-        let number = match self {
-            LiteralErrorKind::UnterminatedString => 3,
-            LiteralErrorKind::UnknownEscape(_) | LiteralErrorKind::MalformedUnicodeEscape(_) => 4,
-            LiteralErrorKind::NotUnicodeScalar(_) => 5,
-            LiteralErrorKind::StringInInterpolation => 6,
-            LiteralErrorKind::InterpolationTooDeep => 7,
-            LiteralErrorKind::IntOutOfRange => 10,
-            LiteralErrorKind::BidiControl(_) => 11,
-            LiteralErrorKind::UnescapedCloseBrace => 12,
-        };
-        Code::new(number)
-    }
-
-    /// The one line message, exactly as in `tests/errors/README.md`.
-    pub fn message(&self) -> String {
-        match self {
-            LiteralErrorKind::UnterminatedString => "unterminated string literal".to_string(),
-            LiteralErrorKind::UnknownEscape(escape) => {
-                format!("unknown escape sequence `{escape}`")
+impl LiteralScan for Literals {
+    /// The literal is the longest run of ASCII digits; leading zeros are allowed. A value
+    /// above [`INT_MAX`] is `E0010`, spanning the digits. A negative number is the unary
+    /// `-` applied to a literal, so the range is symmetric. Any number of digits is read
+    /// without overflow.
+    fn int(&self, src: &str, start: usize, file: FileId, diags: &mut Vec<Diagnostic>) -> usize {
+        let rest = src.get(start..).unwrap_or("");
+        let mut value: i64 = 0;
+        let mut too_large = false;
+        let mut len = 0;
+        for byte in rest.bytes().take_while(u8::is_ascii_digit) {
+            len += 1;
+            if too_large {
+                continue;
             }
-            LiteralErrorKind::MalformedUnicodeEscape(escape) => {
-                format!("malformed escape `{escape}`; write 1 to 6 hex digits between the braces")
-            }
-            LiteralErrorKind::NotUnicodeScalar(escape) => {
-                format!("`{escape}` is not a Unicode scalar value")
-            }
-            LiteralErrorKind::StringInInterpolation => {
-                "string literal inside interpolation; bind it with `let` first".to_string()
-            }
-            LiteralErrorKind::InterpolationTooDeep => {
-                format!("interpolation nests braces deeper than {MAX_INTERPOLATION_DEPTH}")
-            }
-            LiteralErrorKind::IntOutOfRange => {
-                format!("integer literal is outside the `Int` range of -{INT_MAX} to {INT_MAX}")
-            }
-            LiteralErrorKind::BidiControl(ch) => {
-                let value = u32::from(*ch);
-                format!(
-                    "bidirectional control character U+{value:04X} is not allowed; \
-                     write it as `\\u{{{value:X}}}` if it is needed"
-                )
-            }
-            LiteralErrorKind::UnescapedCloseBrace => {
-                "`}` in a string literal must be written as `\\}`".to_string()
+            let digit = i64::from(byte - b'0');
+            match value.checked_mul(10).and_then(|v| v.checked_add(digit)) {
+                Some(next) if next <= INT_MAX => value = next,
+                _ => too_large = true,
             }
         }
-    }
-}
-
-impl LiteralError {
-    /// Converts the fault into an error diagnostic.
-    pub fn to_diagnostic(&self) -> Diagnostic {
-        Diagnostic::error(self.kind.code(), self.span, self.kind.message())
-    }
-}
-
-/// Whether `ch` is one of the nine bidirectional control characters that D53 rejects
-/// anywhere in raw source: U+202A to U+202E and U+2066 to U+2069.
-pub fn is_bidi_control(ch: char) -> bool {
-    matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-}
-
-/// Reads the integer literal that starts at byte `start` of `src`.
-///
-/// The literal is the longest run of ASCII digits. Leading zeros are allowed. A value
-/// above [`INT_MAX`] is `E0010` at the first digit; a negative number is the unary `-`
-/// applied to a literal, so the range check is symmetric. Any number of digits is read
-/// without overflow.
-///
-/// If `start` is not on a digit, the span is empty and the value is 0; the lexer only
-/// calls this function on a digit.
-pub fn scan_int(file: FileId, src: &str, start: usize) -> IntLiteral {
-    let rest = src.get(start..).unwrap_or("");
-    let mut value: i64 = 0;
-    let mut too_large = false;
-    let mut len = 0;
-    for byte in rest.bytes().take_while(u8::is_ascii_digit) {
-        len += 1;
+        let end = start + len;
         if too_large {
-            continue;
+            diags.push(Diagnostic::error(
+                codes::INT_OUT_OF_RANGE,
+                span_of(file, start, end),
+                codes::MSG_INT_OUT_OF_RANGE,
+            ));
         }
-        let digit = i64::from(byte - b'0');
-        match value.checked_mul(10).and_then(|v| v.checked_add(digit)) {
-            Some(next) if next <= INT_MAX => value = next,
-            _ => too_large = true,
-        }
+        end
     }
-    let span = span_of(file, start, start + len);
-    let value = if too_large {
-        Err(LiteralError {
-            kind: LiteralErrorKind::IntOutOfRange,
-            span,
-        })
-    } else {
-        Ok(value)
-    };
-    IntLiteral { span, value }
-}
 
-/// Reads the string literal whose opening quote is at byte `start` of `src`.
-///
-/// The literal ends at the matching closing quote. It never spans lines: a line end or
-/// the end of the file before the closing quote gives `E0003` at the opening quote and
-/// the literal ends just before the line end. All other faults are reported and the scan
-/// continues, so every independent fault in the literal is found.
-pub fn scan_string(file: FileId, src: &str, start: usize) -> StringLiteral {
-    let mut scanner = Scanner {
-        file,
-        src,
-        pos: start,
-        parts: Vec::new(),
-        errors: Vec::new(),
-        text: String::new(),
-        text_start: start,
-    };
-    let end = scanner.run(start);
-    StringLiteral {
-        span: span_of(file, start, end),
-        parts: scanner.parts,
-        errors: scanner.errors,
+    fn string_text(
+        &self,
+        src: &str,
+        start: usize,
+        file: FileId,
+        diags: &mut Vec<Diagnostic>,
+    ) -> (usize, TextStop) {
+        let mut scanner = TextScanner {
+            src,
+            file,
+            pos: start,
+            diags,
+        };
+        let stop = scanner.run();
+        (scanner.pos, stop)
     }
 }
 
@@ -246,29 +87,57 @@ fn span_of(file: FileId, start: usize, end: usize) -> Span {
     Span::new(file, start, end)
 }
 
-/// How a scanned interpolation ended.
-enum InterpolationEnd {
-    /// The matching `}` was found; the scan continues after it.
-    Closed,
-    /// The line or the file ended first; the literal is unterminated.
-    LineEnd,
-}
-
-/// State of one [`scan_string`] call.
-struct Scanner<'a> {
-    file: FileId,
+/// State of one [`Literals::string_text`] call.
+struct TextScanner<'a, 'd> {
     src: &'a str,
+    file: FileId,
     /// Byte offset of the next unread character.
     pos: usize,
-    parts: Vec<StringPart>,
-    errors: Vec<LiteralError>,
-    /// Decoded text not yet pushed as a part.
-    text: String,
-    /// Where the pending text starts in the source.
-    text_start: usize,
+    diags: &'d mut Vec<Diagnostic>,
 }
 
-impl Scanner<'_> {
+impl TextScanner<'_, '_> {
+    /// Reads text up to and including the stop, and says which stop it was.
+    fn run(&mut self) -> TextStop {
+        loop {
+            let at = self.pos;
+            let Some(ch) = self.peek() else {
+                return TextStop::LineEnd;
+            };
+            match ch {
+                '\n' => return TextStop::LineEnd,
+                '\r' if self.peek_second() == Some('\n') => return TextStop::LineEnd,
+                '"' => {
+                    self.pos += 1;
+                    return TextStop::Quote;
+                }
+                '{' => {
+                    self.pos += 1;
+                    return TextStop::Brace;
+                }
+                '\\' => self.escape(),
+                '}' => {
+                    self.pos += 1;
+                    self.error(
+                        codes::LONE_CLOSE_BRACE,
+                        at,
+                        codes::MSG_LONE_CLOSE_BRACE.to_string(),
+                    );
+                }
+                '\r' => {
+                    // A lone carriage return is not a line end (D68).
+                    self.pos += 1;
+                    self.error(codes::UNEXPECTED_CHAR, at, codes::msg_unexpected_char(ch));
+                }
+                ch if codes::is_bidi_control(ch) => {
+                    self.pos += ch.len_utf8();
+                    self.error(codes::BIDI_CONTROL, at, codes::msg_bidi_control(ch));
+                }
+                ch => self.pos += ch.len_utf8(),
+            }
+        }
+    }
+
     /// The next unread character.
     fn peek(&self) -> Option<char> {
         self.src
@@ -283,133 +152,60 @@ impl Scanner<'_> {
         chars.next()
     }
 
-    /// Consumes and returns the next character.
-    fn bump(&mut self) -> Option<char> {
-        let ch = self.peek()?;
-        self.pos += ch.len_utf8();
-        Some(ch)
+    /// Reports a fault that spans from `start` to the current position.
+    fn error(&mut self, code: Code, start: usize, message: String) {
+        let span = span_of(self.file, start, self.pos);
+        self.diags.push(Diagnostic::error(code, span, message));
     }
 
-    fn error(&mut self, kind: LiteralErrorKind, start: usize, end: usize) {
-        let span = span_of(self.file, start, end);
-        self.errors.push(LiteralError { kind, span });
-    }
-
-    /// Pushes the pending text as a part, if there is any source for it.
-    fn flush_text(&mut self, end: usize) {
-        if end > self.text_start {
-            let value = std::mem::take(&mut self.text);
-            let span = span_of(self.file, self.text_start, end);
-            self.parts.push(StringPart::Text { value, span });
-        }
-        self.text.clear();
-    }
-
-    /// Scans the whole literal and returns its end offset.
-    fn run(&mut self, quote: usize) -> usize {
-        // The opening quote.
-        self.bump();
-        self.text_start = self.pos;
-        loop {
-            let at = self.pos;
-            match self.peek() {
-                None | Some('\n') => {
-                    self.flush_text(at);
-                    self.unterminated(quote);
-                    return at;
-                }
-                Some('"') => {
-                    self.flush_text(at);
-                    self.bump();
-                    return self.pos;
-                }
-                Some('\\') => self.escape(),
-                Some('{') => {
-                    self.flush_text(at);
-                    match self.interpolation() {
-                        InterpolationEnd::Closed => self.text_start = self.pos,
-                        InterpolationEnd::LineEnd => {
-                            self.unterminated(quote);
-                            return self.pos;
-                        }
-                    }
-                }
-                Some('}') => {
-                    self.bump();
-                    self.error(LiteralErrorKind::UnescapedCloseBrace, at, self.pos);
-                }
-                Some(ch) => {
-                    self.bump();
-                    if is_bidi_control(ch) {
-                        self.error(LiteralErrorKind::BidiControl(ch), at, self.pos);
-                    } else {
-                        self.text.push(ch);
-                    }
-                }
-            }
-        }
-    }
-
-    fn unterminated(&mut self, quote: usize) {
-        self.error(LiteralErrorKind::UnterminatedString, quote, quote + 1);
-    }
-
-    /// Reads one escape in text. The backslash is the next character. A backslash at the
-    /// line end is left for the caller, which reports the unterminated literal.
+    /// Reads one escape. The backslash is the next character.
+    ///
+    /// A backslash never consumes a line end or a lone carriage return: the caller then
+    /// stops at the line end (the driver reports the unterminated string) or reports the
+    /// carriage return, so one fault gives one diagnostic.
     fn escape(&mut self) {
         let start = self.pos;
-        let decoded = match self.peek_second() {
-            None | Some('\n') => {
-                self.bump();
-                return;
+        match self.peek_second() {
+            None | Some('\n' | '\r') => self.pos += 1,
+            Some('{' | '}' | '"' | '\\' | 'n' | 't') => self.pos += 2,
+            Some('u') => self.unicode_escape(),
+            Some(ch) if codes::is_bidi_control(ch) => {
+                // The character is the fault; it is named by its code point only.
+                let at = start + 1;
+                self.pos = at + ch.len_utf8();
+                self.error(codes::BIDI_CONTROL, at, codes::msg_bidi_control(ch));
             }
-            Some('{') => '{',
-            Some('}') => '}',
-            Some('"') => '"',
-            Some('\\') => '\\',
-            Some('n') => '\n',
-            Some('t') => '\t',
-            Some('u') => {
-                self.unicode_escape();
-                return;
-            }
-            Some(other) => {
-                self.bump();
-                self.bump();
+            Some(ch) => {
+                self.pos += 1 + ch.len_utf8();
                 self.error(
-                    LiteralErrorKind::UnknownEscape(format!("\\{other}")),
+                    codes::BAD_ESCAPE,
                     start,
-                    self.pos,
+                    codes::msg_unknown_escape(&format!("\\{ch}")),
                 );
-                return;
             }
-        };
-        self.bump();
-        self.bump();
-        self.text.push(decoded);
+        }
     }
 
     /// Reads `\u{h}` with 1 to 6 hex digits. The backslash is the next character.
     fn unicode_escape(&mut self) {
         let start = self.pos;
-        self.bump();
-        self.bump();
+        self.pos += 2;
         let mut written = String::from("\\u");
         if self.peek() != Some('{') {
             self.error(
-                LiteralErrorKind::MalformedUnicodeEscape(written),
+                codes::BAD_ESCAPE,
                 start,
-                self.pos,
+                codes::msg_malformed_unicode_escape(&written),
             );
             return;
         }
-        self.bump();
+        self.pos += 1;
         written.push('{');
 
         let mut digits = 0usize;
         let mut value: u32 = 0;
         while let Some(ch) = self.peek().filter(char::is_ascii_hexdigit) {
-            self.bump();
+            self.pos += 1;
             digits += 1;
             if digits <= MAX_SHOWN_HEX_DIGITS {
                 written.push(ch);
@@ -422,656 +218,531 @@ impl Scanner<'_> {
         }
         let closed = self.peek() == Some('}');
         if closed {
-            self.bump();
+            self.pos += 1;
             written.push('}');
-        } else if let Some(stray) = self.stray_escape_tail() {
+        } else if let Some(tail) = self.stray_escape_tail() {
             // `\u{4G}`: the escape visibly ends at the `}`, so it is one malformed escape
             // and the `}` is not reported again as a lone brace.
-            written.push_str(stray);
-            self.pos += stray.len();
+            written.push_str(tail);
+            self.pos += tail.len();
             self.error(
-                LiteralErrorKind::MalformedUnicodeEscape(written),
+                codes::BAD_ESCAPE,
                 start,
-                self.pos,
+                codes::msg_malformed_unicode_escape(&written),
             );
             return;
         }
 
         if !closed || digits == 0 || digits > 6 {
             self.error(
-                LiteralErrorKind::MalformedUnicodeEscape(written),
+                codes::BAD_ESCAPE,
                 start,
-                self.pos,
+                codes::msg_malformed_unicode_escape(&written),
             );
             return;
         }
-        match char::from_u32(value) {
-            Some(ch) => self.text.push(ch),
-            None => self.error(LiteralErrorKind::NotUnicodeScalar(written), start, self.pos),
+        if char::from_u32(value).is_none() {
+            self.error(codes::NOT_SCALAR, start, codes::msg_not_scalar(&written));
         }
     }
 
     /// The rest of a broken `\u{...}` up to and including its `}`, if a `}` follows within
-    /// a few characters and before anything that ends or restarts text (a quote, a
-    /// backslash, a brace, a line end or a bidirectional control character).
+    /// a few characters and before anything that ends or restarts text: a quote, a
+    /// backslash, a brace, a line end or any other control character, or a bidirectional
+    /// control character. Looks at no more than [`MAX_STRAY_TAIL_CHARS`] characters.
     fn stray_escape_tail(&self) -> Option<&str> {
-        const MAX_TAIL_CHARS: usize = 8;
         let rest = self.src.get(self.pos..)?;
-        for (index, ch) in rest.char_indices().take(MAX_TAIL_CHARS) {
+        for (index, ch) in rest.char_indices().take(MAX_STRAY_TAIL_CHARS) {
             match ch {
                 '}' => return rest.get(..index + 1),
-                '"' | '\\' | '{' | '\n' => return None,
-                ch if is_bidi_control(ch) => return None,
+                '"' | '\\' | '{' => return None,
+                ch if ch.is_control() || codes::is_bidi_control(ch) => return None,
                 _ => {}
             }
         }
         None
-    }
-
-    /// Reads one interpolation. The opening `{` is the next character.
-    ///
-    /// Braces are counted, with escaped braces not counting (SPEC 12.1). Everything else
-    /// is left to the lexer, which tokenizes the inner range. Bidirectional control
-    /// characters are reported here only if the interpolation is not returned as a part,
-    /// because otherwise the lexer reports them while tokenizing it.
-    fn interpolation(&mut self) -> InterpolationEnd {
-        self.bump();
-        let inner_start = self.pos;
-        let errors_before = self.errors.len();
-        let mut bidi = Vec::new();
-        let mut depth: u32 = 1;
-        let mut too_deep_reported = false;
-        loop {
-            let at = self.pos;
-            match self.peek() {
-                None | Some('\n') => {
-                    self.errors.append(&mut bidi);
-                    return InterpolationEnd::LineEnd;
-                }
-                Some('"') => {
-                    if !self.skip_inner_string() {
-                        // No second quote on this line: the quote is most likely meant to
-                        // close the literal, and the real fault is the unclosed `{`. The
-                        // literal is unterminated; one diagnostic for one fault.
-                        self.pos = self.line_end();
-                        self.errors.append(&mut bidi);
-                        return InterpolationEnd::LineEnd;
-                    }
-                    self.error(LiteralErrorKind::StringInInterpolation, at, at + 1);
-                }
-                Some('\\') if matches!(self.peek_second(), Some('{' | '}')) => {
-                    self.bump();
-                    self.bump();
-                }
-                Some('{') => {
-                    self.bump();
-                    depth = depth.saturating_add(1);
-                    if depth > MAX_INTERPOLATION_DEPTH && !too_deep_reported {
-                        too_deep_reported = true;
-                        self.error(LiteralErrorKind::InterpolationTooDeep, at, self.pos);
-                    }
-                }
-                Some('}') => {
-                    self.bump();
-                    depth -= 1;
-                    if depth == 0 {
-                        if self.errors.len() == errors_before {
-                            let inner = span_of(self.file, inner_start, at);
-                            self.parts.push(StringPart::Interpolation { inner });
-                        } else {
-                            self.errors.append(&mut bidi);
-                        }
-                        return InterpolationEnd::Closed;
-                    }
-                }
-                Some(ch) => {
-                    self.bump();
-                    if is_bidi_control(ch) {
-                        let span = span_of(self.file, at, self.pos);
-                        bidi.push(LiteralError {
-                            kind: LiteralErrorKind::BidiControl(ch),
-                            span,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    /// Skips a string literal inside an interpolation, starting at its quote. Returns
-    /// false, without moving, if there is no closing quote on the same line.
-    fn skip_inner_string(&mut self) -> bool {
-        let Some(rest) = self.src.get(self.pos + 1..) else {
-            return false;
-        };
-        let line = rest.split('\n').next().unwrap_or("");
-        match line.find('"') {
-            Some(offset) => {
-                self.pos += 1 + offset + 1;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Byte offset of the next line end, or the end of the source.
-    fn line_end(&self) -> usize {
-        let rest = self.src.get(self.pos..).unwrap_or("");
-        self.pos + rest.find('\n').unwrap_or(rest.len())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lex::{TokenKind, lex};
+    use ostrel_core::SourceMap;
 
     const FILE: FileId = FileId::from_raw(0);
 
-    fn int(src: &str) -> IntLiteral {
-        scan_int(FILE, src, 0)
+    /// A diagnostic as (code, start, end, message), easy to compare.
+    type Found = (String, u32, u32, String);
+
+    /// Scans string text of `src` from `start`: end, stop and the diagnostics as
+    /// (code, start, end, message).
+    fn text_at(src: &str, start: usize) -> (usize, TextStop, Vec<Found>) {
+        let mut diags = Vec::new();
+        let (end, stop) = Literals.string_text(src, start, FILE, &mut diags);
+        (end, stop, flat(&diags))
     }
 
-    fn string(src: &str) -> StringLiteral {
-        scan_string(FILE, src, 0)
+    /// Scans string text that starts at offset 0, as just after an opening quote.
+    fn text(src: &str) -> (usize, TextStop, Vec<Found>) {
+        text_at(src, 0)
     }
 
-    fn span(start: u32, end: u32) -> Span {
-        Span::new(FILE, start, end)
+    fn int(src: &str) -> (usize, Vec<Found>) {
+        let mut diags = Vec::new();
+        let end = Literals.int(src, 0, FILE, &mut diags);
+        (end, flat(&diags))
     }
 
-    fn text(value: &str, start: u32, end: u32) -> StringPart {
-        StringPart::Text {
-            value: value.to_string(),
-            span: span(start, end),
-        }
+    fn flat(diags: &[Diagnostic]) -> Vec<Found> {
+        diags
+            .iter()
+            .map(|d| {
+                (
+                    d.code.to_string(),
+                    d.span.start,
+                    d.span.end,
+                    d.message.clone(),
+                )
+            })
+            .collect()
     }
 
-    fn interpolation(start: u32, end: u32) -> StringPart {
-        StringPart::Interpolation {
-            inner: span(start, end),
-        }
+    fn diag(code: &str, start: u32, end: u32, message: &str) -> Found {
+        (code.to_string(), start, end, message.to_string())
     }
 
-    fn error(kind: LiteralErrorKind, start: u32, end: u32) -> LiteralError {
-        LiteralError {
-            kind,
-            span: span(start, end),
-        }
-    }
-
-    /// The only fault of `src`, as (code, start offset, message). Any other number of
-    /// faults gives a value that no expectation matches, with the faults in the message.
-    fn single_error(src: &str) -> (String, u32, String) {
-        let literal = string(src);
-        match literal.errors.as_slice() {
-            [error] => (
-                error.kind.code().to_string(),
-                error.span.start,
-                error.kind.message(),
-            ),
-            other => (
-                format!("{} faults", other.len()),
-                u32::MAX,
-                format!("{src:?}: {other:?}"),
-            ),
-        }
+    /// The codes of all diagnostics of the full lexer for `src`.
+    fn lex_codes(src: &str) -> Vec<String> {
+        let (_, diags) = lex(src, FILE);
+        diags.iter().map(|d| d.code.to_string()).collect()
     }
 
     // Integer literals (G9).
 
     #[test]
     fn int_reads_the_digit_run() {
-        let literal = int("1234 + 1");
-        assert_eq!(literal.value, Ok(1234));
-        assert_eq!(literal.span, span(0, 4));
-    }
-
-    #[test]
-    fn int_allows_zero_and_leading_zeros() {
-        assert_eq!(int("0").value, Ok(0));
-        assert_eq!(int("007").value, Ok(7));
+        assert_eq!(int("1234 + 1"), (4, vec![]));
+        assert_eq!(int("0"), (1, vec![]));
+        assert_eq!(int("007)"), (3, vec![]));
     }
 
     #[test]
     fn int_accepts_the_largest_value() {
-        assert_eq!(int("9007199254740991").value, Ok(INT_MAX));
-        assert_eq!(int("0009007199254740991").value, Ok(INT_MAX));
+        assert_eq!(int("9007199254740991"), (16, vec![]));
+        assert_eq!(int("0009007199254740991"), (19, vec![]));
     }
 
     #[test]
-    fn int_rejects_one_above_the_range() {
-        let literal = int("9007199254740992");
-        assert_eq!(literal.span, span(0, 16));
+    fn int_rejects_one_above_the_range_at_its_start() {
+        let message = "integer literal is outside the `Int` range of \
+                       -9007199254740991 to 9007199254740991";
         assert_eq!(
-            literal.value,
-            Err(error(LiteralErrorKind::IntOutOfRange, 0, 16))
+            int("9007199254740992"),
+            (16, vec![diag("E0010", 0, 16, message)])
         );
-        assert_eq!(LiteralErrorKind::IntOutOfRange.code().to_string(), "E0010");
+        let mut diags = Vec::new();
         assert_eq!(
-            LiteralErrorKind::IntOutOfRange.message(),
-            "integer literal is outside the `Int` range of \
-             -9007199254740991 to 9007199254740991"
+            Literals.int("x = 18446744073709551616", 4, FILE, &mut diags),
+            24
         );
+        assert_eq!(flat(&diags), vec![diag("E0010", 4, 24, message)]);
     }
 
     #[test]
     fn int_with_many_digits_does_not_overflow() {
         let digits = "9".repeat(100_000);
-        let literal = int(&digits);
-        assert_eq!(literal.span, span(0, 100_000));
+        let (end, diags) = int(&digits);
+        assert_eq!(end, 100_000);
+        assert_eq!(diags.len(), 1);
+    }
+
+    // Plain text and the three stops.
+
+    #[test]
+    fn text_stops_after_the_closing_quote() {
+        assert_eq!(text("hello\" rest"), (6, TextStop::Quote, vec![]));
+        assert_eq!(text("\""), (1, TextStop::Quote, vec![]));
+    }
+
+    #[test]
+    fn text_stops_after_an_opening_brace() {
+        assert_eq!(text("a {x}\""), (3, TextStop::Brace, vec![]));
+        // `{{` has no special meaning: the first brace opens the interpolation.
+        assert_eq!(text("{{x}}\""), (1, TextStop::Brace, vec![]));
+    }
+
+    #[test]
+    fn text_starts_at_the_given_offset() {
+        let src = "let s = \"a{x} b\"\n";
+        assert_eq!(text_at(src, 9), (11, TextStop::Brace, vec![]));
+        assert_eq!(text_at(src, 13), (16, TextStop::Quote, vec![]));
+    }
+
+    #[test]
+    fn text_stops_before_a_line_end() {
+        assert_eq!(text("hello\n  print(s)\n"), (5, TextStop::LineEnd, vec![]));
+        assert_eq!(text("abc"), (3, TextStop::LineEnd, vec![]));
+        assert_eq!(text(""), (0, TextStop::LineEnd, vec![]));
+    }
+
+    #[test]
+    fn text_stops_before_crlf() {
+        assert_eq!(text("ab\r\nx\""), (2, TextStop::LineEnd, vec![]));
+        let (tokens, diags) = lex("x = \"ab\r\ny = 1\r\n", FILE);
         assert_eq!(
-            literal.value,
-            Err(error(LiteralErrorKind::IntOutOfRange, 0, 100_000))
+            flat(&diags),
+            vec![diag("E0003", 4, 5, "unterminated string literal")]
         );
+        let error = tokens.iter().find(|t| t.kind == TokenKind::Error);
+        assert_eq!(error.map(|t| (t.span.start, t.span.end)), Some((4, 7)));
+    }
+
+    #[test]
+    fn lone_carriage_return_in_text_is_e0008() {
         assert_eq!(
-            int("18446744073709551616").value,
-            Err(error(LiteralErrorKind::IntOutOfRange, 0, 20))
-        );
-    }
-
-    #[test]
-    fn int_starts_at_the_given_offset() {
-        let literal = scan_int(FILE, "x = 42)", 4);
-        assert_eq!(literal.span, span(4, 6));
-        assert_eq!(literal.value, Ok(42));
-    }
-
-    #[test]
-    fn int_on_a_non_digit_is_empty() {
-        let literal = int("x");
-        assert_eq!(literal.span, span(0, 0));
-        assert_eq!(literal.value, Ok(0));
-        assert_eq!(scan_int(FILE, "1", 5).span, span(5, 5));
-    }
-
-    // Plain strings and escapes.
-
-    #[test]
-    fn string_plain_text() {
-        let literal = string("\"hello\" rest");
-        assert_eq!(literal.span, span(0, 7));
-        assert_eq!(literal.parts, vec![text("hello", 1, 6)]);
-        assert!(literal.errors.is_empty());
-    }
-
-    #[test]
-    fn string_empty_has_no_parts() {
-        let literal = string("\"\"");
-        assert_eq!(literal.span, span(0, 2));
-        assert!(literal.parts.is_empty());
-        assert!(literal.errors.is_empty());
-    }
-
-    #[test]
-    fn string_decodes_every_escape() {
-        let literal = string(r#""\{\}\"\\\n\t\u{41}\u{1F600}\u{0}\u{202e}""#);
-        assert!(literal.errors.is_empty(), "{:?}", literal.errors);
-        let expected = "{}\"\\\n\tA\u{1F600}\u{0}\u{202E}";
-        assert_eq!(literal.parts, vec![text(expected, 1, 41)]);
-    }
-
-    #[test]
-    fn string_keeps_non_ascii_and_invisible_characters() {
-        let literal = string("\"grüße \u{200B}\u{200D}\u{2060}\"");
-        assert!(literal.errors.is_empty());
-        assert_eq!(
-            literal.parts,
-            vec![text("grüße \u{200B}\u{200D}\u{2060}", 1, 18)]
+            text("a\rb\""),
+            (
+                4,
+                TextStop::Quote,
+                vec![diag("E0008", 1, 2, "unexpected character U+000D")]
+            )
         );
     }
 
     #[test]
-    fn string_unknown_escape_is_e0004_at_the_backslash() {
-        // Golden lex_unknown_escape: `print("a \q b")`, the backslash is column 12.
-        let (code, start, message) = single_error(r#""a \q b""#);
-        assert_eq!(code, "E0004");
-        assert_eq!(start, 3);
-        assert_eq!(message, "unknown escape sequence `\\q`");
-        for escape in [r"\r", r"\0", r"\'", r"\ "] {
-            let (code, _, _) = single_error(&format!("\"{escape}\""));
-            assert_eq!(code, "E0004", "{escape}");
+    fn text_keeps_non_ascii_and_invisible_characters() {
+        let src = "grüße \u{200B}\u{200D}\u{2060}\u{FEFF}\u{0}\"";
+        assert_eq!(text(src), (src.len(), TextStop::Quote, vec![]));
+    }
+
+    // Escapes.
+
+    #[test]
+    fn every_valid_escape_is_text() {
+        let src = r#"\{\}\"\\\n\t\u{41}\u{1F600}\u{0}\u{202e}\u{00E9}\u{10FFFF}""#;
+        assert_eq!(text(src), (src.len(), TextStop::Quote, vec![]));
+    }
+
+    #[test]
+    fn escaped_braces_and_quotes_never_stop_the_text() {
+        assert_eq!(text(r#"\{x\} \" y""#), (11, TextStop::Quote, vec![]));
+        // The braces of `\u{...}` never open an interpolation.
+        assert_eq!(text(r"\u{41}{"), (7, TextStop::Brace, vec![]));
+    }
+
+    #[test]
+    fn unknown_escape_is_e0004_at_the_backslash() {
+        assert_eq!(
+            text(r#"a \q b""#),
+            (
+                7,
+                TextStop::Quote,
+                vec![diag("E0004", 2, 4, "unknown escape sequence `\\q`")]
+            )
+        );
+        for escape in [r"\r", r"\0", r"\'", r"\ ", r"\é"] {
+            let (_, stop, diags) = text(&format!("{escape}\""));
+            assert_eq!(stop, TextStop::Quote, "{escape}");
+            assert_eq!(diags.len(), 1, "{escape}");
+            assert_eq!(
+                diags.first().map(|d| d.0.as_str()),
+                Some("E0004"),
+                "{escape}"
+            );
         }
     }
 
     #[test]
-    fn string_unknown_escape_continues_with_the_text() {
-        let literal = string(r#""a \q b""#);
-        assert_eq!(literal.span, span(0, 8));
-        assert_eq!(literal.parts, vec![text("a  b", 1, 7)]);
-    }
-
-    #[test]
-    fn string_malformed_unicode_escapes_are_e0004() {
-        // Goldens lex_escape_empty_unicode and lex_escape_unicode_too_long.
+    fn malformed_unicode_escapes_are_e0004() {
         let cases = [
-            (r#""a \u{} b""#, "\\u{}"),
-            (r#""a \u{0000041} b""#, "\\u{0000041}"),
-            (r#""a \u{41 b""#, "\\u{41"),
-            (r#""a \u41 b""#, "\\u"),
-            (r#""a \u{4G} b""#, "\\u{4G}"),
-            (r#""a \u{123456789ABC} b""#, "\\u{12345678...}"),
+            (r#"a \u{} b""#, "\\u{}"),
+            (r#"a \u{0000041} b""#, "\\u{0000041}"),
+            (r#"a \u{41 b""#, "\\u{41"),
+            (r#"a \u41 b""#, "\\u"),
+            (r#"a \u{4G} b""#, "\\u{4G}"),
+            (r#"a \u{123456789ABC} b""#, "\\u{12345678...}"),
         ];
         for (src, written) in cases {
-            let (code, start, message) = single_error(src);
-            assert_eq!(code, "E0004", "{src}");
-            assert_eq!(start, 3, "{src}");
+            let (end, stop, diags) = text(src);
+            assert_eq!((end, stop), (src.len(), TextStop::Quote), "{src}");
+            let message =
+                format!("malformed escape `{written}`; write 1 to 6 hex digits between the braces");
+            assert_eq!(diags.len(), 1, "{src}");
             assert_eq!(
-                message,
-                format!("malformed escape `{written}`; write 1 to 6 hex digits between the braces"),
+                diags.first().map(|d| (d.0.as_str(), d.1, d.3.as_str())),
+                Some(("E0004", 2, message.as_str())),
                 "{src}"
             );
         }
     }
 
     #[test]
-    fn string_unicode_escape_accepts_both_cases_and_six_digits() {
-        let literal = string(r#""\u{00e9}\u{00E9}\u{10FFFF}""#);
-        assert!(literal.errors.is_empty());
-        assert_eq!(literal.parts, vec![text("éé\u{10FFFF}", 1, 27)]);
+    fn unclosed_unicode_escape_stops_at_the_quote() {
+        // The quote ends the text; it is not swallowed by the escape.
+        let (end, stop, diags) = text("\\u{41\"");
+        assert_eq!((end, stop), (6, TextStop::Quote));
+        assert_eq!(diags.len(), 1);
+        let (end, stop, diags) = text("\\u{41\r\n");
+        assert_eq!((end, stop), (5, TextStop::LineEnd));
+        assert_eq!(diags.len(), 1);
     }
 
     #[test]
-    fn string_non_scalar_escapes_are_e0005() {
-        // Goldens lex_escape_not_scalar and lex_escape_surrogate.
-        for (src, start, written) in [
-            (r#""bad \u{110000} end""#, 5, "\\u{110000}"),
-            (r#""x \u{D800}""#, 3, "\\u{D800}"),
-            (r#""x \u{dfff}""#, 3, "\\u{dfff}"),
-            (r#""x \u{FFFFFF}""#, 3, "\\u{FFFFFF}"),
+    fn non_scalar_escapes_are_e0005() {
+        for (src, written) in [
+            (r#"\u{110000} end""#, "\\u{110000}"),
+            (r#"\u{D800}""#, "\\u{D800}"),
+            (r#"\u{dfff}""#, "\\u{dfff}"),
+            (r#"\u{FFFFFF}""#, "\\u{FFFFFF}"),
         ] {
-            let (code, at, message) = single_error(src);
-            assert_eq!(code, "E0005", "{src}");
-            assert_eq!(at, start, "{src}");
+            let message = format!("`{written}` is not a Unicode scalar value");
+            let end = u32::try_from(written.len()).unwrap_or(0);
             assert_eq!(
-                message,
-                format!("`{written}` is not a Unicode scalar value")
+                text(src),
+                (
+                    src.len(),
+                    TextStop::Quote,
+                    vec![diag("E0005", 0, end, &message)]
+                ),
+                "{src}"
             );
         }
     }
 
     #[test]
-    fn string_unterminated_at_line_end_is_e0003_at_the_quote() {
-        // Golden lex_unterminated_string: `let s = "hello` followed by a line end.
-        let src = "\"hello\n  print(s)\n";
-        let (code, start, message) = single_error(src);
-        assert_eq!((code.as_str(), start), ("E0003", 0));
-        assert_eq!(message, "unterminated string literal");
-        let literal = string(src);
-        assert_eq!(literal.span, span(0, 6));
-        assert_eq!(literal.parts, vec![text("hello", 1, 6)]);
+    fn backslash_never_consumes_a_line_end() {
+        assert_eq!(text("abc\\\nx\""), (4, TextStop::LineEnd, vec![]));
+        assert_eq!(text("abc\\\r\nx\""), (4, TextStop::LineEnd, vec![]));
+        assert_eq!(text("\\"), (1, TextStop::LineEnd, vec![]));
+        // A lone carriage return after a backslash is reported once, as E0008.
+        let (end, stop, diags) = text("\\\rx\"");
+        assert_eq!((end, stop), (4, TextStop::Quote));
+        assert_eq!(flat_codes(&diags), vec!["E0008"]);
     }
 
     #[test]
-    fn string_unterminated_at_end_of_file() {
-        let literal = string("\"abc");
-        assert_eq!(literal.span, span(0, 4));
+    fn every_independent_fault_is_reported() {
+        let (_, _, diags) = text(r#"\q \u{} \u{D800} } x""#);
+        let found: Vec<_> = diags.iter().map(|d| (d.0.as_str(), d.1)).collect();
         assert_eq!(
-            literal.errors,
-            vec![error(LiteralErrorKind::UnterminatedString, 0, 1)]
+            found,
+            vec![("E0004", 0), ("E0004", 3), ("E0005", 8), ("E0012", 17)]
         );
     }
 
-    #[test]
-    fn string_backslash_at_line_end_is_only_unterminated() {
-        let literal = string("\"abc\\\nx\"");
-        assert_eq!(literal.span, span(0, 5));
-        let kinds: Vec<_> = literal.errors.iter().map(|e| e.kind.clone()).collect();
-        assert_eq!(kinds, vec![LiteralErrorKind::UnterminatedString]);
-        assert_eq!(string("\"\\").errors.len(), 1);
+    fn flat_codes(diags: &[Found]) -> Vec<&str> {
+        diags.iter().map(|d| d.0.as_str()).collect()
     }
 
-    #[test]
-    fn string_reports_every_independent_fault() {
-        let literal = string(r#""\q \u{} \u{D800}""#);
-        let codes: Vec<_> = literal
-            .errors
-            .iter()
-            .map(|e| e.kind.code().to_string())
-            .collect();
-        assert_eq!(codes, vec!["E0004", "E0004", "E0005"]);
-        let starts: Vec<_> = literal.errors.iter().map(|e| e.span.start).collect();
-        assert_eq!(starts, vec![1, 4, 9]);
-    }
+    // Lone `}` (E0012) and bidirectional control characters (E0011).
 
     #[test]
-    fn string_starts_at_the_given_offset() {
-        let literal = scan_string(FILE, "let s = \"a{x}\"\n", 8);
-        assert_eq!(literal.span, span(8, 14));
-        assert_eq!(literal.parts, vec![text("a", 9, 10), interpolation(11, 12)]);
-    }
-
-    // Bidirectional control characters (D53).
-
-    #[test]
-    fn bidi_controls_are_exactly_the_nine_characters() {
-        let rejected: Vec<char> = ('\u{2000}'..='\u{20FF}')
-            .filter(|c| is_bidi_control(*c))
-            .collect();
+    fn lone_close_brace_is_e0012() {
         assert_eq!(
-            rejected,
-            vec![
-                '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
-                '\u{2068}', '\u{2069}'
-            ]
+            text(r#"a } b""#),
+            (
+                6,
+                TextStop::Quote,
+                vec![diag(
+                    "E0012",
+                    2,
+                    3,
+                    "`}` in a string literal must be written as `\\}`"
+                )]
+            )
         );
-        assert!(!is_bidi_control('\u{061C}'));
-        assert!(!is_bidi_control('\u{200F}'));
+        // After an interpolation the text starts behind its `}`; a second `}` is lone.
+        assert_eq!(lex_codes("x = \"{a}}\"\n"), vec!["E0012"]);
     }
 
     #[test]
-    fn string_reports_each_raw_bidi_control() {
-        let literal = string("\"a\u{202E}b\u{2066}\"");
-        assert_eq!(literal.span, span(0, 10));
+    fn raw_bidi_control_in_text_is_e0011_once_each() {
+        let (end, stop, diags) = text("a\u{202E}b\u{2066}\"");
+        assert_eq!((end, stop), (9, TextStop::Quote));
         assert_eq!(
-            literal.errors,
+            diags,
             vec![
-                error(LiteralErrorKind::BidiControl('\u{202E}'), 2, 5),
-                error(LiteralErrorKind::BidiControl('\u{2066}'), 6, 9),
+                diag("E0011", 1, 4, &codes::msg_bidi_control('\u{202E}')),
+                diag("E0011", 5, 8, &codes::msg_bidi_control('\u{2066}')),
             ]
         );
         assert_eq!(
-            LiteralErrorKind::BidiControl('\u{202E}').message(),
-            "bidirectional control character U+202E is not allowed; \
-             write it as `\\u{202E}` if it is needed"
+            codes::msg_bidi_control('\u{202E}'),
+            "bidirectional control character U+202E is not allowed in source; \
+             write `\\u{202E}` inside a string if it is needed"
         );
-    }
-
-    // Interpolation (G1).
-
-    #[test]
-    fn interpolation_splits_text_and_expression() {
-        let literal = string(r#""a {x + 1} b {y}""#);
-        assert!(literal.errors.is_empty());
+        // After a backslash the character is reported once, as E0011 only.
+        let (_, _, diags) = text("\\\u{2067}\"");
         assert_eq!(
-            literal.parts,
-            vec![
-                text("a ", 1, 3),
-                interpolation(4, 9),
-                text(" b ", 10, 13),
-                interpolation(14, 15),
-            ]
+            diags,
+            vec![diag("E0011", 1, 4, &codes::msg_bidi_control('\u{2067}'))]
         );
-        assert_eq!(literal.span, span(0, 17));
+        // Inside an interpolation the driver reports it.
+        assert_eq!(lex_codes("x = \"{a \u{2068}}\"\n"), vec!["E0011"]);
     }
 
-    #[test]
-    fn interpolation_counts_nested_braces() {
-        let literal = string(r#""{ {a, b} }!""#);
-        assert!(literal.errors.is_empty());
-        assert_eq!(literal.parts, vec![interpolation(2, 10), text("!", 11, 12)]);
-    }
+    // The full lexer with this scanner.
 
     #[test]
-    fn double_brace_has_no_special_meaning() {
-        let literal = string(r#""{{x}}""#);
-        assert!(literal.errors.is_empty());
-        assert_eq!(literal.parts, vec![interpolation(2, 5)]);
-    }
-
-    #[test]
-    fn empty_interpolation_is_left_to_the_parser() {
-        let literal = string(r#""a{}""#);
-        assert!(literal.errors.is_empty());
-        assert_eq!(literal.parts, vec![text("a", 1, 2), interpolation(3, 3)]);
-    }
-
-    #[test]
-    fn escaped_braces_are_text_and_do_not_count() {
-        let literal = string(r#""\{x\}""#);
-        assert!(literal.errors.is_empty());
-        assert_eq!(literal.parts, vec![text("{x}", 1, 6)]);
-
-        // Inside an interpolation the escaped brace is skipped and left to the lexer.
-        let literal = string(r#""{a \} b}""#);
-        assert!(literal.errors.is_empty());
-        assert_eq!(literal.parts, vec![interpolation(2, 8)]);
-    }
-
-    #[test]
-    fn depth_32_is_accepted() {
-        let src = format!("\"{}x{}\"", "{".repeat(32), "}".repeat(32));
-        let literal = string(&src);
-        assert!(literal.errors.is_empty(), "{:?}", literal.errors);
-        assert_eq!(literal.parts, vec![interpolation(2, 65)]);
-    }
-
-    #[test]
-    fn depth_33_is_e0007_at_the_33rd_brace() {
-        // Golden lex_interpolation_too_deep: 33 braces, the error is at the 33rd.
-        let src = format!("\"{}x{}\" rest", "{".repeat(33), "}".repeat(33));
-        let (code, start, message) = single_error(&src);
-        assert_eq!((code.as_str(), start), ("E0007", 33));
-        assert_eq!(message, "interpolation nests braces deeper than 32");
-        let literal = string(&src);
-        assert_eq!(literal.span, span(0, 69));
-        assert!(literal.parts.is_empty());
-    }
-
-    #[test]
-    fn very_deep_nesting_reports_once_and_stays_linear() {
-        let src = format!("\"{}{}\"", "{".repeat(200_000), "}".repeat(200_000));
-        let literal = string(&src);
-        assert_eq!(literal.errors.len(), 1);
-        assert_eq!(literal.span, span(0, 400_002));
-    }
-
-    #[test]
-    fn string_in_interpolation_is_e0006_at_the_inner_quote() {
-        // Golden lex_string_in_interpolation: `print("a {"b"} c")`.
-        let src = r#""a {"b"} c""#;
-        let (code, start, message) = single_error(src);
-        assert_eq!((code.as_str(), start), ("E0006", 4));
-        assert_eq!(
-            message,
-            "string literal inside interpolation; bind it with `let` first"
-        );
-        let literal = string(src);
-        assert_eq!(literal.span, span(0, 11));
-        assert_eq!(literal.parts, vec![text("a ", 1, 3), text(" c", 8, 10)]);
-    }
-
-    #[test]
-    fn inner_string_with_braces_is_skipped_whole() {
-        let literal = string(r#""{"}"} ok""#);
-        let kinds: Vec<_> = literal.errors.iter().map(|e| e.kind.clone()).collect();
-        assert_eq!(kinds, vec![LiteralErrorKind::StringInInterpolation]);
-        assert_eq!(literal.span, span(0, 10));
-        assert_eq!(literal.parts, vec![text(" ok", 6, 9)]);
-    }
-
-    #[test]
-    fn missing_close_brace_is_only_unterminated() {
-        // `"a {x"`: the quote cannot close the literal, the `{` is still open.
-        let literal = string("\"a {x\"\nnext");
-        assert_eq!(
-            literal.errors,
-            vec![error(LiteralErrorKind::UnterminatedString, 0, 1)]
-        );
-        assert_eq!(literal.span, span(0, 6));
-        assert_eq!(literal.parts, vec![text("a ", 1, 3)]);
-    }
-
-    #[test]
-    fn interpolation_does_not_span_lines() {
-        let literal = string("\"a {x\n}\"");
-        let kinds: Vec<_> = literal.errors.iter().map(|e| e.kind.clone()).collect();
-        assert_eq!(kinds, vec![LiteralErrorKind::UnterminatedString]);
-        assert_eq!(literal.span, span(0, 5));
-    }
-
-    #[test]
-    fn bidi_in_a_valid_interpolation_is_left_to_the_lexer() {
-        let literal = string("\"{a\u{202E}}\"");
-        assert!(literal.errors.is_empty());
-        assert_eq!(literal.parts, vec![interpolation(2, 6)]);
-    }
-
-    #[test]
-    fn bidi_in_a_broken_interpolation_is_reported_here() {
-        let literal = string("\"{\"b\" \u{2067}}\"");
-        let kinds: Vec<_> = literal.errors.iter().map(|e| e.kind.clone()).collect();
+    fn lexer_splits_text_and_interpolation() {
+        let src = "x = \"a {y + 1} b {z}\"\n";
+        let (tokens, diags) = lex(src, FILE);
+        assert!(diags.is_empty(), "{diags:?}");
+        let kinds: Vec<_> = tokens.iter().map(|t| t.kind).collect();
         assert_eq!(
             kinds,
             vec![
-                LiteralErrorKind::StringInInterpolation,
-                LiteralErrorKind::BidiControl('\u{2067}')
+                TokenKind::Ident,
+                TokenKind::Eq,
+                TokenKind::StrHead,
+                TokenKind::Ident,
+                TokenKind::Plus,
+                TokenKind::Int,
+                TokenKind::StrMid,
+                TokenKind::Ident,
+                TokenKind::StrTail,
+                TokenKind::Nl,
+                TokenKind::Eof,
             ]
         );
     }
 
     #[test]
-    fn lone_close_brace_in_text_is_rejected() {
-        let (code, start, message) = single_error(r#""a } b""#);
-        assert_eq!((code.as_str(), start), ("E0012", 3));
-        assert_eq!(message, "`}` in a string literal must be written as `\\}`");
-    }
-
-    #[test]
-    fn diagnostics_render_in_the_golden_format() {
-        let mut map = ostrel_core::SourceMap::new();
-        let src = "fn main()\n  print(\"a \\q b\")\n";
-        let Ok(file) = map.add("tests/errors/lex_unknown_escape.ostl", src) else {
-            unreachable!("small source");
-        };
-        let literal = scan_string(file, src, 18);
-        let rendered: Vec<_> = literal
-            .errors
-            .iter()
-            .map(|e| e.to_diagnostic().render(&map))
-            .collect();
+    fn lexer_reports_string_in_interpolation_at_the_inner_quote() {
+        // Review case: `print("a {x")` is E0006 at the inner quote, as in the driver.
+        let (_, diags) = lex("print(\"a {x\")\n", FILE);
         assert_eq!(
-            rendered,
-            vec![
-                "tests/errors/lex_unknown_escape.ostl:2:12: error[E0004]: \
-                 unknown escape sequence `\\q`"
-            ]
+            flat(&diags).first().map(|d| (d.0.as_str(), d.1)),
+            Some(("E0006", 11))
         );
+        assert_eq!(diags.len(), 1);
+    }
+
+    /// Every lexer golden about literals, run through the real lexer and compared byte
+    /// for byte with its expected output.
+    #[test]
+    fn literal_goldens_match_byte_for_byte() {
+        let goldens = [
+            (
+                "lex_escape_empty_unicode",
+                include_str!("../../../../tests/errors/lex_escape_empty_unicode.ostl"),
+                include_str!("../../../../tests/errors/lex_escape_empty_unicode.expected_err"),
+            ),
+            (
+                "lex_escape_not_scalar",
+                include_str!("../../../../tests/errors/lex_escape_not_scalar.ostl"),
+                include_str!("../../../../tests/errors/lex_escape_not_scalar.expected_err"),
+            ),
+            (
+                "lex_escape_surrogate",
+                include_str!("../../../../tests/errors/lex_escape_surrogate.ostl"),
+                include_str!("../../../../tests/errors/lex_escape_surrogate.expected_err"),
+            ),
+            (
+                "lex_escape_unicode_too_long",
+                include_str!("../../../../tests/errors/lex_escape_unicode_too_long.ostl"),
+                include_str!("../../../../tests/errors/lex_escape_unicode_too_long.expected_err"),
+            ),
+            (
+                "lex_unknown_escape",
+                include_str!("../../../../tests/errors/lex_unknown_escape.ostl"),
+                include_str!("../../../../tests/errors/lex_unknown_escape.expected_err"),
+            ),
+            (
+                "lex_int_literal_too_large",
+                include_str!("../../../../tests/errors/lex_int_literal_too_large.ostl"),
+                include_str!("../../../../tests/errors/lex_int_literal_too_large.expected_err"),
+            ),
+            (
+                "lex_interpolation_too_deep",
+                include_str!("../../../../tests/errors/lex_interpolation_too_deep.ostl"),
+                include_str!("../../../../tests/errors/lex_interpolation_too_deep.expected_err"),
+            ),
+            (
+                "lex_string_in_interpolation",
+                include_str!("../../../../tests/errors/lex_string_in_interpolation.ostl"),
+                include_str!("../../../../tests/errors/lex_string_in_interpolation.expected_err"),
+            ),
+            (
+                "lex_unterminated_string",
+                include_str!("../../../../tests/errors/lex_unterminated_string.ostl"),
+                include_str!("../../../../tests/errors/lex_unterminated_string.expected_err"),
+            ),
+        ];
+        for (name, src, expected) in goldens {
+            let mut map = SourceMap::new();
+            let path = format!("tests/errors/{name}.ostl");
+            let Ok(file) = map.add(&path, src) else {
+                unreachable!("golden sources are small");
+            };
+            let (_, diags) = lex(src, file);
+            let rendered: String = diags.iter().map(|d| d.render(&map) + "\n").collect();
+            assert_eq!(rendered, expected, "{name}");
+        }
+    }
+
+    // Hostile input (AC-04, AC-36): linear time, valid spans, no panic.
+
+    #[test]
+    fn hostile_interpolations_stay_linear() {
+        // The two probes of the review of 18b7503, which took 22 s and 5.6 s before.
+        let probes = [
+            format!("\"{{{}", "\"x\" ".repeat(300_000)),
+            format!("\"{}", "{\"".repeat(300_000)),
+            format!("\"{}", "\\u{".repeat(300_000)),
+            format!("\"{}\"", "}".repeat(300_000)),
+            format!("\"{}\"", "a\r".repeat(300_000)),
+        ];
+        for src in &probes {
+            let (tokens, diags) = lex(src, FILE);
+            assert_eq!(tokens.last().map(|t| t.kind), Some(TokenKind::Eof));
+            assert!(diags.len() <= src.len());
+        }
     }
 
     #[test]
-    fn hostile_input_never_panics() {
+    fn hostile_text_never_panics_or_breaks_the_contract() {
         let samples = [
             "\"",
-            "\"\\",
-            "\"\\u",
-            "\"\\u{",
-            "\"\\u{1",
-            "\"{",
-            "\"{\"",
-            "\"{\"\"",
-            "\"}",
-            "\"{{{",
-            "\"\u{202E}",
-            "\"\\\u{202E}\"",
-            "\"{\\",
-            "\"{\\{",
-            "\"é\\é\"",
+            "\\",
+            "\\u",
+            "\\u{",
+            "\\u{1",
+            "{",
+            "}",
+            "\r",
+            "\r\n",
+            "\\\r",
+            "\u{202E}",
+            "\\\u{202E}",
+            "é\\é",
+            "\\u{é}",
+            "\\u{1\u{202E}}",
+            "\\u{41}\u{FEFF}",
         ];
         for sample in samples {
-            for start in 0..=sample.len() {
-                let literal = scan_string(FILE, sample, start);
-                assert!(literal.span.end as usize <= sample.len(), "{sample:?}");
-                let _ = scan_int(FILE, sample, start);
+            for start in (0..=sample.len()).filter(|&i| sample.is_char_boundary(i)) {
+                let mut diags = Vec::new();
+                let (end, stop) = Literals.string_text(sample, start, FILE, &mut diags);
+                assert!(end >= start && end <= sample.len(), "{sample:?}");
+                assert!(sample.is_char_boundary(end), "{sample:?}");
+                let last = end.checked_sub(1).and_then(|i| sample.as_bytes().get(i));
+                match stop {
+                    TextStop::Quote => assert_eq!(last, Some(&b'"'), "{sample:?}"),
+                    TextStop::Brace => assert_eq!(last, Some(&b'{'), "{sample:?}"),
+                    TextStop::LineEnd => {
+                        let rest = sample.get(end..).unwrap_or("");
+                        assert!(
+                            rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n"),
+                            "{sample:?}"
+                        );
+                    }
+                }
+                for d in &diags {
+                    assert!(d.span.start <= d.span.end && d.span.end as usize <= end);
+                }
+                let _ = Literals.int(sample, start, FILE, &mut diags);
             }
         }
     }
