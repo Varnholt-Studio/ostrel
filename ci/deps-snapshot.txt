@@ -21,4 +21,40 @@
 #        /^checksum = /{c=$3} END{if(n&&s!="-")print n,v,s,c}' Cargo.lock \
 #     | tr -d '"' | LC_ALL=C sort
 #
-# The workspace has no external packages yet, so the list below is empty.
+base64 0.22.1 registry+https://github.com/rust-lang/crates.io-index 72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6
+base64ct 1.8.3 registry+https://github.com/rust-lang/crates.io-index 2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06
+block-buffer 0.10.4 registry+https://github.com/rust-lang/crates.io-index 3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71
+cfg-if 1.0.5 registry+https://github.com/rust-lang/crates.io-index 4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600
+const-oid 0.9.6 registry+https://github.com/rust-lang/crates.io-index c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8
+cpufeatures 0.2.17 registry+https://github.com/rust-lang/crates.io-index 59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280
+crypto-common 0.1.7 registry+https://github.com/rust-lang/crates.io-index 78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a
+curve25519-dalek 4.1.3 registry+https://github.com/rust-lang/crates.io-index 97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be
+curve25519-dalek-derive 0.1.1 registry+https://github.com/rust-lang/crates.io-index f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3
+der 0.7.10 registry+https://github.com/rust-lang/crates.io-index e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb
+digest 0.10.7 registry+https://github.com/rust-lang/crates.io-index 9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292
+ed25519 2.2.3 registry+https://github.com/rust-lang/crates.io-index 115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53
+ed25519-dalek 2.2.0 registry+https://github.com/rust-lang/crates.io-index 70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9
+fiat-crypto 0.2.9 registry+https://github.com/rust-lang/crates.io-index 28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d
+generic-array 0.14.7 registry+https://github.com/rust-lang/crates.io-index 85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a
+getrandom 0.2.17 registry+https://github.com/rust-lang/crates.io-index ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0
+libc 0.2.190 registry+https://github.com/rust-lang/crates.io-index ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78
+pkcs8 0.10.2 registry+https://github.com/rust-lang/crates.io-index f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7
+proc-macro2 1.0.107 registry+https://github.com/rust-lang/crates.io-index 985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9
+quote 1.0.47 registry+https://github.com/rust-lang/crates.io-index 1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001
+rand_core 0.6.4 registry+https://github.com/rust-lang/crates.io-index ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c
+rustc_version 0.4.1 registry+https://github.com/rust-lang/crates.io-index cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92
+semver 1.0.28 registry+https://github.com/rust-lang/crates.io-index 8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd
+serde 1.0.229 registry+https://github.com/rust-lang/crates.io-index 4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba
+serde_core 1.0.229 registry+https://github.com/rust-lang/crates.io-index 67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48
+serde_derive 1.0.229 registry+https://github.com/rust-lang/crates.io-index e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348
+sha2 0.10.9 registry+https://github.com/rust-lang/crates.io-index a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283
+signature 2.2.0 registry+https://github.com/rust-lang/crates.io-index 77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de
+spki 0.7.3 registry+https://github.com/rust-lang/crates.io-index d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d
+subtle 2.6.1 registry+https://github.com/rust-lang/crates.io-index 13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292
+syn 2.0.119 registry+https://github.com/rust-lang/crates.io-index 872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297
+syn 3.0.6 registry+https://github.com/rust-lang/crates.io-index 8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee
+typenum 1.20.1 registry+https://github.com/rust-lang/crates.io-index b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20
+unicode-ident 1.0.26 registry+https://github.com/rust-lang/crates.io-index d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954
+version_check 0.9.5 registry+https://github.com/rust-lang/crates.io-index 0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a
+wasi 0.11.1+wasi-snapshot-preview1 registry+https://github.com/rust-lang/crates.io-index ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b
+zeroize 1.9.0 registry+https://github.com/rust-lang/crates.io-index e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e
