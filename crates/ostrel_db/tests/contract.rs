@@ -32,13 +32,16 @@ struct State {
     ops: Vec<StoredOp>,
     seqs: BTreeMap<String, u64>,
     schema: Option<AppliedSchema>,
-    /// Declaration order per enum column, from the applied plan.
-    enums: BTreeMap<(ModelId, FieldId), Vec<String>>,
+    /// Enum columns with their declaration order, from the applied plan.
+    enums: Vec<EnumColumn>,
 }
 
 impl State {
     fn variants(&self, model: ModelId, field: FieldId) -> Option<&[String]> {
-        self.enums.get(&(model, field)).map(Vec::as_slice)
+        self.enums
+            .iter()
+            .find(|c| c.model == model && c.field == field)
+            .map(|c| c.variants.as_slice())
     }
 }
 
@@ -284,7 +287,7 @@ fn compare_pos(s: &State, q: &Query, a: (&[Value], RowId), b: (&[Value], RowId))
 }
 
 fn scan(s: &State, q: &Query) -> Result<Rows, DbError> {
-    q.check()?;
+    q.check(&s.enums)?;
     let mut rows: Vec<Row> = Vec::new();
     for (id, r) in &s.rows {
         if r.model != q.model || r.deleted {
@@ -485,11 +488,7 @@ impl Connection for FixtureConn {
                 hash: p.to,
                 schema: p.schema.clone(),
             });
-            self.state.enums = p
-                .enums
-                .iter()
-                .map(|c| ((c.model, c.field), c.variants.clone()))
-                .collect();
+            self.state.enums = p.enums.clone();
             Ok(())
         })
     }
@@ -1265,9 +1264,9 @@ fn query_check_bounds_filter_size_hops_and_cursor() {
     let leaf = || Expr::Const(Value::Bool(true));
     let and = |n| Expr::And((0..n).map(|_| leaf()).collect());
     // The And node counts too.
-    assert_eq!(filtered(1, and(MAX_FILTER_NODES - 1)).check(), Ok(()));
+    assert_eq!(filtered(1, and(MAX_FILTER_NODES - 1)).check(&[]), Ok(()));
     assert!(matches!(
-        filtered(1, and(MAX_FILTER_NODES)).check(),
+        filtered(1, and(MAX_FILTER_NODES)).check(&[]),
         Err(DbError::Invalid(_))
     ));
     // A deep chain is refused without walking it recursively.
@@ -1276,7 +1275,7 @@ fn query_check_bounds_filter_size_hops_and_cursor() {
         deep = Expr::Not(Box::new(deep));
     }
     assert!(matches!(
-        filtered(1, deep).check(),
+        filtered(1, deep).check(&[]),
         Err(DbError::Invalid(_))
     ));
 
@@ -1286,9 +1285,9 @@ fn query_check_bounds_filter_size_hops_and_cursor() {
             field: 0,
         })
     };
-    assert_eq!(filtered(1, hops(2)).check(), Ok(()));
+    assert_eq!(filtered(1, hops(2)).check(&[]), Ok(()));
     assert!(matches!(
-        filtered(1, hops(3)).check(),
+        filtered(1, hops(3)).check(&[]),
         Err(DbError::Invalid(_))
     ));
     let deep_set = Expr::InSet {
@@ -1299,15 +1298,15 @@ fn query_check_bounds_filter_size_hops_and_cursor() {
         },
     };
     assert!(matches!(
-        filtered(1, deep_set).check(),
+        filtered(1, deep_set).check(&[]),
         Err(DbError::Invalid(_))
     ));
     assert!(matches!(
-        filtered(1, Expr::Const(Value::List(vec![]))).check(),
+        filtered(1, Expr::Const(Value::List(vec![]))).check(&[]),
         Err(DbError::Invalid(_))
     ));
     assert!(matches!(
-        filtered(1, Expr::Coalesce(field(0), Value::Set(vec![]))).check(),
+        filtered(1, Expr::Coalesce(field(0), Value::Set(vec![]))).check(&[]),
         Err(DbError::Invalid(_))
     ));
 
@@ -1318,9 +1317,9 @@ fn query_check_bounds_filter_size_hops_and_cursor() {
         }),
         ..sorted(1, vec![(0, Dir::Asc)])
     };
-    assert_eq!(cursor(1).check(), Ok(()));
-    assert!(matches!(cursor(0).check(), Err(DbError::Invalid(_))));
-    assert!(matches!(cursor(2).check(), Err(DbError::Invalid(_))));
+    assert_eq!(cursor(1).check(&[]), Ok(()));
+    assert!(matches!(cursor(0).check(&[]), Err(DbError::Invalid(_))));
+    assert!(matches!(cursor(2).check(&[]), Err(DbError::Invalid(_))));
 
     let mut conn = connect();
     assert!(matches!(
@@ -1663,6 +1662,78 @@ fn rows_sort_enums_by_declaration_and_bytes_bytewise_unlike_collections() {
         assert!(conn.query(&filtered(1, consts)).await.unwrap().0.is_empty());
         let lt = filtered(1, Expr::Cmp(CmpOp::Lt, field(1), konst(hi.clone())));
         assert_eq!(ids(conn.query(&lt).await.unwrap()), [2, 3]);
+    });
+}
+
+#[test]
+fn comparing_enum_columns_with_different_variants_is_invalid() {
+    // Model 1 field 0 and field 3 have different variant lists; model 2 field 0 has the same
+    // list as model 1 field 0 and is reached through the reference field 5 of model 1.
+    let mut enums = enum_plan().enums;
+    enums.push(EnumColumn {
+        model: 2,
+        field: 0,
+        variants: strings(&["backlog", "todo", "done"]),
+    });
+    let get = |f| {
+        Box::new(Expr::MapGet {
+            map: Path {
+                hops: vec![],
+                field: f,
+            },
+            key: konst(Value::Ref(rid(9))),
+        })
+    };
+    let hop = Box::new(Expr::Field(Path {
+        hops: vec![Hop { field: 5, model: 2 }],
+        field: 0,
+    }));
+    let nested =
+        |e: Box<Expr>, n: usize| (0..n).fold(e, |e, _| Box::new(Expr::Coalesce(e, Value::Null)));
+    let invalid = [
+        Expr::Cmp(CmpOp::Lt, field(0), get(3)),
+        Expr::Cmp(CmpOp::Eq, get(3), field(0)),
+        Expr::Cmp(CmpOp::Ge, nested(field(0), 3), nested(get(3), 2)),
+        Expr::Not(Box::new(Expr::Cmp(CmpOp::Gt, hop.clone(), get(3)))),
+    ];
+    for e in invalid {
+        assert!(
+            matches!(
+                filtered(1, e.clone()).check(&enums),
+                Err(DbError::Invalid(_))
+            ),
+            "{e:?}"
+        );
+        // Without the enum columns of the schema there is nothing to refuse.
+        assert_eq!(filtered(1, e).check(&[]), Ok(()));
+    }
+    let valid = [
+        // Same variant list on both sides: compared by ordinal.
+        Expr::Cmp(CmpOp::Lt, field(0), hop.clone()),
+        Expr::Cmp(CmpOp::Lt, field(0), field(0)),
+        // One side only names an enum column.
+        Expr::Cmp(CmpOp::Lt, field(0), konst(en("todo"))),
+        Expr::Cmp(CmpOp::Lt, get(3), field(1)),
+        // Queried on model 2: field 0 is an enum column there, field 3 is not.
+        Expr::Cmp(CmpOp::Lt, field(0), get(3)),
+    ];
+    for (i, e) in valid.into_iter().enumerate() {
+        let model = if i == 4 { 2 } else { 1 };
+        assert_eq!(filtered(model, e.clone()).check(&enums), Ok(()), "{e:?}");
+    }
+    // A Coalesce chain longer than the node limit fails the node limit, not the enum rule.
+    let long = Expr::Cmp(CmpOp::Lt, nested(field(0), MAX_FILTER_NODES + 1), get(3));
+    assert_eq!(
+        filtered(1, long).check(&enums),
+        Err(DbError::Invalid("filter has too many nodes"))
+    );
+
+    // The driver refuses the query before it reads anything.
+    let mut conn = connect();
+    block_on(async {
+        conn.migrate(&enum_plan()).await.unwrap();
+        let q = filtered(1, Expr::Cmp(CmpOp::Lt, field(0), get(3)));
+        assert!(matches!(conn.query(&q).await, Err(DbError::Invalid(_))));
     });
 }
 

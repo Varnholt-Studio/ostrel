@@ -17,7 +17,9 @@
 //! * Enum typed columns are the ones listed in [`MigrationPlan::enums`] of the applied schema.
 //!   A write that puts a value other than a declared variant name (or `Null`) into such a
 //!   column, or into the value of such a `Map` field, fails with [`DbError::Invalid`] and
-//!   changes nothing.
+//!   changes nothing. `Set` elements and `Map` keys of an enum type are not checked against
+//!   the variants: the driver stores them as names (D79) and takes them as `ostrel_sync` hands
+//!   them over (D87).
 //! * After a transaction method returned an error, the caller rolls the transaction back. A
 //!   driver may refuse every further call except [`Transaction::rollback`].
 //! * Dropping a transaction without commit has the effect of a rollback.
@@ -159,7 +161,8 @@ pub enum MigrationStep {}
 /// compares `from` with the hash stored by the last successful migration (`None` for a
 /// database that was never migrated). If they differ it returns [`DbError::SchemaMismatch`]
 /// and changes nothing. Otherwise it runs every step and stores `to`, `schema` and `enums` in
-/// one transaction, so that [`Connection::applied_schema`] returns them. A plan with
+/// one transaction, so that [`Connection::applied_schema`] returns them; a new connection loads
+/// the stored `enums` (D87). A plan with
 /// `from == Some(to)` and no steps succeeds without changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MigrationPlan {

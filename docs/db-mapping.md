@@ -87,8 +87,13 @@ compile to an indexable integer comparison. The wire format keeps the variant na
 `MigrationPlan.enums` (`EnumColumn`: model, field, variants in declaration order), which lists
 every enum column and every `Map` field with an enum value type of the target schema; the adapter
 never parses the schema JSON for it (D79). A write with a value that is not a declared variant of
-its column fails with `DbError::Invalid`. Table `ostrel_enums` (section 4) lists every ordinal with
-its name, so the adapter can map names after a restart and readers of the file can decode them.
+its column fails with `DbError::Invalid`. Table `ostrel_enums` (section 4) stores these enum
+columns with every ordinal and name, written in the same transaction as `ostrel_schema`; the
+adapter loads it when it connects, so it maps names after a restart, and readers of the file can
+decode the ordinals (D87). A query that compares two enum columns with different variant lists
+is refused by `Query::check` with `DbError::Invalid`; equal lists compare by ordinal (D87).
+`Set` elements and `Map` keys of an enum type are stored as names and not checked against the
+variants (D87).
 
 ### 2.3 Implicit fields
 
@@ -305,12 +310,14 @@ CREATE TABLE ostrel_schema (
   applied_at INTEGER NOT NULL
 ) STRICT;
 
--- Enum ordinals with their names, for people reading the file.
+-- Enum columns of the applied schema (MigrationPlan.enums) with ordinals and names. Written in
+-- the same transaction as ostrel_schema and loaded on connect (D87).
 CREATE TABLE ostrel_enums (
-  enum    TEXT    NOT NULL,
+  model   INTEGER NOT NULL,
+  field   INTEGER NOT NULL,
   ordinal INTEGER NOT NULL,
   name    TEXT    NOT NULL,
-  PRIMARY KEY (enum, ordinal)
+  PRIMARY KEY (model, field, ordinal)
 ) STRICT, WITHOUT ROWID;
 ```
 

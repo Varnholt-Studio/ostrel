@@ -21,7 +21,7 @@
 //! ```
 //!
 //! [`run_dir`] takes a [`Fresh`] closure that must return a connection to a new, empty
-//! database for every call; the harness migrates it and runs one case on it. Connections of one
+//! database for every call; the harness migrates it with [`case_plan`] and runs one case on it. Connections of one
 //! driver share a database, so [`new_driver_per_case`] builds a new driver for every case. A
 //! driver whose futures wait on I/O runs `run_dir` on its own runtime instead of [`block_on`].
 //! The tests of the harness itself (`selftest.rs`) run in every test target that includes it.
@@ -37,7 +37,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::task::{Context, Poll, Waker};
 
-use ostrel_db::api::{BoxFuture, Connection, DbError, Driver, MigrationPlan, Row, Value};
+use ostrel_db::api::{
+    BoxFuture, Connection, DbError, Driver, MigrationPlan, Row, SchemaHash, Value,
+};
 
 use cases::{Action, Case, Expect};
 
@@ -152,6 +154,18 @@ pub async fn run_dir(dir: &Path, fresh: &Fresh<'_>) -> Report {
     report
 }
 
+/// The plan every case database is migrated with: from a new database to a schema without
+/// enum columns. The case files need nothing else from the schema.
+pub fn case_plan() -> MigrationPlan {
+    MigrationPlan {
+        from: None,
+        to: SchemaHash([0; 32]),
+        schema: "{}".to_string(),
+        enums: Vec::new(),
+        steps: Vec::new(),
+    }
+}
+
 /// Runs the cases of one file and adds the outcome to `report`.
 pub async fn run_text(file: &str, text: &str, fresh: &Fresh<'_>, report: &mut Report) {
     report.files.push(file.to_string());
@@ -182,7 +196,7 @@ async fn run_case(case: &Case, fresh: &Fresh<'_>) -> Vec<(usize, String)> {
         Ok(c) => c,
         Err(e) => return vec![(0, format!("connect failed with {e:?}"))],
     };
-    if let Err(e) = conn.migrate(&MigrationPlan::default()).await {
+    if let Err(e) = conn.migrate(&case_plan()).await {
         return vec![(0, format!("migrate failed with {e:?}"))];
     }
     for (i, step) in case.steps.iter().enumerate() {
@@ -247,7 +261,7 @@ async fn run_tx(
 /// Compares returned rows with the expected rows in order; fields as a map by `FieldId`.
 fn compare_rows(got: &[Row], want: &[Row]) -> Option<String> {
     if got.len() != want.len() {
-        let ids: Vec<u128> = got.iter().map(|r| r.id.0).collect();
+        let ids: Vec<u128> = got.iter().map(|r| r.id.as_u128()).collect();
         return Some(format!(
             "expected {} rows, got {} (ids {})",
             want.len(),
@@ -259,7 +273,18 @@ fn compare_rows(got: &[Row], want: &[Row]) -> Option<String> {
         if g.id != w.id || g.version != w.version {
             return Some(format!(
                 "row {k}: expected id {} version {}, got id {} version {}",
-                w.id.0, w.version, g.id.0, g.version
+                w.id.as_u128(),
+                w.version,
+                g.id.as_u128(),
+                g.version
+            ));
+        }
+        if g.collections != w.collections {
+            return Some(format!(
+                "row {k} (id {}): expected collections {}, got {}",
+                w.id.as_u128(),
+                show(&format!("{:?}", w.collections)),
+                show(&format!("{:?}", g.collections))
             ));
         }
         let mut seen = BTreeSet::new();
@@ -272,7 +297,7 @@ fn compare_rows(got: &[Row], want: &[Row]) -> Option<String> {
         if gf.len() != w.fields.len() || gf.iter().zip(&w.fields).any(|(a, b)| *a != b) {
             return Some(format!(
                 "row {k} (id {}): expected fields {}, got {}",
-                w.id.0,
+                w.id.as_u128(),
                 show(&format!("{:?}", w.fields)),
                 show(&format!("{gf:?}"))
             ));

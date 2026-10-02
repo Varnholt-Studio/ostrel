@@ -19,7 +19,9 @@
 //! An ordered comparison ([`CmpOp::Lt`] and the others) of two enum values uses the declaration
 //! order of the enum column on one side: an [`Expr::Field`] or [`Expr::MapGet`] of an enum
 //! column, also inside [`Expr::Coalesce`]. It is false when no side names an enum column or a
-//! value is not a variant of that column, like a comparison with `Null`. The planner never
+//! value is not a variant of that column, like a comparison with `Null`. When both sides name
+//! enum columns, [`Query::check`] refuses the query with [`DbError::Invalid`] unless both
+//! columns have the same variant list, which then gives the order (D87). The planner never
 //! emits such a comparison; the rule only makes the result defined.
 //!
 //! # Filter semantics
@@ -31,7 +33,7 @@
 //! model (the reference is `Null`, the row was deleted or never existed) makes the whole filter
 //! false for that row, also under `Not` and `Or` (fail closed, docs/db-mapping.md A5).
 
-use super::{DbError, FieldId, ModelId, RowId, Value};
+use super::{DbError, EnumColumn, FieldId, ModelId, RowId, Value};
 
 /// Largest number of [`Expr`] nodes in one filter (ARCHITECTURE 5.9, "Filter size").
 pub const MAX_FILTER_NODES: usize = 64;
@@ -151,9 +153,11 @@ impl Query {
     }
 
     /// Checks the rules a driver must not have to guess about: at most [`MAX_FILTER_NODES`]
-    /// filter nodes, at most [`MAX_HOPS`] hops per path, no collection constants, and one
-    /// cursor value per sort key.
-    pub fn check(&self) -> Result<(), DbError> {
+    /// filter nodes, at most [`MAX_HOPS`] hops per path, no collection constants, one cursor
+    /// value per sort key, and no comparison of two enum columns with different variant lists
+    /// (D87). `enums` are the enum columns of the applied schema
+    /// ([`MigrationPlan::enums`](super::MigrationPlan::enums)).
+    pub fn check(&self, enums: &[EnumColumn]) -> Result<(), DbError> {
         if let Some(cursor) = &self.after
             && cursor.values.len() != self.order.len()
         {
@@ -180,6 +184,17 @@ impl Query {
                 Expr::Field(p) => check_hops(&p.hops)?,
                 Expr::RowId(hops) => check_hops(hops)?,
                 Expr::Cmp(_, a, b) => {
+                    let sides = (
+                        enum_column(self.model, a, enums),
+                        enum_column(self.model, b, enums),
+                    );
+                    if let (Some(x), Some(y)) = sides
+                        && x != y
+                    {
+                        return Err(DbError::Invalid(
+                            "comparison of enum columns with different variants",
+                        ));
+                    }
                     stack.push(a);
                     stack.push(b);
                 }
@@ -208,4 +223,26 @@ fn check_hops(hops: &[Hop]) -> Result<(), DbError> {
         return Err(DbError::Invalid("path has too many hops"));
     }
     Ok(())
+}
+
+/// Variants of the enum column an operand names: an [`Expr::Field`] or [`Expr::MapGet`] of an
+/// enum column, also inside [`Expr::Coalesce`]. The walk stops after [`MAX_FILTER_NODES`]
+/// steps; a longer chain fails the node limit anyway.
+fn enum_column<'e>(model: ModelId, e: &Expr, enums: &'e [EnumColumn]) -> Option<&'e [String]> {
+    let lookup = |p: &Path| {
+        let model = p.hops.last().map_or(model, |h| h.model);
+        enums
+            .iter()
+            .find(|c| c.model == model && c.field == p.field)
+            .map(|c| c.variants.as_slice())
+    };
+    let mut e = e;
+    for _ in 0..MAX_FILTER_NODES {
+        match e {
+            Expr::Coalesce(inner, _) => e = inner,
+            Expr::Field(p) | Expr::MapGet { map: p, .. } => return lookup(p),
+            _ => return None,
+        }
+    }
+    None
 }
