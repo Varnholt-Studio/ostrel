@@ -10,10 +10,12 @@ import { encode } from '../../runtime/js/crdt/canon/canon.mjs';
 export const VECTOR_ROOT = dirname(fileURLToPath(import.meta.url));
 
 /** Strategy directories that hold op vectors. `canon/` has its own format. */
-export const STRATEGIES = ['lww', 'set', 'map'];
+export const STRATEGIES = ['lww', 'set', 'map', 'rank'];
 
 const OP_ID = /^[0-9a-f]{24}$/;
 const HLC = /^[0-9a-f]{32}$/;
+const ROW_ID = /^[0-9a-f]{32}$/;
+const RANK_KEY = /^[0-9A-Za-z]*[1-9A-Za-z]$/; // runtime/js/crdt/rank/rank.mjs
 const MAX_TAGS_PER_REMOVE = 64; // ARCHITECTURE 5.9
 const VECTOR_FIELDS = ['deliveries', 'description', 'expect', 'ops', 'strategy'];
 
@@ -51,6 +53,7 @@ export function validateVector(vector, strategy) {
   checkDeliveries(vector.deliveries, vector.ops.length);
   checkExpect(vector.expect);
   if (strategy === 'set') checkSetCausality(vector.ops, vector.deliveries);
+  if (strategy === 'rank') checkRankOps(vector.ops);
 }
 
 function checkOps(ops) {
@@ -135,6 +138,23 @@ function checkSetCausality(ops, deliveries) {
           throw new Error(`deliveries[${number}] delivers ${late}`);
         }
       });
+    }
+  });
+}
+
+// A rank op writes the key of one row: `{ "set": [row, key] }` with a RowId and a valid key.
+function checkRankOps(ops) {
+  ops.forEach(({ op }, index) => {
+    const where = `ops[${index}]`;
+    if (Object.keys(op).join() !== 'set' || !Array.isArray(op.set) || op.set.length !== 2) {
+      throw new Error(`${where} must be { "set": [row, key] }`);
+    }
+    const [row, key] = op.set;
+    if (typeof row !== 'string' || !ROW_ID.test(row)) {
+      throw new Error(`${where}: row is not a 32 digit lowercase hex RowId`);
+    }
+    if (typeof key !== 'string' || !RANK_KEY.test(key)) {
+      throw new Error(`${where}: "${key}" is not a rank key (base 62 digits, no trailing 0)`);
     }
   });
 }

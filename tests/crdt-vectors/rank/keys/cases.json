@@ -1,0 +1,19 @@
+{
+  "cases": [
+    { "name": "empty list", "before": null, "after": null, "key": "V" },
+    { "name": "after the last key", "before": "V", "after": null, "key": "l" },
+    { "name": "before the first key", "before": null, "after": "V", "key": "G" },
+    { "name": "middle digit of a gap", "before": "a", "after": "c", "key": "b" },
+    { "name": "adjacent digits add a digit", "before": "V", "after": "W", "key": "VV" },
+    { "name": "after the last digit", "before": "z", "after": null, "key": "zV" },
+    { "name": "before the smallest one digit key", "before": null, "after": "1", "key": "0V" },
+    { "name": "shared prefix is kept", "before": "a", "after": "a1", "key": "a0V" },
+    { "name": "longer upper bound leaves room at its first digit", "before": "V", "after": "W1", "key": "W" },
+    { "name": "longer lower bound", "before": "Vz", "after": "W", "key": "VzV" },
+    { "name": "equal bounds", "before": "a", "after": "a", "error": "InvalidRank" },
+    { "name": "bounds in the wrong order", "before": "b", "after": "a", "error": "InvalidRank" },
+    { "name": "trailing zero", "before": "a0", "after": null, "error": "InvalidRank" },
+    { "name": "empty key", "before": null, "after": "", "error": "InvalidRank" },
+    { "name": "character outside the digits", "before": "a-", "after": null, "error": "InvalidRank" }
+  ]
+}

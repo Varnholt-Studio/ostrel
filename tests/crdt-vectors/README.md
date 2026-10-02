@@ -14,12 +14,14 @@ the output of an implementation.
 | `lww/` | Last writer wins register, the default merge of every scalar field |
 | `set/` | `Set[T]`: add wins observed remove set with add tags (D49) |
 | `map/` | `Map[K, V]`: last writer wins per key, with tombstones (G6) |
+| `rank/` | `Rank`: fractional index keys of the rows of one list, last writer wins per row (G6) |
+| `rank/keys/cases.json` | Fixed results of `keyBetween`, so every implementation creates the same keys |
 | `canon/cases.json` | Canonical JSON encoding and the hex form of ids (ARCHITECTURE 5.3) |
 | `format.mjs` | Loader and validator for the op vectors |
-| `oracle.mjs` | Minimal reference models for `lww` and `set` until their runtime modules land |
+| `oracle.mjs` | Minimal reference models for `lww`, `set` and `rank`, independent of the runtime |
 | `*.test.mjs` | JavaScript runners, part of the gate (`ci/checks/50_tests.sh`) |
 
-Planned, not yet present: `rank/` (fractional index) and `text/` (collaborative plain text, D11).
+Planned, not yet present: `text/` (collaborative plain text, D11).
 
 ## Op vectors
 
@@ -57,10 +59,25 @@ A runner creates a fresh replica per delivery, applies the ops in that order and
 | `lww` | `{"set": v}` | `v` of the highest `Hlc` | `{"hlc": h, "value": v}` |
 | `set` | `{"add": e}` or `{"remove": e, "tags": [OpId, ...]}` | live elements | `[[e, [tag, ...]], ...]` for live elements, tags sorted |
 | `map` | `{"put": [k, v]}` or `{"remove": k}` | `[[k, v], ...]` for live keys | `[[k, {"hlc": h, "value": v}], ...]` or `{"hlc": h, "removed": true}` for a tombstone |
+| `rank` | `{"set": [row, key]}` | row ids in list order | `[[row, {"hlc": h, "rank": key}], ...]` in list order |
 
-Elements and keys are ordered by their canonical encoding, compared by Unicode code point
-(which equals UTF-8 byte order, D50). For text this puts U+FF01 before U+1F600, unlike the
-default JavaScript sort.
+Set elements and map keys are ordered by their wire value, not by their canonical encoding
+(D61, `compareKey` in `runtime/js/crdt/canon/`): booleans before numbers before strings,
+`false` before `true`, numbers numerically, strings by Unicode code point (which equals UTF-8
+byte order, D50). So 9 comes before 10, U+0001 and `"` come before `A`, and U+FF01 comes before
+U+1F600, unlike the default JavaScript sort.
+
+### Rules for `rank` vectors
+
+A `Rank` key is a non empty string of the base 62 digits `0-9A-Za-z` that does not end in `0`,
+read as a fraction (`runtime/js/crdt/rank/rank.mjs`). Rows are ordered by key, compared by code
+point, and rows with equal keys by row id (`RowId`, 32 lowercase hex digits). Per row, the
+write with the highest `Hlc` wins. The validator refuses an op that is not
+`{"set": [row, key]}` with a valid row id and key.
+
+`rank/keys/cases.json` holds a list of `{name, before, after, key}` (or `error` instead of
+`key`): `keyBetween(before, after)` must return exactly `key`, where `null` stands for the start
+or the end of the list.
 
 ### Rules for `set` vectors
 
@@ -91,6 +108,10 @@ and `state()`. Add it to `MODELS` in `vectors.test.mjs`. When the runtime module
 lands, it runs next to the oracle, so both are checked against the same expectations.
 
 ## Open points
+
+* The `rank` op body and the list model are assumed: the wire form of a `Rank` field write
+  comes from the protocol stub (T25), and the vectors follow it. Keys grow by about one digit every
+  five appends at the same end of a list; a length limit or rebalancing is not decided.
 
 * The op body shapes above follow the wire forms in ARCHITECTURE 5.1 and 6.2. The protocol stub
   (T25, `ostrel_sync::protocol`) is the authority; if it differs, the vectors follow it.
