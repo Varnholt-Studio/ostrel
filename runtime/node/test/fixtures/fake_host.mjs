@@ -1,8 +1,11 @@
 // Minimal stand in for a sidecar host, used only to test the harness itself. Each request's
-// `method` selects a behaviour; it implements none of the real host's checks.
+// `method` selects a behaviour; it implements none of the real host's checks. Like the real host
+// it announces itself with a `ready` notification and echoes its command line arguments there.
 import { createInterface } from 'node:readline';
 
 const out = (text) => process.stdout.write(text);
+
+out(`${JSON.stringify({ jsonrpc: '2.0', method: 'ready', params: { argv: process.argv.slice(2) } })}\n`);
 
 createInterface({ input: process.stdin }).on('line', (line) => {
   const req = JSON.parse(line);
@@ -21,6 +24,10 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       break;
     case 'oversized':
       out(`"${'y'.repeat(req.params.bytes)}"\n`);
+      break;
+    case 'notify':
+      out(`${JSON.stringify({ jsonrpc: '2.0', method: 'note', params: req.params })}\n`);
+      out(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 'notified' })}\n`);
       break;
     case 'silent':
       break;

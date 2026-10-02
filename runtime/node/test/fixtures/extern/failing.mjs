@@ -78,3 +78,37 @@ export function readsOutsideExternDir() {
 export function envKeys() {
   return Object.keys(process.env);
 }
+
+export function returnsUndefined() {
+  return undefined;
+}
+
+export function settlesAfter(ms, value) {
+  return new Promise((resolve) => setTimeout(() => resolve(value), ms));
+}
+
+// A value whose JSON text doubles with every level because both members share one child.
+// Depth 26 is about 67 million values per path, far over the value budget of 7.2.
+export function dagResult(depth) {
+  let node = 0;
+  for (let i = 0; i < depth; i++) node = { a: node, b: node };
+  return node;
+}
+
+export function sparseResult() {
+  return [1, , 3];
+}
+
+export function dateResult() {
+  return new Date(0);
+}
+
+export function loneSurrogateResult() {
+  return '\ud800';
+}
+
+export function negativeZero() {
+  return -0;
+}
+
+export const notAFunction = 1;

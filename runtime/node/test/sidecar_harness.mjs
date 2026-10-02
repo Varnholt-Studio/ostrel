@@ -1,27 +1,60 @@
-// Test harness for the Node sidecar host (ARCHITECTURE 7.2).
+// Test harness for the Node sidecar host (ARCHITECTURE 7.2, D60).
 //
-// Spawns a host script the way the server is expected to start it: an empty environment,
-// Node's permission model with read access limited to the extern directory, and JSON-RPC 2.0
-// framed as one JSON object per line on stdin and stdout.
+// Spawns a host script the way the server starts it: an empty environment, Node's permission
+// model with read access limited to the extern directory, one `--module <name>=<absolute path>`
+// per extern module, and JSON-RPC 2.0 framed as one JSON object per line on stdin and stdout:
 //
-// ASSUMPTION (T48, to be confirmed by T30 and the F3 sidecar RPC schema): the host is started as
-//   node --permission --allow-fs-read=<externDir> host.mjs <externDir>
-// (the command line of ARCHITECTURE 7.2 plus the extern directory as argument)
-// and an extern call is the request
-//   {"jsonrpc":"2.0","id":<n>,"method":"call","params":{"module":<file>,"export":<name>,"args":[...]}}
-// where <file> is resolved inside <externDir>. Every request shape used by the tests is built by
-// `callRequest` below, so a change of the schema is a change in one place.
+//   node --permission --allow-fs-read=<externDir> host.mjs --module <name>=<path> [...]
+//
+// Every message the tests send is built by the functions below, so a change of the wire schema
+// is a change in one place. Notifications from the host (the `ready` line) are kept apart from
+// answers, so counting answers never counts `ready`.
 
 import { spawn } from 'node:child_process';
 
 export const MAX_MESSAGE_BYTES = 1024 * 1024;
+export const MAX_OPEN_CALLS = 64;
+export const PROTOCOL_VERSION = 1;
 
-export function callRequest(id, module, exportName, args = []) {
-  return { jsonrpc: '2.0', id, method: 'call', params: { module, export: exportName, args } };
+export const Codes = Object.freeze({
+  PARSE_ERROR: -32700,
+  INVALID_REQUEST: -32600,
+  METHOD_NOT_FOUND: -32601,
+  INVALID_PARAMS: -32602,
+  EXTERN_ERROR: -32000,
+});
+
+export function request(id, method, params) {
+  const message = { jsonrpc: '2.0', id, method };
+  if (params !== undefined) message.params = params;
+  return message;
 }
 
-// Splits a byte stream into lines. Lines longer than `maxBytes` are not kept in memory: they are
-// reported once with their length so a test can assert on oversized output without buffering it.
+export function notification(method, params) {
+  const message = { jsonrpc: '2.0', method };
+  if (params !== undefined) message.params = params;
+  return message;
+}
+
+export function pingRequest(id) {
+  return request(id, 'ping');
+}
+
+export function callRequest(id, module, fn, args = []) {
+  return request(id, 'call', { module, fn, args });
+}
+
+export function cancelNotification(id) {
+  return notification('cancel', { id });
+}
+
+// Command line arguments after the host script for a map of module name to absolute path.
+export function moduleArgs(modules) {
+  const args = [];
+  for (const [name, path] of Object.entries(modules)) args.push('--module', `${name}=${path}`);
+  return args;
+}
+
 export class LineSplitter {
   constructor(onLine, onOversized, maxBytes = MAX_MESSAGE_BYTES) {
     this.onLine = onLine;
@@ -72,9 +105,13 @@ export class LineSplitter {
 }
 
 export class Sidecar {
-  constructor(hostPath, externDir, { extraArgs = [], responseTimeoutMs = 3000 } = {}) {
+  // `hostArgs` are passed after the host script; use `moduleArgs` to build them.
+  constructor(hostPath, externDir, hostArgs = [], { responseTimeoutMs = 3000 } = {}) {
     this.responseTimeoutMs = responseTimeoutMs;
+    // Every parsed stdout line in arrival order, `answers` only those with an id member.
     this.lines = [];
+    this.answers = [];
+    this.notifications = [];
     this.badLines = [];
     this.oversized = [];
     this.stderr = '';
@@ -82,9 +119,8 @@ export class Sidecar {
     const nodeArgs = [
       '--permission',
       `--allow-fs-read=${externDir}`,
-      ...extraArgs,
       hostPath,
-      externDir,
+      ...hostArgs,
     ];
     this.child = spawn(process.execPath, nodeArgs, { env: {}, stdio: ['pipe', 'pipe', 'pipe'] });
     this.splitter = new LineSplitter(
@@ -110,10 +146,19 @@ export class Sidecar {
   }
 
   onLine(line) {
+    let message;
     try {
-      this.lines.push(JSON.parse(line));
+      message = JSON.parse(line);
     } catch {
       this.badLines.push(line);
+      this.notify();
+      return;
+    }
+    this.lines.push(message);
+    if (message !== null && typeof message === 'object' && Object.hasOwn(message, 'id')) {
+      this.answers.push(message);
+    } else {
+      this.notifications.push(message);
     }
     this.notify();
   }
@@ -156,12 +201,30 @@ export class Sidecar {
   }
 
   response(id, timeoutMs) {
-    return this.waitFor(() => this.lines.find((m) => m && m.id === id), `response id ${id}`, timeoutMs);
+    return this.waitFor(() => this.answers.find((m) => m.id === id), `response id ${id}`, timeoutMs);
   }
 
-  async call(id, module, exportName, args = [], timeoutMs = undefined) {
-    this.send(callRequest(id, module, exportName, args));
+  // Resolves with the `ready` notification the host sends once all modules are loaded.
+  ready(timeoutMs) {
+    return this.waitFor(
+      () => this.notifications.find((m) => m?.method === 'ready'),
+      'ready notification',
+      timeoutMs,
+    );
+  }
+
+  async call(id, module, fn, args = [], timeoutMs = undefined) {
+    this.send(callRequest(id, module, fn, args));
     return this.response(id, timeoutMs);
+  }
+
+  async ping(id, timeoutMs = undefined) {
+    this.send(pingRequest(id));
+    return this.response(id, timeoutMs);
+  }
+
+  cancel(id) {
+    this.send(cancelNotification(id));
   }
 
   // Waits for `ms` and reports whether the host is still running.
