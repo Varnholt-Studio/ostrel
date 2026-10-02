@@ -1,10 +1,10 @@
 // CallDepth (SPEC 12.4): main is frame 1, so down(9998) holds exactly 10 000 frames and
 // runs; down(9999) needs frame 10 001, which the recursive call in down(1) would create.
+// down(0) makes no call, so the base case needs no bare `return` (D90, #917).
 
 fn down(n: Int)
-  if n == 0
-    return
-  down(n - 1)
+  if n > 0
+    down(n - 1)
 
 fn main()
   print("start")

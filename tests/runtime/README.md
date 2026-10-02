@@ -32,7 +32,7 @@ to this directory says otherwise. `examples/v0_1/` holds only programs that exit
 | IntOverflow | `int_overflow_mul_in_callee` | 5:3 | product far beyond 64 bits, reported in the callee |
 | DivisionByZero | `division_by_zero` | 4:3 | `/` with a negative dividend, reported in the callee |
 | DivisionByZero | `remainder_by_zero` | 4:3 | `%`, including `0 % 0` |
-| CallDepth | `call_depth_boundary` | 7:3 | 10 000 frames run, frame 10 001 fails (SPEC 12.4) |
+| CallDepth | `call_depth_boundary` | 7:5 | 10 000 frames run, frame 10 001 fails (SPEC 12.4) |
 | CallDepth | `call_depth_unbounded` | 5:3 | recursion without a base case ends cleanly |
 | StepLimit | `step_limit_default` | 11:9 | far beyond the default of 100 000 000 steps |
 | StepLimit | `step_limit_small` | 11:9 | `--max-steps 1000` on a program that passes by default |
