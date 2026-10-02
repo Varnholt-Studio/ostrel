@@ -1,0 +1,23 @@
+// if with and without else, early return from branches, Text results.
+
+fn describe(n: Int) -> Text
+  if n < 0
+    return "negative"
+  if n == 0
+    return "zero"
+  return "positive"
+
+fn report(n: Int)
+  if n % 2 == 0
+    print("{n} is even and {describe(n)}")
+  else
+    print("{n} is odd and {describe(n)}")
+
+fn main()
+  report(-3)
+  report(0)
+  report(10)
+  report(7)
+  if 1 > 2
+    print("unreachable")
+  print("done")

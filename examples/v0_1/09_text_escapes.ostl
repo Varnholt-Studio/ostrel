@@ -1,0 +1,13 @@
+// Text equality and every escape of SYNTAX 3 (G1); the empty Text prints an empty line.
+
+fn main()
+  let a = "abc"
+  print(a == "abc")
+  print(a != "abd")
+  print("Tab:\tend")
+  print("Line one\nLine two")
+  print("Quote: \"hi\"")
+  print("Braces: \{x\}")
+  print("Backslash: \\")
+  print("Caf\u{e9}")
+  print("")

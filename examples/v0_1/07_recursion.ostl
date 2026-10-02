@@ -1,0 +1,17 @@
+// Recursion: the fib program of SYNTAX 4.11 plus factorial up to the largest value below 2^53.
+
+fn fib(n: Int) -> Int
+  if n < 2
+    return n
+  return fib(n - 1) + fib(n - 2)
+
+fn factorial(n: Int) -> Int
+  if n <= 1
+    return 1
+  return n * factorial(n - 1)
+
+fn main()
+  let x = fib(20)
+  print("fib(20) = {x}")
+  print(factorial(10))
+  print(factorial(18))
