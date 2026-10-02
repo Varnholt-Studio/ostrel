@@ -1,7 +1,7 @@
 //! Lexer, parser and syntax tree of the Ostrel programming language.
 //!
-//! This crate is an empty placeholder of the workspace skeleton. Its owners fill it
-//! according to the v0.1 build plan.
+//! The syntax tree is in [`ast`]. Lexer and parser follow according to the v0.1
+//! build plan.
 
 // This crate handles untrusted input: no unwrap, expect, panic or unchecked indexing.
 #![deny(
@@ -10,3 +10,5 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+
+pub mod ast;
