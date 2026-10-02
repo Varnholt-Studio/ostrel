@@ -33,12 +33,19 @@ pub struct Span {
     pub end: u32,
 }
 
+/// Largest `Int` value: 2^53 - 1 (D24, ARCHITECTURE 7.4). Single source of the bound.
+pub const INT_MAX: i64 = (1 << 53) - 1;
+
+/// Smallest `Int` value: -(2^53 - 1) (D24, ARCHITECTURE 7.4).
+pub const INT_MIN: i64 = -INT_MAX;
+
 /// Type of a local or of a function result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
     /// No value: result type of functions without `-> T`.
     Unit,
-    /// 64 bit signed integer; overflow is a runtime error.
+    /// Integer in [`INT_MIN`, `INT_MAX`] (the JS safe integer range, D24), the same
+    /// on client and server. Leaving that range is the runtime error `IntOverflow`.
     Int,
     /// Immutable UTF 8 text.
     Text,
@@ -156,6 +163,7 @@ pub enum InstKind {
 /// Constant operand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Const {
+    /// Always within [`INT_MIN`, `INT_MAX`]; the checker rejects other literals (G9).
     Int(i64),
     Text(String),
     Bool(bool),
@@ -288,5 +296,11 @@ mod tests {
         assert_eq!(Const::Int(-1).ty(), Ty::Int);
         assert_eq!(Const::Text(String::new()).ty(), Ty::Text);
         assert_eq!(Const::Bool(true).ty(), Ty::Bool);
+    }
+
+    #[test]
+    fn int_range_is_the_js_safe_range() {
+        assert_eq!(INT_MAX, 9_007_199_254_740_991);
+        assert_eq!(INT_MIN, -9_007_199_254_740_991);
     }
 }

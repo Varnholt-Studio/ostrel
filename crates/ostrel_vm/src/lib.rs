@@ -55,7 +55,7 @@ impl Default for Limits {
 /// The kinds of runtime error of v0.1 (ARCHITECTURE 3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeErrorKind {
-    /// An `Int` operation left the 64 bit signed range.
+    /// An `Int` result left [`ostrel_ir::INT_MIN`, `ostrel_ir::INT_MAX`] (D24).
     IntOverflow,
     /// `/` or `%` with a zero divisor.
     DivisionByZero,
