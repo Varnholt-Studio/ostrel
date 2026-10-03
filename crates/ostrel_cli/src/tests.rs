@@ -235,17 +235,29 @@ fn missing_main_is_the_catalog_golden_for_check_and_run() -> R {
     Ok(())
 }
 
-/// The CLI's part of the lexer goldens: every golden on which the lexer of
-/// this build reports a diagnostic gives exactly the expected stderr under
-/// `check` and `run`. Goldens the lexer accepts belong to later stages and are
-/// checked by `ci/checks/55_golden.sh`.
+/// The CLI's part of the lexer goldens: every golden that is not valid UTF-8
+/// (E0014, reported before the lexer runs) or on which the lexer of this build
+/// reports a diagnostic gives exactly the expected stderr under `check` and
+/// `run`. Goldens are read as bytes, as the CLI reads a file, because some of
+/// them are not valid UTF-8 on purpose. Goldens the lexer accepts belong to
+/// later stages and are checked by `ci/checks/55_golden.sh`.
 #[test]
 fn lexer_goldens_match_byte_for_byte() -> R {
     let mut matched = 0;
+    let mut invalid_utf8 = 0;
     for case in files("tests/errors", ".ostl")? {
-        let src = ok(fs::read_to_string(repo().join(&case)))?;
-        let (_, lexed) = ostrel_syntax::lex::lex(&src, FileId::from_raw(0));
-        if !lexed.iter().any(Diagnostic::is_error) {
+        let bytes = ok(fs::read(repo().join(&case)))?;
+        let before_parser = match std::str::from_utf8(&bytes) {
+            Err(_) => {
+                invalid_utf8 += 1;
+                true
+            }
+            Ok(src) => {
+                let (_, lexed) = ostrel_syntax::lex::lex(src, FileId::from_raw(0));
+                lexed.iter().any(Diagnostic::is_error)
+            }
+        };
+        if !before_parser {
             continue;
         }
         let expected = sibling(&case, ".expected_err")?;
@@ -258,6 +270,37 @@ fn lexer_goldens_match_byte_for_byte() -> R {
         }
     }
     assert!(matched >= 2 * 15, "only {matched} lexer golden runs");
+    assert!(
+        invalid_utf8 >= 3,
+        "only {invalid_utf8} invalid UTF-8 goldens"
+    );
+    Ok(())
+}
+
+/// SPEC 12.6 (check of AC-03): a golden whose source holds a byte outside
+/// U+0020 to U+007E and LF expects a message of printable ASCII and LF only, so
+/// no invisible or confusable character reaches a diagnostic.
+#[test]
+fn goldens_with_non_ascii_source_expect_ascii_only() -> R {
+    let mut checked = 0;
+    for case in files("tests/errors", ".ostl")? {
+        let bytes = ok(fs::read(repo().join(&case)))?;
+        if bytes
+            .iter()
+            .all(|&b| b == b'\n' || (0x20..=0x7E).contains(&b))
+        {
+            continue;
+        }
+        let expected = sibling(&case, ".expected_err")?;
+        assert!(
+            expected
+                .bytes()
+                .all(|b| b == b'\n' || (0x20..=0x7E).contains(&b)),
+            "{case}: {expected:?}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 8, "only {checked} goldens with non ASCII source");
     Ok(())
 }
 

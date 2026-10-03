@@ -1,0 +1,1 @@
+tests/errors/lex_escape_zero_width.ostl:2:12: error[E0004]: unknown escape sequence `\U+200B`

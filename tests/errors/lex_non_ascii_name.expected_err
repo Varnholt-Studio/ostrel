@@ -1,1 +1,1 @@
-tests/errors/lex_non_ascii_name.ostl:2:9: error[E0008]: unexpected character `ü`
+tests/errors/lex_non_ascii_name.ostl:2:9: error[E0008]: unexpected character U+00FC
