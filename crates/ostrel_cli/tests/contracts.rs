@@ -2,10 +2,8 @@
 //! 12.6, AC-52): exit codes, usage errors, the stderr line format, paths as
 //! given, stdout flushing and edge cases of the input file.
 //!
-//! The parser is wired into the CLI by a later work package. Until then the
-//! binary ends every lexically valid file with exit code 70 and a fixed
-//! message. Tests that need a parsed program accept exactly that outcome and
-//! check the full contract as soon as the parser is part of the build.
+//! Exit code 70 marks an internal defect (ARCHITECTURE 3.4, D84). No test
+//! here accepts it: every input ends with 0, 1 or 2.
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -13,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const USAGE: &str = "usage: ostrel run [--max-steps N] FILE\n       ostrel check FILE\n       ostrel --help | --version\n";
-const PARSER_MISSING: &str = "ostrel: internal error: the parser is not part of this build\n";
 const LEX_CASE: &str = "tests/errors/lex_tab_indent.ostl";
 const LEX_EXPECTED: &str = "tests/errors/lex_tab_indent.expected_err";
 
@@ -47,22 +44,6 @@ fn scratch(name: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
-}
-
-/// True when the binary reaches the stages after the parser.
-fn parser_built() -> bool {
-    let out = ostrel(&["check", "examples/v0_1/01_hello.ostl"]);
-    match out.status.code() {
-        Some(0) => true,
-        Some(70) => {
-            assert_eq!(text(&out.stderr), PARSER_MISSING);
-            false
-        }
-        other => panic!(
-            "check of hello world: exit {other:?}, stderr {}",
-            text(&out.stderr)
-        ),
-    }
 }
 
 /// Asserts that `out` is a usage error: exit 2, nothing on stdout, one
@@ -264,56 +245,51 @@ fn invalid_utf8_is_one_diagnostic_with_exit_1() {
 }
 
 #[test]
-fn empty_file_is_e0400_at_1_1_or_names_the_missing_parser() {
+fn empty_file_is_e0400_at_1_1() {
     let dir = scratch("empty");
     let path = dir.join("empty.ostl");
     fs::write(&path, b"").unwrap();
-    let built = parser_built();
     for cmd in ["check", "run"] {
         let out = ostrel(&[OsStr::new(cmd), path.as_os_str()]);
         assert!(out.stdout.is_empty(), "{cmd}");
         let err = text(&out.stderr);
-        if built {
-            // SPEC 12.6: an empty file is E0400 at 1:1 from check and run, exit 1.
-            assert_eq!(out.status.code(), Some(1), "{cmd}: {err}");
-            let prefix = format!("{}:1:1: error[E0400]: ", path.to_string_lossy());
-            assert!(err.starts_with(&prefix), "{cmd}: {err}");
-            assert_eq!(err.lines().count(), 1, "{cmd}: {err}");
-        } else {
-            assert_eq!(out.status.code(), Some(70), "{cmd}: {err}");
-            assert_eq!(err, PARSER_MISSING, "{cmd}");
-        }
+        // SPEC 12.6: an empty file is E0400 at 1:1 from check and run, exit 1.
+        assert_eq!(out.status.code(), Some(1), "{cmd}: {err}");
+        let prefix = format!("{}:1:1: error[E0400]: ", path.to_string_lossy());
+        assert!(err.starts_with(&prefix), "{cmd}: {err}");
+        assert_eq!(err.lines().count(), 1, "{cmd}: {err}");
     }
 }
 
 #[test]
 fn files_without_a_program_never_succeed() {
     let dir = scratch("no_program");
-    for (name, bytes) in [
-        ("bom.ostl", &b"\xEF\xBB\xBF"[..]),
-        ("newline.ostl", &b"\n"[..]),
-        ("crlf.ostl", &b"\r\n\r\n"[..]),
-        ("spaces.ostl", &b"   "[..]),
-        ("comment.ostl", &b"// nothing here\n"[..]),
-        ("nul.ostl", &b"\0"[..]),
+    for (name, bytes, code) in [
+        ("bom.ostl", &b"\xEF\xBB\xBF"[..], Some("E0400")),
+        ("newline.ostl", &b"\n"[..], Some("E0400")),
+        ("crlf.ostl", &b"\r\n\r\n"[..], Some("E0400")),
+        ("spaces.ostl", &b"   "[..], Some("E0400")),
+        ("comment.ostl", &b"// nothing here\n"[..], Some("E0400")),
+        ("nul.ostl", &b"\0"[..], None),
     ] {
         let path = dir.join(name);
         fs::write(&path, bytes).unwrap();
         for cmd in ["check", "run"] {
             let out = ostrel(&[OsStr::new(cmd), path.as_os_str()]);
-            let code = out.status.code();
-            assert!(
-                matches!(code, Some(1 | 70)),
-                "{cmd} {name}: exit {code:?}, stderr {}",
-                text(&out.stderr)
-            );
+            let err = text(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{cmd} {name}: {err}");
             assert!(out.stdout.is_empty(), "{cmd} {name}");
+            assert_eq!(err.lines().count(), 1, "{cmd} {name}: {err}");
+            let prefix = format!("{}:", path.to_string_lossy());
+            assert!(err.starts_with(&prefix), "{cmd} {name}: {err}");
+            let tag = code.map_or_else(|| ": error[E".to_owned(), |c| format!(": error[{c}]: "));
+            assert!(err.contains(&tag), "{cmd} {name}: {err}");
         }
     }
 }
 
 #[test]
-fn every_error_golden_through_the_binary_is_exact_or_names_the_missing_parser() {
+fn every_error_golden_through_the_binary_is_exact() {
     let mut cases: Vec<String> = fs::read_dir(repo().join("tests/errors"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -321,8 +297,6 @@ fn every_error_golden_through_the_binary_is_exact_or_names_the_missing_parser() 
         .collect();
     cases.sort();
     assert!(!cases.is_empty());
-    let built = parser_built();
-    let mut exact = 0;
     let mut wrong = Vec::new();
     for name in &cases {
         let rel = format!("tests/errors/{name}");
@@ -330,12 +304,7 @@ fn every_error_golden_through_the_binary_is_exact_or_names_the_missing_parser() 
         for cmd in ["check", "run"] {
             let out = ostrel(&[cmd, rel.as_str()]);
             let err = text(&out.stderr);
-            if !built && out.status.code() == Some(70) && err == PARSER_MISSING {
-                continue;
-            }
-            if out.status.code() == Some(1) && out.stdout.is_empty() && err == expected {
-                exact += 1;
-            } else {
+            if out.status.code() != Some(1) || !out.stdout.is_empty() || err != expected {
                 wrong.push(format!(
                     "{cmd} {rel}: exit {:?}\n  expected: {expected:?}\n  found:    {err:?}",
                     out.status.code()
@@ -344,13 +313,10 @@ fn every_error_golden_through_the_binary_is_exact_or_names_the_missing_parser() 
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    // The lexer goldens never depend on the parser.
-    assert!(exact > 0);
 }
 
 #[test]
-fn every_example_through_the_binary_is_exact_or_names_the_missing_parser() {
-    let built = parser_built();
+fn every_example_through_the_binary_is_exact() {
     let mut cases: Vec<String> = fs::read_dir(repo().join("examples/v0_1"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -362,25 +328,19 @@ fn every_example_through_the_binary_is_exact_or_names_the_missing_parser() {
         let rel = format!("examples/v0_1/{name}");
         let out = ostrel(&["run", rel.as_str()]);
         let err = text(&out.stderr);
-        if built {
-            assert_eq!(out.status.code(), Some(0), "{rel}: {err}");
-            assert_eq!(
-                text(&out.stdout),
-                read(&rel.replace(".ostl", ".expected")),
-                "{rel}"
-            );
-            assert!(err.is_empty(), "{rel}: {err}");
-            let out = ostrel(&["check", rel.as_str()]);
-            assert_eq!(out.status.code(), Some(0), "check {rel}");
-            assert!(
-                out.stdout.is_empty() && out.stderr.is_empty(),
-                "check {rel}"
-            );
-        } else {
-            assert_eq!(out.status.code(), Some(70), "{rel}: {err}");
-            assert_eq!(err, PARSER_MISSING, "{rel}");
-            assert!(out.stdout.is_empty(), "{rel}");
-        }
+        assert_eq!(out.status.code(), Some(0), "{rel}: {err}");
+        assert_eq!(
+            text(&out.stdout),
+            read(&rel.replace(".ostl", ".expected")),
+            "{rel}"
+        );
+        assert!(err.is_empty(), "{rel}: {err}");
+        let out = ostrel(&["check", rel.as_str()]);
+        assert_eq!(out.status.code(), Some(0), "check {rel}");
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "check {rel}"
+        );
     }
 }
 
@@ -398,19 +358,14 @@ fn output_before_a_runtime_error_is_flushed_before_stderr() {
         .status()
         .unwrap();
     let combined = fs::read_to_string(&both).unwrap();
-    if parser_built() {
-        assert_eq!(status.code(), Some(1), "{combined}");
-        let prefix = format!("before\n{}:3:", src.to_string_lossy());
-        assert!(combined.starts_with(&prefix), "{combined}");
-        assert!(
-            combined.contains(": runtime error[DivisionByZero]: "),
-            "{combined}"
-        );
-        assert_eq!(combined.lines().count(), 2, "{combined}");
-    } else {
-        assert_eq!(status.code(), Some(70));
-        assert_eq!(combined, PARSER_MISSING);
-    }
+    assert_eq!(status.code(), Some(1), "{combined}");
+    let prefix = format!("before\n{}:3:", src.to_string_lossy());
+    assert!(combined.starts_with(&prefix), "{combined}");
+    assert!(
+        combined.contains(": runtime error[DivisionByZero]: "),
+        "{combined}"
+    );
+    assert_eq!(combined.lines().count(), 2, "{combined}");
 }
 
 #[cfg(target_os = "linux")]
@@ -422,13 +377,8 @@ fn lost_program_output_is_a_failure_never_a_success() {
         .output()
         .unwrap();
     let err = text(&out.stderr);
-    if parser_built() {
-        assert_eq!(out.status.code(), Some(1), "{err}");
-        assert!(err.starts_with("ostrel: cannot write to stdout: "), "{err}");
-    } else {
-        assert_eq!(out.status.code(), Some(70), "{err}");
-        assert_eq!(err, PARSER_MISSING);
-    }
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.starts_with("ostrel: cannot write to stdout: "), "{err}");
     // No program output: a full stdout changes nothing for a diagnostic.
     let full = File::options().write(true).open("/dev/full").unwrap();
     let out = command(&["check", LEX_CASE]).stdout(full).output().unwrap();
@@ -448,7 +398,7 @@ fn closed_stdout_pipe_never_kills_the_process() {
     // Exit 0 if all output fit into the pipe before it closed; never a signal or a panic.
     let code = out.status.code();
     assert!(
-        matches!(code, Some(0 | 1 | 70)),
+        matches!(code, Some(0 | 1)),
         "exit {code:?}, stderr {}",
         text(&out.stderr)
     );
