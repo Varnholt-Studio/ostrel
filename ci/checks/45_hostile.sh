@@ -8,7 +8,8 @@
 #      generator builds and is deterministic, the seven named cases of AC-04 and the string
 #      cases of RED-B F17 exist; needs no compiler.
 #   2. bash tests/hostile/run.sh --commands check --ostrel <release binary of 40_build.sh>
-#      runs `ostrel check` on every case with the time and memory limits of the README.
+#      runs `ostrel check` on every case with the CPU time and memory limits of the README
+#      (D93: CPU time, wall clock only as a 60 s hang guard).
 #      The `run` half is ci/checks/56_hostile_run.sh, so the corpus is not run twice (#283).
 #
 # Step 2 is on since the CLI implements `ostrel check` (INT-4): a missing release binary or
@@ -122,8 +123,11 @@ if [ -x "$ostrel" ]; then
   probe=$(mktemp) || exit 1
   printf ')\n' >"$probe"
   (
+    ulimit -c 0
     ulimit -v 524288
-    exec timeout -k 1 5 "$ostrel" check "$probe"
+    ulimit -S -t 5
+    ulimit -H -t 6
+    exec timeout -k 1 60 "$ostrel" check "$probe"
   ) </dev/null >/dev/null 2>&1
   code=$?
   rm -f "$probe"
