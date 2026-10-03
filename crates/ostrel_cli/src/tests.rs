@@ -277,6 +277,33 @@ fn lexer_goldens_match_byte_for_byte() -> R {
     Ok(())
 }
 
+/// SPEC 12.6 (check of AC-03): a golden whose source holds a byte outside
+/// U+0020 to U+007E and LF expects a message of printable ASCII and LF only, so
+/// no invisible or confusable character reaches a diagnostic.
+#[test]
+fn goldens_with_non_ascii_source_expect_ascii_only() -> R {
+    let mut checked = 0;
+    for case in files("tests/errors", ".ostl")? {
+        let bytes = ok(fs::read(repo().join(&case)))?;
+        if bytes
+            .iter()
+            .all(|&b| b == b'\n' || (0x20..=0x7E).contains(&b))
+        {
+            continue;
+        }
+        let expected = sibling(&case, ".expected_err")?;
+        assert!(
+            expected
+                .bytes()
+                .all(|b| b == b'\n' || (0x20..=0x7E).contains(&b)),
+            "{case}: {expected:?}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 8, "only {checked} goldens with non ASCII source");
+    Ok(())
+}
+
 #[test]
 fn invalid_utf8_is_one_diagnostic_at_the_first_bad_byte() {
     let src = b"fn main()\n  print(\"\xC3\xA4\xFF\")\n".to_vec();

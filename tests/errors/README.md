@@ -37,6 +37,7 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0002 | `lex_odd_indent_too_deep` | 2:1 | indentation must be a multiple of two spaces |
 | E0003 | `lex_unterminated_string` | 2:11 | unterminated string literal |
 | E0004 | `lex_unknown_escape` | 2:12 | unknown escape sequence `\q` |
+| E0004 | `lex_escape_zero_width` | 2:12 | unknown escape sequence `\U+200B` |
 | E0004 | `lex_escape_empty_unicode` | 2:12 | malformed escape `\u{}`; write 1 to 6 hex digits between the braces |
 | E0004 | `lex_escape_unicode_too_long` | 2:12 | malformed escape `\u{0000041}`; write 1 to 6 hex digits between the braces |
 | E0005 | `lex_escape_not_scalar` | 2:14 | `\u{110000}` is not a Unicode scalar value |
@@ -44,10 +45,12 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0006 | `lex_string_in_interpolation` | 2:13 | string literal inside interpolation; bind it with `let` first |
 | E0007 | `lex_interpolation_too_deep` | 3:42 | interpolation nests braces deeper than 32 |
 | E0008 | `lex_unexpected_char` | 2:13 | unexpected character `@` |
-| E0008 | `lex_non_ascii_name` | 2:9 | unexpected character `ü` |
+| E0008 | `lex_non_ascii_name` | 2:9 | unexpected character U+00FC |
+| E0008 | `lex_confusable_letter` | 2:7 | unexpected character U+0430 |
+| E0008 | `lex_zero_width_in_code` | 2:8 | unexpected character U+200B |
 | E0008 | `lex_column_counts_scalars` | 2:21 | unexpected character `@` |
 | E0008 | `lex_bom_at_start` | 1:1 | unexpected character `@` |
-| E0008 | `lex_bom_in_code` | 3:12 | unexpected character, then the raw U+FEFF between backticks (see below) |
+| E0008 | `lex_bom_in_code` | 3:12 | unexpected character U+FEFF |
 | E0009 | `lex_semicolon` | 2:12 | `;` is not used in Ostrel; write one statement per line |
 | E0010 | `lex_int_literal_too_large` | 2:11 | integer literal is outside the `Int` range of -9007199254740991 to 9007199254740991 |
 | E0011 | `lex_bidi_in_comment` | 2:16 | bidirectional control character U+202E is not allowed in source; write `\u{202E}` inside a string if it is needed |
@@ -129,10 +132,16 @@ subtracts 1. Depth 32 is accepted; the brace that would reach depth 33 is E0007 
   E0014 position is counted over the valid prefix with the same rule, so it is 1:1 as well.
 * U+FEFF anywhere else is E0008 in code and allowed in strings and comments (D68).
   `lex_bom_in_code` holds one U+FEFF inside a string and one inside a comment on line 2, which
-  must not be reported, and one after `1` on line 3, reported at 3:12. The message carries the
-  raw character between backticks, as for any other unexpected character that is not a control
-  character; whether invisible format characters should be written as `U+FEFF` instead is an
-  open question in `#spec`, and this golden changes with its answer.
+  must not be reported, and one after `1` on line 3, reported at 3:12.
+* A lexer message writes a character raw only if it is printable ASCII (SPEC 12.6). E0008 names
+  every character outside U+0021 to U+007E by its code point, `U+` and at least four upper case
+  hex digits, and every source text quoted by E0004 or E0005 has each character outside U+0020
+  to U+007E replaced the same way in its place. So `lex_bom_in_code` expects `U+FEFF`,
+  `lex_non_ascii_name` expects `U+00FC`, `lex_zero_width_in_code` (a U+200B after `x` in a
+  `let`) expects `U+200B`, `lex_confusable_letter` (a Cyrillic `а` that reads as ASCII `a`)
+  expects `U+0430`, and `lex_escape_zero_width` (a backslash followed by U+200B in a string)
+  expects `\U+200B`. Every `.expected_err` whose source holds a byte outside U+0020 to U+007E
+  and LF contains only printable ASCII and LF; the golden runner checks this.
 * `lex_non_ascii_name` holds exactly one non ASCII character, so its single diagnostic does not
   depend on whether the lexer merges a run of unexpected characters.
 
