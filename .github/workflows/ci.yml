@@ -8,9 +8,12 @@ on:
 permissions:
   contents: read
 
+# Superseded runs are cancelled only for pull requests from team branches.
+# Runs on main and dev, and pull requests whose head is a reserved branch,
+# always finish so every integrated commit keeps its own result.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && !contains(fromJSON('["main","dev","gh-pages","packaging"]'), github.head_ref) }}
 
 jobs:
   gate:
