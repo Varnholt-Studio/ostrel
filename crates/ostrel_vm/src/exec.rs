@@ -25,6 +25,28 @@ const FRAME_OVERHEAD: u64 = size_of::<Frame>() as u64;
 /// Heap bytes charged per register.
 const VALUE_BYTES: u64 = size_of::<Value>() as u64;
 
+/// Bytes of work that cost one extra step. An instruction costs one step plus one
+/// step for every started `WORK_BYTES` bytes it reads, writes or copies (text
+/// compared, concatenated or printed, registers initialised by a call), so
+/// the step limit bounds the running time of a program and not only its number of
+/// instructions. Measured on the gate machine (release), 64 bytes of such work take
+/// less time than one plain instruction. Loading a text constant is not weighted:
+/// it copies at most once per constant, so its work is bounded by the source size.
+const WORK_BYTES: u64 = 64;
+
+/// Steps charged for an instruction that handles `bytes` bytes of work.
+fn step_cost(bytes: u64) -> u64 {
+    1 + bytes.div_ceil(WORK_BYTES)
+}
+
+/// UTF 8 bytes of `value` if it is a `Text`, else 0.
+fn text_len(value: &Value) -> u64 {
+    match value {
+        Value::Text(t) => t.text.len() as u64,
+        _ => 0,
+    }
+}
+
 /// Live heap bytes of one run, shared by every value that holds a charge.
 #[derive(Clone)]
 struct Meter(Rc<Cell<u64>>);
@@ -113,6 +135,10 @@ impl Frame {
 
     fn int(&self, index: u32) -> i64 {
         self.regs.get(index as usize).map_or(0, Value::int)
+    }
+
+    fn text_len(&self, index: u32) -> u64 {
+        self.regs.get(index as usize).map_or(0, text_len)
     }
 
     fn boolean(&self, index: u32) -> bool {
@@ -296,6 +322,37 @@ impl<H: Host + ?Sized> Vm<'_, H> {
             .copied()
     }
 
+    /// Bytes of work `op` does beyond a plain instruction when it runs in `cur`,
+    /// computed before it runs. Work that a limit refuses is not counted, so an
+    /// instruction that fails with `TextLimit` is not reported as `StepLimit`.
+    fn work_bytes(&self, cur: &Frame, op: &Op) -> u64 {
+        match op {
+            // Texts of different length compare without reading their bytes.
+            Op::Equal { lhs, rhs, .. } => {
+                let (la, lb) = (cur.text_len(*lhs), cur.text_len(*rhs));
+                if la == lb { la } else { 0 }
+            }
+            Op::Concat { parts, .. } => {
+                let len = parts
+                    .iter()
+                    .fold(0u64, |sum, p| sum.saturating_add(cur.text_len(*p)));
+                let refs = (parts.len() as u64).saturating_mul(VALUE_BYTES);
+                if len <= self.limits.max_text_bytes {
+                    len.saturating_add(refs)
+                } else {
+                    refs
+                }
+            }
+            Op::Print { arg } => cur.text_len(*arg),
+            Op::Call { func, .. } => self
+                .code
+                .funcs
+                .get(*func as usize)
+                .map_or(0, |f| (f.locals.len() as u64).saturating_mul(VALUE_BYTES)),
+            _ => 0,
+        }
+    }
+
     /// Runs until `main` returns.
     fn execute(&mut self, mut cur: Frame) -> Result<(), RuntimeError> {
         let code = self.code;
@@ -307,13 +364,16 @@ impl<H: Host + ?Sized> Vm<'_, H> {
             let (Some(op), Some(&span)) = (func.ops.get(pc), func.spans.get(pc)) else {
                 return Ok(());
             };
-            if self.steps >= self.limits.max_steps {
-                return Err(RuntimeError {
-                    kind: RuntimeErrorKind::StepLimit,
-                    span: self.main_call_span().unwrap_or(span),
-                });
+            let cost = step_cost(self.work_bytes(&cur, op));
+            match self.steps.checked_add(cost) {
+                Some(total) if total <= self.limits.max_steps => self.steps = total,
+                _ => {
+                    return Err(RuntimeError {
+                        kind: RuntimeErrorKind::StepLimit,
+                        span: self.main_call_span().unwrap_or(span),
+                    });
+                }
             }
-            self.steps += 1;
             cur.pc = cur.pc.wrapping_add(1);
             let error = |kind| RuntimeError { kind, span };
             match op {
@@ -670,6 +730,16 @@ mod tests {
         for max_steps in [3, 4, 5, 6, 50, 51] {
             assert_eq!(step_limit_at(&image, max_steps), Some(30), "{max_steps}");
         }
+    }
+
+    #[test]
+    fn step_cost_charges_each_started_block_of_work() {
+        assert_eq!(step_cost(0), 1);
+        assert_eq!(step_cost(1), 2);
+        assert_eq!(step_cost(WORK_BYTES), 2);
+        assert_eq!(step_cost(WORK_BYTES + 1), 3);
+        assert_eq!(step_cost(16 * 1024 * 1024), 1 + 262_144);
+        assert_eq!(step_cost(u64::MAX), 1 + u64::MAX.div_ceil(WORK_BYTES));
     }
 
     #[test]
