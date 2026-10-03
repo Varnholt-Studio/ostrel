@@ -1,0 +1,1 @@
+tests/errors/lex_zero_width_in_code.ostl:2:8: error[E0008]: unexpected character U+200B

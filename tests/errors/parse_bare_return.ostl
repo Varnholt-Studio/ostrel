@@ -1,0 +1,5 @@
+fn stop()
+  return
+
+fn main()
+  stop()

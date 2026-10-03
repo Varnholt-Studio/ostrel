@@ -1,0 +1,5 @@
+fn main()
+  let s = "a﻿b" // c﻿d
+  let x = 1﻿
+  print(x)
+  print(s)

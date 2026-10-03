@@ -1,0 +1,1 @@
+tests/errors/lex_invalid_utf8_truncated.ostl:2:14: error[E0014]: source is not valid UTF-8 (byte 0xE2)

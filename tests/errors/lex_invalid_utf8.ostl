@@ -1,0 +1,4 @@
+fn main()
+  let s = "GrÃ¼ÃŸe ÿ"
+  // a second invalid byte À and an @ give no further diagnostic
+  print(s)

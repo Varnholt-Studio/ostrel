@@ -575,7 +575,7 @@ fn unexpected_run_is_one_diagnostic() {
     let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
     assert_eq!(
         messages,
-        ["unexpected character `@`", "unexpected character `ü`"]
+        ["unexpected character `@`", "unexpected character U+00FC"]
     );
     assert_eq!(
         texts(src, &tokens).get(..4),
@@ -743,7 +743,7 @@ fn bom_does_not_shift_diagnostic_columns() {
     // A second BOM is an unexpected character at column 1, the first is not.
     assert_eq!(
         rendered("b.ostl", "\u{FEFF}\u{FEFF}\n"),
-        "b.ostl:1:1: error[E0008]: unexpected character `\u{FEFF}`\n"
+        "b.ostl:1:1: error[E0008]: unexpected character U+FEFF\n"
     );
     // Columns after the error and on later lines are unchanged.
     assert_eq!(
