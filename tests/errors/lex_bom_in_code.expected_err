@@ -1,0 +1,1 @@
+tests/errors/lex_bom_in_code.ostl:3:12: error[E0008]: unexpected character `﻿`

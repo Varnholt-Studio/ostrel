@@ -46,6 +46,8 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0008 | `lex_unexpected_char` | 2:13 | unexpected character `@` |
 | E0008 | `lex_non_ascii_name` | 2:9 | unexpected character `ü` |
 | E0008 | `lex_column_counts_scalars` | 2:21 | unexpected character `@` |
+| E0008 | `lex_bom_at_start` | 1:1 | unexpected character `@` |
+| E0008 | `lex_bom_in_code` | 3:12 | unexpected character, then the raw U+FEFF between backticks (see below) |
 | E0009 | `lex_semicolon` | 2:12 | `;` is not used in Ostrel; write one statement per line |
 | E0010 | `lex_int_literal_too_large` | 2:11 | integer literal is outside the `Int` range of -9007199254740991 to 9007199254740991 |
 | E0011 | `lex_bidi_in_comment` | 2:16 | bidirectional control character U+202E is not allowed in source; write `\u{202E}` inside a string if it is needed |
@@ -54,6 +56,7 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0013 | `lex_indent_jump` | 2:1 | indentation is more than one level deeper than the line above; indent a block by two spaces |
 | E0014 | `lex_invalid_utf8` | 2:18 | source is not valid UTF-8 (byte 0xFF) |
 | E0014 | `lex_invalid_utf8_truncated` | 2:14 | source is not valid UTF-8 (byte 0xE2) |
+| E0014 | `lex_bom_invalid_utf8` | 1:1 | source is not valid UTF-8 (byte 0xFF) |
 | E0020 | `parse_compound_assign` | 3:5 | Ostrel assigns with `=`; compound assignment does not exist |
 | E0020 | `parse_walrus_assign` | 2:5 | Ostrel assigns with `=`; `:=` does not exist, declare a new name with `let` |
 | E0021 | `parse_is_operator` | 3:8 | `is` is not Ostrel; to unwrap an optional write `if let y = x` |
@@ -117,8 +120,19 @@ subtracts 1. Depth 32 is accepted; the brace that would reach depth 33 is E0007 
   longest valid prefix (SPEC 12.6, answer to #969). `lex_invalid_utf8_truncated` has `E2 82`
   followed by `A` after `€ 5 ` on line 2, so the diagnostic names byte 0xE2 at 2:14 (counting
   bytes would give 2:16, and naming the continuation byte 0x82 or the `A` is wrong). Its third
-  line holds byte 0xFF and an `@`, which must not be reported. These two files are the only ones
-  in this directory that are not valid UTF-8; their `.expected_err` files are valid UTF-8.
+  line holds byte 0xFF and an `@`, which must not be reported. These two files and
+  `lex_bom_invalid_utf8` are the only ones in this directory that are not valid UTF-8; their
+  `.expected_err` files are valid UTF-8.
+* Exactly one U+FEFF at byte 0 is skipped and column 1 of line 1 starts after it (D68,
+  ARCHITECTURE 3.5). `lex_bom_at_start` has a BOM followed by `@`, so the diagnostic is at 1:1
+  (counting the BOM would give 1:2). `lex_bom_invalid_utf8` has a BOM followed by byte 0xFF: the
+  E0014 position is counted over the valid prefix with the same rule, so it is 1:1 as well.
+* U+FEFF anywhere else is E0008 in code and allowed in strings and comments (D68).
+  `lex_bom_in_code` holds one U+FEFF inside a string and one inside a comment on line 2, which
+  must not be reported, and one after `1` on line 3, reported at 3:12. The message carries the
+  raw character between backticks, as for any other unexpected character that is not a control
+  character; whether invisible format characters should be written as `U+FEFF` instead is an
+  open question in `#spec`, and this golden changes with its answer.
 * `lex_non_ascii_name` holds exactly one non ASCII character, so its single diagnostic does not
   depend on whether the lexer merges a run of unexpected characters.
 
