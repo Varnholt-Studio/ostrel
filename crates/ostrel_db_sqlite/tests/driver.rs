@@ -1041,6 +1041,105 @@ fn set_tags_and_map_entries_are_stored_as_the_contract_says() {
     assert_eq!(q(in_map("y")), Ok(vec![]));
 }
 
+/// D96: a tag in a remove counts only when row, field, element and tag all match a live tag;
+/// a tag of another element, field or row is ignored like an unknown one.
+#[test]
+fn a_set_remove_only_removes_the_tag_of_its_own_element_field_and_row() {
+    let mut conn = connect();
+    let add = |f, e: Value, r, q| {
+        (
+            f,
+            CollectionChange::Set(vec![SetChange::Add {
+                elem: e,
+                tag: tag(r, q),
+            }]),
+        )
+    };
+    let remove = |f, e: Value, r, q| {
+        (
+            f,
+            CollectionChange::Set(vec![SetChange::Remove {
+                elem: e,
+                tag: tag(r, q),
+            }]),
+        )
+    };
+    let row = |n: u128, collections| Write::Insert {
+        model: 1,
+        row: rid(n),
+        fields: vec![],
+        collections,
+    };
+    let edit = |n: u128, v, collections| Write::Update {
+        model: 1,
+        row: rid(n),
+        expect_version: v,
+        fields: vec![],
+        collections: vec![collections],
+    };
+    // Row 1: field 1 holds e1 (tag 1:1) and e2 (tag 2:1), field 3 holds e2 (tag 3:1).
+    // A write names each field once, so e2 joins field 1 in a second write.
+    // Row 2: field 1 holds e2 (tag 4:1).
+    commit(
+        &mut conn,
+        &[
+            row(1, vec![add(1, text("e1"), 1, 1), add(3, text("e2"), 3, 1)]),
+            edit(1, 1, add(1, text("e2"), 2, 1)),
+            row(2, vec![add(1, text("e2"), 4, 1)]),
+        ],
+    );
+    commit(
+        &mut conn,
+        &[
+            // The tag of e2 named in a remove of e1: nothing goes (the vector of set/09).
+            edit(1, 2, remove(1, text("e1"), 2, 1)),
+            // The tag of e2 in field 3 named for e2 in field 1: nothing goes.
+            edit(1, 3, remove(1, text("e2"), 3, 1)),
+            // The tag of e2 in row 2 named for e2 in row 1: nothing goes.
+            edit(1, 4, remove(1, text("e2"), 4, 1)),
+            // The tag of e2 in field 1 named for e2 in field 3: nothing goes.
+            edit(1, 5, remove(3, text("e2"), 2, 1)),
+            // Right element and replica, wrong sequence number: nothing goes.
+            edit(1, 6, remove(1, text("e1"), 1, 2)),
+        ],
+    );
+    let state = |c: &mut Box<dyn Connection>| {
+        block_on(c.query(&all(1)))
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|r| r.collections)
+            .collect::<Vec<_>>()
+    };
+    let set = |tags: Vec<(&str, u64)>| {
+        CollectionState::Set(
+            tags.into_iter()
+                .map(|(e, r)| SetTag {
+                    elem: text(e),
+                    tag: tag(r, 1),
+                })
+                .collect(),
+        )
+    };
+    let untouched = vec![
+        vec![
+            (1, set(vec![("e1", 1), ("e2", 2)])),
+            (3, set(vec![("e2", 3)])),
+        ],
+        vec![(1, set(vec![("e2", 4)]))],
+    ];
+    assert_eq!(state(&mut conn), untouched);
+    // The full tuple removes exactly that one tag and nothing of the same element elsewhere.
+    commit(&mut conn, &[edit(1, 7, remove(1, text("e2"), 2, 1))]);
+    assert_eq!(
+        state(&mut conn),
+        vec![
+            vec![(1, set(vec![("e1", 1)])), (3, set(vec![("e2", 3)]))],
+            vec![(1, set(vec![("e2", 4)]))],
+        ]
+    );
+}
+
 #[test]
 fn refused_writes_change_nothing() {
     let mut conn = connect();
