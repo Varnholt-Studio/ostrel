@@ -1,0 +1,13 @@
+// TextLimit (D44, SPEC 12.4): a Text of exactly 16 777 216 UTF 8 bytes is allowed; one more
+// byte raises TextLimit before the allocation.
+
+fn double(t: Text, rounds: Int) -> Text
+  if rounds == 0
+    return t
+  return double("{t}{t}", rounds - 1)
+
+fn main()
+  let full = double("a", 24)
+  print("16777216 bytes fit")
+  print("{full}b")
+  print("not reached")

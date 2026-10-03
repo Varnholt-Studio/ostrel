@@ -56,5 +56,6 @@ test('keys of different JSON types do not collide', () => {
   const map = new LwwMap();
   map.apply(put('1', 'text key'));
   map.apply(put(1, 'number key', '018bcfe568010000000000000000000a'));
-  assert.deepEqual(map.value(), [['1', 'text key'], [1, 'number key']]);
+  // Both keys stay; numbers come before strings (D61).
+  assert.deepEqual(map.value(), [[1, 'number key'], ['1', 'text key']]);
 });

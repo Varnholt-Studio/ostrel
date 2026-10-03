@@ -32,6 +32,10 @@ pub const BIDI_CONTROL: Code = Code::new(11);
 pub const LONE_CLOSE_BRACE: Code = Code::new(12);
 /// Indentation more than one level deeper than the line above (D68).
 pub const DEEP_INDENT: Code = Code::new(13);
+/// Source file that is not valid UTF-8, reported at the first invalid byte
+/// (D84, SPEC 12.6). The lexer reads `&str` and never sees such a file; the
+/// caller that decodes the bytes reports it with [`msg_invalid_utf8`].
+pub const INVALID_UTF8: Code = Code::new(14);
 
 /// Deepest accepted interpolation brace depth (G1, SPEC 12.1).
 pub const MAX_INTERPOLATION_DEPTH: u32 = 32;
@@ -69,6 +73,14 @@ pub fn msg_unexpected_char(c: char) -> String {
     } else {
         format!("unexpected character `{c}`")
     }
+}
+
+/// Message of [`INVALID_UTF8`] for the first invalid byte `byte` (D84).
+///
+/// The byte is written as two upper case hex digits, for example
+/// `source is not valid UTF-8 (byte 0xFF)`.
+pub fn msg_invalid_utf8(byte: u8) -> String {
+    format!("source is not valid UTF-8 (byte 0x{byte:02X})")
 }
 
 /// Message of [`BIDI_CONTROL`] for the character `c` (ARCHITECTURE 3.5).

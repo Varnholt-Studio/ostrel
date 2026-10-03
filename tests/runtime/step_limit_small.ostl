@@ -1,0 +1,12 @@
+// StepLimit with a small `--max-steps` value (step_limit_small.args): fib(20) finishes
+// under the default limit (examples/v0_1/07_recursion) but not within 1000 steps.
+
+fn fib(n: Int) -> Int
+  if n < 2
+    return n
+  return fib(n - 1) + fib(n - 2)
+
+fn main()
+  print("start")
+  print(fib(20))
+  print("not reached")

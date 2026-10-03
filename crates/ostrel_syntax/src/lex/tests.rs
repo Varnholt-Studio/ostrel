@@ -821,8 +821,28 @@ fn diagnostic_codes_match_the_catalog() {
         (codes::SEMICOLON, 9),
         (codes::INT_OUT_OF_RANGE, 10),
         (codes::BIDI_CONTROL, 11),
+        (codes::LONE_CLOSE_BRACE, 12),
+        (codes::DEEP_INDENT, 13),
+        (codes::INVALID_UTF8, 14),
     ];
     for (code, number) in expected {
         assert_eq!(code.number(), *number);
     }
+}
+
+#[test]
+fn invalid_utf8_message_names_the_byte_in_hex() {
+    // D84: the text of E0014, with the byte as two upper case hex digits.
+    assert_eq!(
+        codes::msg_invalid_utf8(0xFF),
+        "source is not valid UTF-8 (byte 0xFF)"
+    );
+    assert_eq!(
+        codes::msg_invalid_utf8(0x80),
+        "source is not valid UTF-8 (byte 0x80)"
+    );
+    assert_eq!(
+        codes::msg_invalid_utf8(0x0A),
+        "source is not valid UTF-8 (byte 0x0A)"
+    );
 }

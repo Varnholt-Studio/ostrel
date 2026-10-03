@@ -512,6 +512,86 @@ fn last_line_without_line_end() -> R {
     Ok(())
 }
 
+// ----- token view: borrowed, never copied (AC-04 memory limit) -----
+
+#[test]
+fn tokens_without_trivia_are_borrowed() -> R {
+    let src = "fn main()\n  print(1 + 2)\n";
+    let (tokens, _) = lex_with(src, F, &StubLiterals);
+    let view = Tokens::new(src, F, &tokens);
+    assert!(matches!(view.all, Cow::Borrowed(_)));
+    assert!(view.kept.is_none());
+    assert_eq!(view.len(), tokens.len());
+    assert_eq!(view.iter().collect::<Vec<_>>(), tokens);
+    assert_eq!(view.last().must()?.kind, TokenKind::Eof);
+    assert_eq!(view.get(tokens.len()), None);
+    Ok(())
+}
+
+#[test]
+fn tokens_with_trivia_keep_indexes_only() -> R {
+    let src = "// head\nfn main() // tail\n  // inside\n  print(1)\n// end";
+    let (tokens, _) = lex_with(src, F, &StubLiterals);
+    let plain: Vec<Token> = tokens.iter().copied().filter(|t| !t.is_trivia()).collect();
+    assert!(plain.len() < tokens.len(), "the source has comments");
+    let view = Tokens::new(src, F, &tokens);
+    assert!(matches!(view.all, Cow::Borrowed(_)));
+    assert_eq!(view.kept.as_ref().map(Vec::len), Some(plain.len()));
+    assert_eq!(view.iter().collect::<Vec<_>>(), plain);
+    assert_eq!(view.last().must()?.kind, TokenKind::Eof);
+    assert_eq!(view.get(plain.len()), None);
+    Ok(())
+}
+
+#[test]
+fn tokens_find_eof_behind_trailing_trivia() -> R {
+    // A stream whose last token is trivia after EOF still counts as closed.
+    let src = "fn main()\n  print(1)\n";
+    let (mut tokens, _) = lex_with(src, F, &StubLiterals);
+    let end = u32::try_from(src.len()).map_err(|e| e.to_string())?;
+    tokens.push(Token::new(TokenKind::Comment, Span::new(F, end, end)));
+    let view = Tokens::new(src, F, &tokens);
+    assert!(matches!(view.all, Cow::Borrowed(_)));
+    assert_eq!(view.last().must()?.kind, TokenKind::Eof);
+    assert_eq!(view.len(), tokens.len() - 1);
+    Ok(())
+}
+
+#[test]
+fn tokens_without_eof_get_one_at_the_end() -> R {
+    // Only comments and no EOF: the copy gets an EOF at the end of `src`.
+    let src = "// a\n// b";
+    let (tokens, _) = lex_with(src, F, &StubLiterals);
+    let comments: Vec<Token> = tokens.iter().copied().filter(|t| t.is_trivia()).collect();
+    assert!(!comments.is_empty());
+    let view = Tokens::new(src, F, &comments);
+    assert!(matches!(view.all, Cow::Owned(_)));
+    assert_eq!(view.len(), 1);
+    let eof = view.last().must()?;
+    assert_eq!(eof.kind, TokenKind::Eof);
+    assert_eq!(eof.span.start as usize, src.len());
+    // No tokens at all.
+    let view = Tokens::new("", F, &[]);
+    assert_eq!(
+        view.iter().map(|t| t.kind).collect::<Vec<_>>(),
+        [TokenKind::Eof]
+    );
+    Ok(())
+}
+
+#[test]
+fn comments_on_every_line_change_no_result() {
+    let plain = "fn main()\n  let x = (1 + 2\n  print(x)\n  if x\n    return 1 +\n";
+    let commented: String = plain.lines().map(|l| format!("{l} // c\n")).collect();
+    let (m1, d1) = parse(plain);
+    let (m2, d2) = parse(&commented);
+    let codes = |d: &[Diagnostic]| d.iter().map(|d| d.code).collect::<Vec<_>>();
+    assert!(!d1.is_empty());
+    assert_eq!(codes(&d1), codes(&d2));
+    assert_eq!(m1.node_count(), m2.node_count());
+    assert_eq!(m1.items().len(), m2.items().len());
+}
+
 #[test]
 fn reexports_the_limits() {
     assert_eq!(MAX_NODES, 1_000_000);

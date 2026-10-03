@@ -1,0 +1,1 @@
+tests/runtime/int_overflow_mul_in_callee.ostl:5:3: runtime error[IntOverflow]: `Int` result is outside the range of -9007199254740991 to 9007199254740991

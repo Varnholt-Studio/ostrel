@@ -282,6 +282,20 @@ impl<H: Host + ?Sized> Vm<'_, H> {
         })
     }
 
+    /// Span of the call expression in `main` that is running, or `None` while `main`
+    /// itself is the running frame (ARCHITECTURE 3.4, D83). `main` is the bottom
+    /// caller, and its `pc` already points past the `Call` that created frame 2.
+    fn main_call_span(&self) -> Option<Span> {
+        let main = self.stack.first()?;
+        let pc = main.pc.checked_sub(1)?;
+        self.code
+            .funcs
+            .get(main.func as usize)?
+            .spans
+            .get(pc as usize)
+            .copied()
+    }
+
     /// Runs until `main` returns.
     fn execute(&mut self, mut cur: Frame) -> Result<(), RuntimeError> {
         let code = self.code;
@@ -296,7 +310,7 @@ impl<H: Host + ?Sized> Vm<'_, H> {
             if self.steps >= self.limits.max_steps {
                 return Err(RuntimeError {
                     kind: RuntimeErrorKind::StepLimit,
-                    span,
+                    span: self.main_call_span().unwrap_or(span),
                 });
             }
             self.steps += 1;
@@ -436,6 +450,227 @@ fn arith(op: Arith, a: i64, b: i64) -> Result<i64, RuntimeErrorKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Image, compile};
+    use ostrel_ir::{
+        BinOp, Block, BlockId, Const, FuncId, Function, Inst, InstKind, Local, Program, Terminator,
+    };
+
+    struct Capture(Vec<String>);
+
+    impl Host for Capture {
+        fn print(&mut self, text: &str) {
+            self.0.push(text.to_string());
+        }
+    }
+
+    fn sp(start: u32) -> Span {
+        Span {
+            file: 0,
+            start,
+            end: start + 1,
+        }
+    }
+
+    fn at(start: u32, kind: InstKind) -> Inst {
+        Inst {
+            kind,
+            span: sp(start),
+        }
+    }
+
+    fn call(func: u32, args: &[u32]) -> InstKind {
+        InstKind::Call {
+            dst: None,
+            func: FuncId(func),
+            args: args.iter().map(|a| Local(*a)).collect(),
+        }
+    }
+
+    fn int(dst: u32, value: i64) -> InstKind {
+        InstKind::Const {
+            dst: Local(dst),
+            value: Const::Int(value),
+        }
+    }
+
+    fn func(name: &str, params: u32, locals: &[Ty], start: u32, blocks: Vec<Block>) -> Function {
+        Function {
+            name: name.to_string(),
+            params,
+            locals: locals.to_vec(),
+            result: Ty::Unit,
+            blocks,
+            span: sp(start),
+        }
+    }
+
+    /// A function whose only block jumps to itself.
+    fn spinner(name: &str, start: u32) -> Function {
+        func(
+            name,
+            0,
+            &[Ty::Int],
+            start,
+            vec![Block {
+                insts: vec![at(start + 1, int(0, 1))],
+                term: Terminator::Jump(BlockId(0)),
+            }],
+        )
+    }
+
+    /// `fn down(n: Int) { if n == 0 { return } down(n - 1) }` as function `id`.
+    fn down(id: u32) -> Function {
+        func(
+            "down",
+            1,
+            &[Ty::Int, Ty::Int, Ty::Bool],
+            900,
+            vec![
+                Block {
+                    insts: vec![
+                        at(901, int(1, 0)),
+                        at(
+                            902,
+                            InstKind::Binary {
+                                dst: Local(2),
+                                op: BinOp::Eq,
+                                lhs: Local(0),
+                                rhs: Local(1),
+                            },
+                        ),
+                    ],
+                    term: Terminator::Branch {
+                        cond: Local(2),
+                        then: BlockId(1),
+                        otherwise: BlockId(2),
+                    },
+                },
+                Block {
+                    insts: vec![],
+                    term: Terminator::Return(None),
+                },
+                Block {
+                    insts: vec![
+                        at(903, int(1, 1)),
+                        at(
+                            904,
+                            InstKind::Binary {
+                                dst: Local(1),
+                                op: BinOp::Sub,
+                                lhs: Local(0),
+                                rhs: Local(1),
+                            },
+                        ),
+                        at(905, call(id, &[1])),
+                    ],
+                    term: Terminator::Return(None),
+                },
+            ],
+        )
+    }
+
+    fn image(functions: Vec<Function>) -> Option<Image> {
+        compile(&Program {
+            functions,
+            main: FuncId(0),
+        })
+        .ok()
+    }
+
+    fn step_limit_at(image: &Image, max_steps: u64) -> Option<u32> {
+        let limits = Limits {
+            max_steps,
+            ..Limits::default()
+        };
+        let mut host = Capture(Vec::new());
+        match crate::run(image, &mut host, limits) {
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::StepLimit,
+                span,
+            }) => Some(span.start),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn step_limit_in_main_reports_the_instruction() {
+        // `fn main() { loop { } }` with one constant per round.
+        let image = image(vec![spinner("main", 10)]);
+        assert!(image.is_some(), "program compiles");
+        let Some(image) = image else { return };
+        for max_steps in [1, 2, 3, 1000, 1001] {
+            assert_eq!(step_limit_at(&image, max_steps), Some(11), "{max_steps}");
+        }
+    }
+
+    #[test]
+    fn step_limit_in_recursion_reports_the_call_in_main() {
+        // `fn main() { let n = 100000; down(n) }`: the failing instruction inside
+        // `down` depends on the limit, the reported call does not.
+        let main = func(
+            "main",
+            0,
+            &[Ty::Int],
+            0,
+            vec![Block {
+                insts: vec![at(3, int(0, 100_000)), at(7, call(1, &[0]))],
+                term: Terminator::Return(None),
+            }],
+        );
+        let image = image(vec![main, down(1)]);
+        assert!(image.is_some(), "program compiles");
+        let Some(image) = image else { return };
+        // With one step only the constant in `main` would run next.
+        assert_eq!(step_limit_at(&image, 0), Some(3));
+        assert_eq!(step_limit_at(&image, 1), Some(7));
+        for max_steps in [2, 3, 4, 5, 6, 7, 99, 500, 501, 502, 503] {
+            assert_eq!(step_limit_at(&image, max_steps), Some(7), "{max_steps}");
+        }
+    }
+
+    #[test]
+    fn step_limit_reports_the_running_call_of_main_through_nested_calls() {
+        // `fn main() { a(); b() }`, `fn a() { }`, `fn b() { c() }`, `fn c() { loop { } }`.
+        let main = func(
+            "main",
+            0,
+            &[],
+            0,
+            vec![Block {
+                insts: vec![at(20, call(1, &[])), at(30, call(2, &[]))],
+                term: Terminator::Return(None),
+            }],
+        );
+        let a = func(
+            "a",
+            0,
+            &[],
+            100,
+            vec![Block {
+                insts: vec![],
+                term: Terminator::Return(None),
+            }],
+        );
+        let b = func(
+            "b",
+            0,
+            &[],
+            200,
+            vec![Block {
+                insts: vec![at(201, call(3, &[]))],
+                term: Terminator::Return(None),
+            }],
+        );
+        let image = image(vec![main, a, b, spinner("c", 300)]);
+        assert!(image.is_some(), "program compiles");
+        let Some(image) = image else { return };
+        // Steps: call a, return in a, call b, then b and c.
+        assert_eq!(step_limit_at(&image, 1), Some(20));
+        assert_eq!(step_limit_at(&image, 2), Some(30));
+        for max_steps in [3, 4, 5, 6, 50, 51] {
+            assert_eq!(step_limit_at(&image, max_steps), Some(30), "{max_steps}");
+        }
+    }
 
     #[test]
     fn int_text_len_matches_formatting() {

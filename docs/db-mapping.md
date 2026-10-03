@@ -1,6 +1,8 @@
 # SQLite schema mapping
 
-Status: draft for review, work package T6-3 (ARCHITECTURE 15.3). Refs #23.
+Status: draft for review, work package T6-3 (ARCHITECTURE 15.3). Refs #23. Aligned with the F1b
+contract of `crates/ostrel_db/src/api.rs` (T6-1b, Refs #69): error names, `Set` tags (D49), change
+sets, `NULL` order, cursor, schema hash, applied schema and the two orders of D79.
 Scope: how `ostrel_db_sqlite` stores models, collections, the op log and sequences, and how it plans
 queries, including `last n`. Inputs: ARCHITECTURE 5.1 (type table), 5.3 (ids), 6.1 and 6.2 (DB
 interface), 9 (pushdown subset); SYNTAX 4.2 to 4.5; SPEC AC-10, AC-31, AC-33 (e), AC-37, AC-56.
@@ -64,11 +66,16 @@ Collisions that the planner (`ostrel_db::plan`) must reject with a clear error b
 | `Bytes` | `BLOB` | raw bytes (base64url is only the wire form) | bytewise |
 | enum | `INTEGER` | ordinal in declaration order, from 0 | declaration order |
 | reference `T` | `BLOB` with `CHECK (length(x) = 16)` | `RowId`, 16 bytes big endian | by id |
-| `T?` | as `T`, nullable | `NULL` for `none` | `NULLS FIRST` (section 6.4) |
+| `T?` | as `T`, nullable | `NULL` for `none` | `NULL` first ascending, last descending (6.4) |
 | `List[T]` | `TEXT` | canonical JSON of the whole value (ARCHITECTURE 5.3) | not sortable |
 | `Rank` | `TEXT` | fractional index key | bytewise |
 | `Int serial [per f]` | `INTEGER`, nullable | `NULL` until the server assigns it | numeric |
 | `Set[T]`, `Map[K, V]` | no column; side table | section 3 | not sortable |
+
+This table is the form of model columns and of `Map` values. `Set` elements and `Map` keys use
+another form in the side tables, so that their order is the schema free order of D61 (section 3,
+D79): an enum element or key is stored as its variant name and a `Bytes` element or key as
+unpadded base64url, both as `TEXT`.
 
 Non optional fields are `NOT NULL`. A field default (`= backlog`, `= {me}`) is applied by the
 runtime when it builds the `make`; it is not a SQL `DEFAULT`, because defaults such as `me` and
@@ -76,8 +83,17 @@ runtime when it builds the `make`; it is not a SQL `DEFAULT`, because defaults s
 
 Enums are stored as ordinals so that rule comparisons such as `(team.roles[me] ?? guest) >= member`
 compile to an indexable integer comparison. The wire format keeps the variant name (ARCHITECTURE
-5.1); the adapter converts using the schema. Table `ostrel_enums` (section 4) lists every ordinal
-with its name for readers of the file.
+5.1); the adapter converts using the schema. The declaration order comes from
+`MigrationPlan.enums` (`EnumColumn`: model, field, variants in declaration order), which lists
+every enum column and every `Map` field with an enum value type of the target schema; the adapter
+never parses the schema JSON for it (D79). A write with a value that is not a declared variant of
+its column fails with `DbError::Invalid`. Table `ostrel_enums` (section 4) stores these enum
+columns with every ordinal and name, written in the same transaction as `ostrel_schema`; the
+adapter loads it when it connects, so it maps names after a restart, and readers of the file can
+decode the ordinals (D87). A query that compares two enum columns with different variant lists
+is refused by `Query::check` with `DbError::Invalid`; equal lists compare by ordinal (D87).
+`Set` elements and `Map` keys of an enum type are stored as names and not checked against the
+variants (D87).
 
 ### 2.3 Implicit fields
 
@@ -124,7 +140,7 @@ All writes run inside a transaction started with `BEGIN IMMEDIATE` (section 7).
 **`Write::Insert`**
 
 1. `INSERT INTO ostrel_rows (id, model, deleted) VALUES (?, ?, 0)`. A primary key violation means
-   the id exists or existed in some model: the driver returns the conflict error before step 2.
+   the id exists or existed in some model: the driver returns `DbError::Conflict` before step 2.
    Nothing else is touched, so a tombstoned row is never resurrected.
 2. `INSERT INTO "Model" ("id", "made", "changed", "author", <fields>, "ostrel_version") VALUES (?, ..., 1)`.
 3. One `INSERT` per element or key into each side table (section 3).
@@ -133,8 +149,8 @@ All writes run inside a transaction started with `BEGIN IMMEDIATE` (section 7).
 
 1. `UPDATE "Model" SET <fields> = ?, "ostrel_version" = "ostrel_version" + 1 WHERE "id" = ? AND "ostrel_version" = ?`.
 2. If no row changed, the driver distinguishes with one lookup in `ostrel_rows`: row unknown or
-   deleted gives the not found error, otherwise the version did not match and the driver returns
-   the conflict error, which `ostrel_sync` turns into a retry (ARCHITECTURE 5.6).
+   deleted gives `DbError::NotFound`, otherwise the version did not match and the driver returns
+   `DbError::VersionMismatch`, which `ostrel_sync` turns into a retry (ARCHITECTURE 5.6).
 3. Side table entries carried by the write are upserted (section 3.3). The version bump in step 1
    also applies when only side table entries change, so `expect_version` protects collections too.
 
@@ -157,31 +173,48 @@ does not need to decode blobs by hand.
 
 ## 3. Collections
 
+Element and key form (D79): the `elem` column of a `Set` and the `key` column of a `Map` hold the
+wire value, so that `ORDER BY elem` and `ORDER BY key` equal `compare_key` (D61) without any
+sorting in the adapter:
+
+| Element or key type | Column type | Stored value |
+|---|---|---|
+| enum | `TEXT` | variant name, so `backlog` < `done` < `todo` whatever the declaration order |
+| `Bytes` | `TEXT` | unpadded base64url, so `[0xF8]` (`-A`) sorts before `[0x00]` (`AA`) |
+| `Text`, `Rank` | `TEXT` | as in 2.2, `BINARY` collation |
+| reference | `BLOB` | 16 bytes big endian, the same order as the hex wire form |
+| `Bool`, `Int`, `Time`, `Float` | as in 2.2 | as in 2.2, numeric order equals D61 |
+
+A `Map` value is stored like a model column (2.2), so an enum value is an ordinal and
+`(team.roles[me] ?? guest) >= member` stays an integer comparison.
+
 ### 3.1 `Set[T]`
+
+Observed remove set with add tags (D49, ARCHITECTURE 6.2). A row of the side table is one live
+tag; there are no tombstones.
 
 ```sql
 CREATE TABLE "Room__members" (
-  row_id  BLOB    NOT NULL REFERENCES "Room" ("id") ON DELETE CASCADE,
-  elem    BLOB    NOT NULL,          -- column type of T, here a reference
-  hlc     BLOB    NOT NULL,          -- stamp of the op that last changed this element
-  removed INTEGER NOT NULL CHECK (removed IN (0, 1)),
-  PRIMARY KEY (row_id, elem)
+  row_id      BLOB    NOT NULL REFERENCES "Room" ("id") ON DELETE CASCADE,
+  elem        BLOB    NOT NULL,      -- element form of T (table above), here a reference
+  tag_replica BLOB    NOT NULL CHECK (length(tag_replica) = 8),
+  tag_seq     INTEGER NOT NULL,      -- OpId.seq of the add
+  PRIMARY KEY (row_id, elem, tag_replica)
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX "Room__members__by_elem" ON "Room__members" (elem, row_id) WHERE removed = 0;
+CREATE INDEX "Room__members__by_elem" ON "Room__members" (elem, row_id);
 ```
 
-The primary key answers "is `me` in this room" (`see` and `edit` rules). The partial index answers
-"which rooms contain `me`" for list queries filtered by membership. Removed elements stay as
-tombstones with `removed = 1`, so a late remove of an older add is merged correctly. Garbage
-collection of old tombstones is out of scope for v0.3.
+The primary key answers "is `me` in this room" (`see` and `edit` rules) and keeps at most one live
+tag per (element, replica). The index answers "which rooms contain `me`" for list queries filtered
+by membership. An element is in the set while it has at least one row.
 
 ### 3.2 `Map[K, V]`
 
 ```sql
 CREATE TABLE "Team__roles" (
   row_id  BLOB    NOT NULL REFERENCES "Team" ("id") ON DELETE CASCADE,
-  key     BLOB    NOT NULL,          -- column type of K
-  value   INTEGER,                   -- column type of V; NULL when removed
+  key     BLOB    NOT NULL,          -- key form of K (section 3), here a reference
+  value   INTEGER,                   -- column type of V (2.2), here an enum ordinal; NULL when removed
   hlc     BLOB    NOT NULL,
   removed INTEGER NOT NULL CHECK (removed IN (0, 1)),
   PRIMARY KEY (row_id, key)
@@ -189,24 +222,45 @@ CREATE TABLE "Team__roles" (
 CREATE INDEX "Team__roles__by_key" ON "Team__roles" (key, row_id) WHERE removed = 0;
 ```
 
-ARCHITECTURE 6.2 names one shape `(row_id, elem_or_key, value, hlc, removed)` for both. A set has
-no value, so its side table has no `value` column; everything else matches.
+ARCHITECTURE 6.2 names the shape `(row_id, key, value, hlc, removed)` for maps. Removed keys stay
+as tombstones with `removed = 1`, so a late write with an older stamp is merged correctly. Garbage
+collection of old tombstones is out of scope for v0.3.
 
 `WITHOUT ROWID` is used because side table rows are small and always looked up by their key.
 
 ### 3.3 How a `Write` reaches a side table
 
-Each `Insert` or `Update` carries, for a collection field, the entries that changed: per element
-or key the value, the stamp and the `removed` flag, already merged by `ostrel_crdt`. The driver
-writes each entry with
+`Write::Insert` and `Write::Update` carry, per collection field, a `CollectionChange`
+(`crates/ostrel_db/src/api/write.rs`), already merged by `ostrel_crdt`:
 
-```sql
-INSERT INTO "Team__roles" (row_id, key, value, hlc, removed) VALUES (?, ?, ?, ?, ?)
-ON CONFLICT (row_id, key) DO UPDATE SET value = excluded.value, hlc = excluded.hlc,
-                                        removed = excluded.removed;
-```
+* `CollectionChange::Set`: a list of `SetChange`, applied in order. `Add { elem, tag }` makes `tag`
+  the live tag of `(elem, tag.replica)` unless the stored tag of that replica has a `seq` of at
+  least `tag.seq`; `Remove { elem, tag }` deletes the tag only if replica and `seq` both match,
+  otherwise nothing happens. An insert carries no `Remove`.
 
-The driver does not compare stamps; the merge already decided. See ASSUMPTION A1 and question Q1.
+  ```sql
+  INSERT INTO "Room__members" (row_id, elem, tag_replica, tag_seq) VALUES (?, ?, ?, ?)
+  ON CONFLICT (row_id, elem, tag_replica) DO UPDATE SET tag_seq = excluded.tag_seq
+  WHERE excluded.tag_seq > tag_seq;
+  DELETE FROM "Room__members" WHERE row_id = ? AND elem = ? AND tag_replica = ? AND tag_seq = ?;
+  ```
+
+* `CollectionChange::Map`: a list of `MapEntry { key, value, hlc }`, at most one per key; `value`
+  `None` is a removed key. Each entry replaces the stored one:
+
+  ```sql
+  INSERT INTO "Team__roles" (row_id, key, value, hlc, removed) VALUES (?, ?, ?, ?, ?)
+  ON CONFLICT (row_id, key) DO UPDATE SET value = excluded.value, hlc = excluded.hlc,
+                                          removed = excluded.removed;
+  ```
+
+The driver does not compare map stamps; the merge already decided. The tag rules above are the
+only decisions of the driver, and they make a replayed change harmless. Every write batch is
+checked with `check_writes` first (field written twice, `Set` or `Map` value in a column, `Remove`
+in an insert, map key twice), so all adapters refuse the same input with `DbError::Invalid`.
+
+Queries return the state per collection field as `CollectionState`: live tags ordered by element
+(`compare_key`, D61), then tag; map entries including tombstones ordered by key.
 
 ### 3.4 `Text merge text`
 
@@ -256,12 +310,14 @@ CREATE TABLE ostrel_schema (
   applied_at INTEGER NOT NULL
 ) STRICT;
 
--- Enum ordinals with their names, for people reading the file.
+-- Enum columns of the applied schema (MigrationPlan.enums) with ordinals and names. Written in
+-- the same transaction as ostrel_schema and loaded on connect (D87).
 CREATE TABLE ostrel_enums (
-  enum    TEXT    NOT NULL,
+  model   INTEGER NOT NULL,
+  field   INTEGER NOT NULL,
   ordinal INTEGER NOT NULL,
   name    TEXT    NOT NULL,
-  PRIMARY KEY (enum, ordinal)
+  PRIMARY KEY (model, field, ordinal)
 ) STRICT, WITHOUT ROWID;
 ```
 
@@ -292,8 +348,8 @@ are unique, gaps are allowed. SQLite has no native sequences, so `Capabilities.s
 ## 5. Migrations
 
 `Connection::migrate` runs the whole plan in one transaction (SQLite DDL is transactional). It
-first compares the plan's source schema hash with `ostrel_schema.hash` and refuses a plan made for
-a different starting point (ASSUMPTION A4). On success it stores the new schema and hash and
+first compares `MigrationPlan.from` with `ostrel_schema.hash` (`None` when the table has no row) and
+refuses a plan made for a different starting point with `DbError::SchemaMismatch` (A4). On success it stores the new schema and hash and
 refreshes `ostrel_enums` and the read views.
 
 | Plan step | SQLite | Destructive flag needed |
@@ -345,11 +401,11 @@ AC-56). There is no filtering after the query.
 | `signed` | constant `1` or `0` as a parameter |
 | `ref.f` (one hop) | `(SELECT r."f" FROM "Ref" AS r WHERE r."id" = t."ref")` |
 | `a.b.f` (two hops) | the same subquery nested once more |
-| `x in setField` | `EXISTS (SELECT 1 FROM "M__set" AS s WHERE s.row_id = <row> AND s.elem IS :x AND s.removed = 0)` |
-| `x in mapField` | the same on the map side table with `key` |
-| `mapField[k]` | `(SELECT m.value FROM "M__map" AS m WHERE m.row_id = <row> AND m.key IS :k AND m.removed = 0)` |
+| `x in setField` | `EXISTS (SELECT 1 FROM "M__set" AS s WHERE s.row_id = <row> AND s.elem IS :x)`, `:x` in element form (section 3) |
+| `x in mapField` | the same on the map side table with `key`, `:x` in key form |
+| `mapField[k]` | `(SELECT m.value FROM "M__map" AS m WHERE m.row_id = <row> AND m.key IS :k AND m.removed = 0)`, `:k` in key form |
 | `e ?? c` | `COALESCE(e, :c)` |
-| enum variant `member` | its ordinal as a parameter |
+| enum variant `member` | its ordinal as a parameter when compared with a column or a map value; its name when used as a `Set` element or `Map` key (`member in tags`) |
 
 Here `<row>` is `t."id"` for a field of the queried model, or the reference column for a hop
 (`t."room"` in `me in room.members`).
@@ -359,7 +415,7 @@ Examples from the chat and the issue tracker (SYNTAX 5.1, 8):
 ```sql
 -- Message: see if me in room.members
 EXISTS (SELECT 1 FROM "Room__members" AS s
-        WHERE s.row_id = t."room" AND s.elem IS :me AND s.removed = 0)
+        WHERE s.row_id = t."room" AND s.elem IS :me)
 
 -- Issue: see if me in team.roles
 EXISTS (SELECT 1 FROM "Team__roles" AS m
@@ -379,6 +435,11 @@ logic, so the translation keeps `NULL` out of every boolean:
   and a missing map key compared with `==` is false.
 * Ordered comparisons with an optional operand are compile errors (AC-33 (a)); `??` turns an
   optional into a value first.
+* The driver contract still defines them, because a missing map key (`mapField[k]` without `??`)
+  is `NULL` too: an ordered comparison with `NULL` is false, and `not` of it is true
+  (`crates/ostrel_db/src/api/query.rs`, filter semantics). Where an operand can be `NULL`, the
+  translation wraps the comparison as `COALESCE(<cmp>, 0)` so that `NOT` sees a boolean. This is
+  the SQLite form; PostgreSQL has a real boolean type and writes `COALESCE(<cmp>, false)`.
 * The remaining source of `NULL` is a hop through a non optional reference whose target row was
   deleted. The translation adds `EXISTS (SELECT 1 FROM "Ref" WHERE "id" = t."ref")` as a top level
   conjunct for every such hop, so the whole rule is false and the row is not readable. This fails
@@ -394,8 +455,13 @@ logic, so the translation keeps `NULL` out of every boolean:
   replicas must sort the same way: PostgreSQL with `COLLATE "C"`, and the JS runtime by code point,
   not by the default UTF-16 code unit comparison of `<` (they differ for characters above U+FFFF).
   This is a cross team requirement, see question Q3.
-* Optional sort fields use `NULLS FIRST` explicitly, because PostgreSQL defaults to `NULLS LAST`
-  for ascending order. Keyset paging over an optional sort field is question Q4.
+* `NULL`, and a field that was never written, sorts before every value in ascending order and
+  after every value in descending order, so descending stays the exact reverse (driver contract,
+  `crates/ostrel_db/src/api/query.rs`, column order). SQLite does this by default. PostgreSQL
+  defaults to the opposite (`NULLS LAST` ascending, `NULLS FIRST` descending), so its adapter
+  writes `NULLS FIRST` for ascending and `NULLS LAST` for descending keys explicitly. `sort` on an
+  optional field is a compile error in v0.3 (Q4, ARCHITECTURE 19); the rule still matters for
+  `ostrel_sync` queries and fields added later by a migration.
 
 ### 6.5 `limit n` and `last n`
 
@@ -416,13 +482,18 @@ Because `see` is in `WHERE`, these are the last 200 rows the principal may read,
 
 ### 6.6 Paging with `after`
 
-`Query.after` holds the sort values and id of the last row of the previous page. With every sort
-key non optional and one direction (ASSUMPTION A6), the cursor is a row value comparison:
+`Query.after` (`Cursor`) holds the sort values and id of the last row of the previous page. The
+contract defines it as a position: the query returns only rows strictly after `(values, id)` in
+query order, and the row itself need not exist any more. With every sort key non optional and one
+direction (ASSUMPTION A6), the cursor is a row value comparison:
 
 ```sql
 AND (t."made", t."id") > (:made, :id)     -- ascending
 AND (t."made", t."id") < (:made, :id)     -- descending, also used for last n pages
 ```
+
+With mixed directions or a `NULL` in the cursor the adapter expands the comparison key by key
+(`a > :a OR (a IS :a AND (b < :b OR ...))`) under the `NULL` order of section 6.4.
 
 ### 6.7 Indexes
 
@@ -496,15 +567,18 @@ These are proposals for `tests/db-conformance/` (owner T6-2); each is adapter in
 
 ## 10. Assumptions
 
-* **A1.** For `Set` and `Map` fields, `Write::Insert` and `Write::Update` carry merged side table
-  entries `(elem_or_key, value, hlc, removed)`, not the whole collection. The exact `Value` shape is
-  defined in `ostrel_db` by T6-1.
-* **A2.** `DbError` has distinct variants for "conflict" (existing id, stale version) and "not
-  found". Their names come from T6-1.
+* **A1.** Resolved by T6-1b: `Write::Insert` and `Write::Update` carry merged changes per
+  collection field (`CollectionChange`, section 3.3), not the whole collection. Review of the
+  `Set` tag shape by T5 pending.
+* **A2.** Resolved by T6-1b: existing or deleted id gives `DbError::Conflict`, stale version
+  `DbError::VersionMismatch`, missing row `DbError::NotFound`.
 * **A3.** `Capabilities.sequences = false` means the driver emulates sequences inside the
   transaction; `next_in_sequence` must still work.
-* **A4.** `MigrationPlan` carries the hash of the schema it was planned from and the full target
-  schema, so the driver can refuse a plan for a different starting point.
+* **A4.** Resolved by T6-1b and D79: `MigrationPlan` carries `from` (hash of the schema it was
+  planned from, `None` for a new database), `to`, the canonical JSON of the target schema and the
+  enum columns. The planner reads the stored hash and schema JSON with
+  `Connection::applied_schema` (`None` if never migrated, unchanged by a refused plan) and plans
+  the next steps from it. SQLite reads it from `ostrel_schema`.
 * **A5.** A hop through a non optional reference to a deleted row makes the whole rule false
   (fail closed, S-9), even where short circuit evaluation in the VM would not reach the hop.
 * **A6.** The id tie break follows the direction of the sort field, and one query has one sort
@@ -514,11 +588,8 @@ These are proposals for `tests/db-conformance/` (owner T6-2); each is adapter in
 
 ## 11. Open questions
 
-* **Q1 (T5, architect).** ARCHITECTURE 5.1 specifies an add wins observed remove set. The side
-  table keeps one stamp per element, which is enough for "add wins on equal stamp" but not for a
-  full observed remove set, which needs the set of add tags per element. Either the side table
-  gains a tag table, or the set semantics are defined per element on stamps. Needed before T6-2
-  writes the conformance cases for sets.
+* **Q1 (T5, architect).** Closed by D49: observed remove set with add tags, side table of
+  section 3.1.
 * **Q2 (architect).** Is a hop to a deleted row a runtime error in rules (then A5 matches S-9), or
   does it yield `none`? The VM evaluation of write rules and this SQL translation must agree.
 * **Q3 (T3, T5).** The JS runtime must compare `Text` and `Rank` by code point (6.4). Owner of the
