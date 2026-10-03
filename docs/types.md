@@ -1,6 +1,6 @@
 # Built in types
 
-Status: frozen with the type table of ARCHITECTURE 5.1 (v1.10). Owner: architect. Refs #111.
+Status: frozen with the type table of ARCHITECTURE 5.1 (v1.11). Owner: architect. Refs #111.
 This document is derived from that table and adds nothing to it: if the two ever disagree, the
 table in ARCHITECTURE 5.1 wins and this file is a bug. A change to a type goes through an
 architect DECISION first and is then copied here.
@@ -32,26 +32,66 @@ The other types are part of the frozen table and keep the same representation wh
 | `Float` | no | number | `Float(FiniteFloat)` | `REAL` | `number` (`Float`) | LWW register |
 | `Text` | yes | string | `Text(String)` | `TEXT`, UTF-8, not normalised | `string` (`Text`) | LWW register; `merge text` selects the sequence CRDT |
 | `Time` | yes | number, ms since the Unix epoch | `Time(SafeInt)` | `INTEGER` | `number` (`Time`) | LWW register |
-| `Bytes` | no | base64url string without padding | `Bytes(Vec<u8>)` | `BLOB` | `Uint8Array` | LWW register |
-| enum | yes | string, the variant name | `Enum(String)` | `INTEGER`, ordinal in declaration order | `string` (`EnumValue`) | LWW register |
+| `Bytes` | no | base64url string without padding | `Bytes(Vec<u8>)` | `BLOB` (as a `Set` element or `Map` key: `TEXT`, unpadded base64url, see 2.1) | `Uint8Array` | LWW register |
+| enum | yes | string, the variant name | `Enum(String)` | `INTEGER`, ordinal in declaration order (as a `Set` element or `Map` key: `TEXT`, the variant name, see 2.1) | `string` (`EnumValue`) | LWW register |
 | reference `T` | yes | id string, 32 lowercase hex digits | `Ref(RowId)` | `BLOB`, 16 bytes big endian | `string` (`Ref`, a `RowId`) | LWW register |
 | `T?` | yes | value of `T`, or `null` | as `T`, or `Null` | as `T`, nullable, `NULL` for `none` | as `T`, or `null` | as `T` |
-| `Set[T]` | yes | array | `Set(Vec<Value>)` | side table, one row per element | readonly array | observed remove set, add wins |
-| `Map[K, V]` | no | array of `[k, v]` pairs | `Map(Vec<(Value, Value)>)` | side table, one row per key | readonly array of `[k, v]` | per key LWW register with tombstone |
+| `Set[T]` | yes | array | `Set(Vec<Value>)` | side table, one row per live add tag, so one element can have several rows (see 2.1) | readonly array | observed remove set, add wins |
+| `Map[K, V]` | no | array of `[k, v]` pairs | `Map(Vec<(Value, Value)>)` | side table, one row per key including removed keys (see 2.1) | readonly array of `[k, v]` | per key LWW register with tombstone |
 | `List[T]` | no | array | `List(Vec<Value>)` | `TEXT`, canonical JSON of the whole value | readonly array | LWW of the whole value |
 | `Rank` | no | string, fractional index key | `Rank(String)` | `TEXT` | `string` (`Rank`) | LWW of the key |
 | `Int serial [per f]` | no | number | `Int(SafeInt)`, `Null` until synced | `INTEGER`, nullable | `number`, `null` until synced | none, server assigned |
 
 `Doc` and a counter type do not exist. Collaborative text is `Text merge text`.
 
-Implicit fields on every row: `id` (reference to the row itself), `made` and `changed` (`Time` in
-the language, HLC stamps on the wire and in the database), `author` (a reference to `User`, only
-in apps with `auth`), and on the client only `pending` and `rejected`.
+### 2.1 Collections in the database
+
+A `Set[T]` and a `Map[K, V]` field each get a side table (ARCHITECTURE 6.2, `docs/db-mapping.md` 3).
+
+* `Set[T]`: observed remove set with add tags (D49). A row is one live add tag:
+  `(row_id, elem, tag_replica, tag_seq)` with primary key `(row_id, elem, tag_replica)`. There is
+  at most one live tag per element and replica, but replicas that added the same element
+  concurrently each keep their own row, so an element can have several rows. The element is in
+  the set while it has at least one row. There are no tombstones.
+* `Map[K, V]`: one row per key, `(row_id, key, value, hlc, removed)` with primary key
+  `(row_id, key)`. A removed key stays as a tombstone with `removed = 1`.
+* Element and key form (D79): the `elem` and `key` columns hold the wire value, so that
+  `ORDER BY` equals `compare_key` (D61). An enum element or key is stored as its variant name and
+  a `Bytes` element or key as unpadded base64url, both as `TEXT` with code point collation. A
+  reference stays 16 bytes big endian; all other types use their column form from the table above.
+* A `Map` value is stored like a model column, so an enum value stays an ordinal.
+
+### 2.2 Implicit fields
+
+Every row has `id` (a reference to the row itself), `made` and `changed`, `author` (a reference to
+`User`, only in apps with `auth`), and on the client only `pending` and `rejected`.
+
+`made` and `changed` are server checked HLC stamps (ARCHITECTURE 5.1, 5.5). On the wire and in
+`RowMeta` of the client (`runtime/js/api.d.ts` section 4) they are `Hlc` hex strings of 32
+digits; in the database they are 16 byte big endian blobs. A program reads them as `Time`
+(SYNTAX 4.6 and 8, `docs/db-mapping.md` 2.3): the value is the stamp's `wall_ms`, which is the
+first 12 hex digits of the wire form. A comparison with a `Time` in a query is translated to a
+comparison with the smallest stamp of that millisecond (`docs/db-mapping.md` 2.3). `sort made`
+and `sort changed` order by the full stamp and then by `id`, not by the `Time` value alone.
 
 ## 3. Rules that hold on every target
 
-These rules are the reason the table needs no per target exceptions. Each one is checked by
-shared vectors that the Rust and the JS implementation both run.
+These rules are the reason the table needs no per target exceptions. Each rule must be checked
+by shared vectors that the Rust and the JS implementation both run. For text length (including
+emoji and combining marks) and inclusive range bounds this is required by SPEC AC-29 and owned
+by T2 (type checker, VM) and T3 (generated JS, guards). On dev at c4d3d8d vectors exist only for
+part of the rules:
+
+* `tests/crdt-vectors/canon/cases.json`: the `Int` bounds, floats including `-0`, escapes and
+  unpaired surrogates in the canonical encoding.
+* `tests/crdt-vectors/set/`, `map/` and `rank/`: element, key and `Rank` order (D61).
+* Text order by code point in the database: only `text_orders_by_code_point` in
+  `crates/ostrel_db_memory/tests/driver.rs` and `ac_37_text_order_with_nul` in
+  `tests/db-conformance/cases/`. The shared file `tests/db-conformance/text-order/` named in
+  ARCHITECTURE 6.2 (owner T6) does not exist yet.
+
+Still missing: `IntOverflow` in arithmetic, `len` in scalar values, inclusive ranges, row order of
+enum and `Bool`, and optional comparisons.
 
 **Integers.** `Int` and `Time` are limited to plus and minus (2^53 minus 1), that is
 `-9007199254740991` to `9007199254740991`, both bounds included. Rust stores them as `i64`, JS as
@@ -89,4 +129,6 @@ string order, byte order and value order agree (ARCHITECTURE 5.3).
 * ARCHITECTURE 5.1 (type table), 5.3 (ids, `Value`, canonical encoding), 6.2 (order), 7.4 (integers)
 * SYNTAX 4.2 (`len`, `..`), 4.3 (merge per field), 4.4 (optionals in rules)
 * SPEC AC-29, 12.4 (`TextLimit`)
-* `runtime/js/api.d.ts` section 2 (client values), `docs/db-mapping.md` 2.2 and 3 (SQLite)
+* ARCHITECTURE 6.2 (D49 `Set` tags, D61 element order, D79 element and key form)
+* `runtime/js/api.d.ts` sections 2 and 4 (client values, `RowMeta`)
+* `docs/db-mapping.md` 2.2, 2.3 and 3 (SQLite)
