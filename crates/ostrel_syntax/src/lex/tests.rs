@@ -549,8 +549,9 @@ fn a_quote_after_blanks_on_the_next_line_closes_the_cut_string() {
     for src in [
         "f(\"abc\r\n\")\r\n",
         "f(\"a {b} c\n\")\n",
-        "f(\"abc\n \t\")\n",
+        "f(\"abc\n  \")\n",
         "f(\"abc\n\" + x)\n",
+        "f(\"abc\n\"\t+\tx)\n",
         "f(\"abc\n\"",
     ] {
         assert_eq!(
@@ -633,6 +634,85 @@ fn spec_example_a_complete_string_on_the_next_line_is_not_consumed() {
         tokens.iter().any(|t| t.kind == Str),
         "line 3 must stay a string: {tokens:?}"
     );
+}
+
+#[test]
+fn spec_example_rest_after_the_quote_continues_the_line() {
+    // SPEC v1.9 12.6 (c), selma #1121: blanks after the quote are separators,
+    // never indentation, so no E0001, E0002 or E0013 can arise there.
+    assert_eq!(
+        spec_positions("  print(\"abc\n\" + x)\n"),
+        vec![(codes::UNTERMINATED_STRING, 2, 9)]
+    );
+    assert_eq!(
+        spec_positions("  print(\"abc\n\"\t\t + x)\n"),
+        vec![(codes::UNTERMINATED_STRING, 2, 9)]
+    );
+}
+
+#[test]
+fn spec_example_a_tab_before_the_quote_keeps_its_e0001() {
+    // SPEC v1.9 12.6 (a), selma #1122: only spaces may stand before the
+    // closing quote; a tab breaks (a) and line 3 is lexed as usual.
+    assert_eq!(
+        spec_positions("  print(\"abc\n\t\")\n"),
+        vec![
+            (codes::UNTERMINATED_STRING, 2, 9),
+            (codes::TAB_INDENT, 3, 1),
+            (codes::UNTERMINATED_STRING, 3, 2)
+        ]
+    );
+}
+
+#[test]
+fn only_spaces_before_the_quote_satisfy_a() {
+    // A tab anywhere in the blanks, or any other blank like character,
+    // breaks (a): the next line keeps its own diagnostics.
+    for body in [
+        "  print(\"abc\n \t\")\n",
+        "  print(\"abc\n\t \")\n",
+        "  print(\"abc\n\u{A0}\")\n",
+        "  print(\"abc\n\u{3000}\")\n",
+        "  print(\"abc\n\u{FEFF}\")\n",
+        "  print(\"abc\n\u{0B}\")\n",
+        "  print(\"abc\n\u{0C}\")\n",
+        "  print(\"abc\n\r\")\n",
+    ] {
+        let found = spec_positions(body);
+        assert!(found.len() >= 2, "{body:?}: {found:?}");
+        assert_eq!(
+            found.first(),
+            Some(&(codes::UNTERMINATED_STRING, 2, 9)),
+            "{body:?}"
+        );
+    }
+}
+
+#[test]
+fn a_byte_order_mark_after_the_quote_prevents_closing() {
+    // (c): the rest is the middle of a line, where U+FEFF is E0008 (D68).
+    // Lexed as a source of its own it would be a skipped byte order mark
+    // and would hide that fault.
+    for body in [
+        "  print(\"abc\n\"\u{FEFF})\n",
+        "  print(\"abc\n\" \u{FEFF})\n",
+        "  print(\"abc\n\"\t\u{FEFF})\n",
+    ] {
+        let found = spec_positions(body);
+        assert_eq!(
+            found.first(),
+            Some(&(codes::UNTERMINATED_STRING, 2, 9)),
+            "{body:?}"
+        );
+        assert_eq!(
+            found
+                .iter()
+                .filter(|d| d.0 == codes::UNTERMINATED_STRING)
+                .count(),
+            2,
+            "line 3 must not close the string: {body:?}: {found:?}"
+        );
+    }
 }
 
 #[test]

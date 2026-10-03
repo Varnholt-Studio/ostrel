@@ -550,9 +550,12 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
     /// after a line end in a string") the next physical line closes the cut
     /// string only when all of these hold:
     ///
-    /// * (a) its first character after leading spaces and tabs is `"`,
+    /// * (a) its first character after leading spaces (U+0020 only) is `"`;
+    ///   a tab or any other character before it breaks (a), so a tab in the
+    ///   indentation keeps its E0001,
     /// * (b) lexed on its own, the line reports E0003 at exactly that quote,
-    /// * (c) the text after that quote lexes without any diagnostic.
+    /// * (c) the text after that quote, lexed as the continuation of a line
+    ///   (after a token, never as a line start), gives no diagnostic.
     ///
     /// Then the string is one `Error` token from its opening quote through that
     /// closing quote, the line end inside it does not end the logical line,
@@ -589,8 +592,9 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             };
         let line_end = self.line_end_from(start);
         let line = self.src.get(start..line_end)?;
-        // (a) Nothing but spaces and tabs before the quote.
-        let blank = line.len() - line.trim_start_matches([' ', '\t']).len();
+        // (a) Nothing but spaces before the quote. A tab there is a real fault
+        // (E0001) that recovery must not hide.
+        let blank = line.len() - line.trim_start_matches(' ').len();
         if line.as_bytes().get(blank) != Some(&b'"') {
             return None;
         }
@@ -603,10 +607,13 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         if !cut_here {
             return None;
         }
-        // (c) The rest of the line is clean on its own. It continues the line,
-        // so its leading blanks are not indentation and are left out.
-        let after = line.get(blank + 1..)?.trim_start_matches([' ', '\t']);
-        let (_, rest_diags) = lex_with(after, self.file, self.literals);
+        // (c) The rest of the line is clean as the continuation of a line. It
+        // is lexed after a placeholder token, so it is never a line start:
+        // its blanks are separators, not indentation, and a U+FEFF at its
+        // start is E0008 as anywhere in code, not a skipped byte order mark.
+        let after = line.get(blank + 1..)?;
+        let continued = format!("x {after}");
+        let (_, rest_diags) = lex_with(&continued, self.file, self.literals);
         if !rest_diags.is_empty() {
             return None;
         }
