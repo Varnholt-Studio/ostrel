@@ -213,6 +213,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostrel_sync"
+version = "0.0.0"
+dependencies = [
+ "ostrel_core",
+ "ostrel_db",
+]
+
+[[package]]
 name = "ostrel_syntax"
 version = "0.0.0"
 dependencies = [
