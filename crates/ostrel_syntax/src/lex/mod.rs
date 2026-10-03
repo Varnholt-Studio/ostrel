@@ -546,23 +546,23 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
     ///
     /// A string cut by a line end is often meant to span two lines, and the
     /// quote that was meant to close it then opens a new string on the next
-    /// line, which runs into that line's end. Both are one fault (SPEC 12.1),
-    /// so the closing quote is taken as the end of the cut string when all of
-    /// these hold:
+    /// line. Both are one fault (SPEC 12.1), so under SPEC 12.6 ("Recovery
+    /// after a line end in a string") the next physical line closes the cut
+    /// string only when all of these hold:
     ///
-    /// * the next physical line starts with string text that ends in an
-    ///   unescaped `"` (no `{`, no line end before it),
-    /// * the next line on its own reports E0003, and
-    /// * the rest of that line after the quote on its own does not.
+    /// * (a) its first character after leading spaces and tabs is `"`,
+    /// * (b) lexed on its own, the line reports E0003 at exactly that quote,
+    /// * (c) the text after that quote lexes without any diagnostic.
     ///
     /// Then the string is one `Error` token from its opening quote through that
     /// closing quote, the line end inside it does not end the logical line,
     /// and lexing goes on after the quote with the brackets that were open
-    /// before the string. Faults that the literal scanner finds in the text of
-    /// the next line (for example E0011) are still reported. In every other
-    /// case only the line that holds the opening quote belongs to the string.
+    /// before the string. Only the directly following line is looked at. In
+    /// every other case only the line that holds the opening quote belongs to
+    /// the string, and the next line is lexed as usual, so a second real fault
+    /// there keeps its own E0003.
     fn cut_text(&mut self, quote: usize, first_token: usize, open_before: u32) {
-        let Some((close, text_diags)) = self.closing_quote_on_next_line() else {
+        let Some(close) = self.closing_quote_on_next_line() else {
             return self.unterminated_in(quote, first_token, open_before);
         };
         self.error(
@@ -571,15 +571,13 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             quote + 1,
             codes::MSG_UNTERMINATED_STRING,
         );
-        self.diags.extend(text_diags);
         self.pos = close;
         self.collapse(quote, first_token, open_before);
     }
 
     /// The offset just after the quote that closes a string cut at the line
-    /// end at `self.pos`, plus the diagnostics of the literal scanner for the
-    /// text before it, if the next line qualifies under [`Self::cut_text`].
-    fn closing_quote_on_next_line(&self) -> Option<(usize, Vec<Diagnostic>)> {
+    /// end at `self.pos`, if the next line qualifies under [`Self::cut_text`].
+    fn closing_quote_on_next_line(&self) -> Option<usize> {
         let rest = self.src.get(self.pos..)?;
         let start = self.pos
             + if rest.starts_with('\n') {
@@ -590,28 +588,29 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
                 return None;
             };
         let line_end = self.line_end_from(start);
-        let mut text_diags = Vec::new();
-        let (end, stop) = self
-            .literals
-            .string_text(self.src, start, self.file, &mut text_diags);
-        let quote_ok = stop == TextStop::Quote
-            && self.valid_end(start, end)
-            && end > start
-            && end <= line_end
-            && self.byte_before(end) == Some(b'"');
-        if !quote_ok {
+        let line = self.src.get(start..line_end)?;
+        // (a) Nothing but spaces and tabs before the quote.
+        let blank = line.len() - line.trim_start_matches([' ', '\t']).len();
+        if line.as_bytes().get(blank) != Some(&b'"') {
             return None;
         }
-        let cut_alone = |from: usize| {
-            let piece = self.src.get(from..line_end).unwrap_or("");
-            let (_, diags) = lex_with(piece, self.file, self.literals);
-            diags.iter().any(|d| d.code == codes::UNTERMINATED_STRING)
-        };
-        if cut_alone(start) && !cut_alone(end) {
-            Some((end, text_diags))
-        } else {
-            None
+        // (b) On its own the line is cut at exactly this quote.
+        let at = u32::try_from(blank).ok()?;
+        let (_, line_diags) = lex_with(line, self.file, self.literals);
+        let cut_here = line_diags
+            .iter()
+            .any(|d| d.code == codes::UNTERMINATED_STRING && d.span.start == at);
+        if !cut_here {
+            return None;
         }
+        // (c) The rest of the line is clean on its own. It continues the line,
+        // so its leading blanks are not indentation and are left out.
+        let after = line.get(blank + 1..)?.trim_start_matches([' ', '\t']);
+        let (_, rest_diags) = lex_with(after, self.file, self.literals);
+        if !rest_diags.is_empty() {
+            return None;
+        }
+        Some(start + blank + 1)
     }
 
     /// E0003: replaces every token of the string with one `Error` token from
