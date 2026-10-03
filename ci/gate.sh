@@ -46,9 +46,11 @@ export GATE_SCOPE="$scope"
 
 # touched_crates: prints the package names of the crates touched on this branch (committed,
 # staged, unstaged and untracked changes), one per line, or the single word "all" when the
-# set cannot be narrowed safely (no git checkout, unknown base, workspace, ci or shared test
-# files touched). Files under tests/ are read by tests of several crates (goldens, hostile
-# corpus, conformance vectors), so a change there runs the tests of every crate.
+# set cannot be narrowed safely (no git checkout, unknown base, workspace, ci, shared test or
+# example files touched). Files under tests/ and examples/ are read by tests of several crates
+# (goldens, hostile corpus, conformance vectors, example programs), so a change there runs the
+# tests of every crate. Renames are listed as delete plus add (--no-renames), so moving a file
+# out of tests/ or a crate still counts for its old path.
 touched_crates() {
   local base="${GATE_BASE:-origin/dev}" mb path dir name
   if [[ "$base" == -* ]] || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -62,7 +64,7 @@ touched_crates() {
   declare -A seen=()
   while IFS= read -r -d '' path; do
     case "$path" in
-      Cargo.toml | Cargo.lock | rust-toolchain.toml | .cargo/* | ci/* | tests/*)
+      Cargo.toml | Cargo.lock | rust-toolchain.toml | .cargo/* | ci/* | tests/* | examples/*)
         echo all
         return
         ;;
@@ -81,7 +83,7 @@ touched_crates() {
         seen["$name"]=1
         ;;
     esac
-  done < <(git diff --name-only -z "$mb" -- && git ls-files -z -o --exclude-standard)
+  done < <(git diff --no-renames --name-only -z "$mb" -- && git ls-files -z -o --exclude-standard)
   if [ ${#seen[@]} -gt 0 ]; then
     printf '%s\n' "${!seen[@]}" | sort
   fi
