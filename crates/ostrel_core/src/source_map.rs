@@ -10,7 +10,9 @@ pub const MAX_FILE_BYTES: usize = u32::MAX as usize;
 /// A 1 based line and column (SPEC 12.1).
 ///
 /// `column` is 1 plus the number of Unicode scalar values before the position on
-/// its line. A tab counts as one. Lines are separated by LF only.
+/// its line. A tab counts as one. Lines are separated by LF only. A byte order
+/// mark (U+FEFF) at byte 0 of the file is not counted, so line 1 column 1 starts
+/// after it (D68). U+FEFF anywhere else counts like any other character.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Location {
     /// 1 based line number.
@@ -48,6 +50,30 @@ struct SourceFile {
     /// Byte offset of the first byte of every line. Always starts with 0.
     line_starts: Vec<u32>,
 }
+
+impl SourceFile {
+    /// Byte length of the byte order mark at byte 0, or 0 if there is none.
+    fn bom_len(&self) -> usize {
+        if self.text.starts_with(BOM) {
+            BOM.len_utf8()
+        } else {
+            0
+        }
+    }
+
+    /// Byte offset where columns of the 0 based line `idx` start counting.
+    /// Equal to the line start, except on line 1 after a byte order mark.
+    fn column_origin(&self, idx: usize, line_start: usize) -> usize {
+        if idx == 0 {
+            line_start.max(self.bom_len())
+        } else {
+            line_start
+        }
+    }
+}
+
+/// The byte order mark that is skipped at byte 0 (D68).
+const BOM: char = '\u{FEFF}';
 
 /// Owns the text of every source file of one compiler run.
 #[derive(Debug, Default)]
@@ -145,7 +171,10 @@ impl SourceMap {
             .get(line_idx)
             .and_then(|&s| usize::try_from(s).ok())
             .unwrap_or(0);
-        let chars = f.text.get(line_start..pos).map_or(0, |s| s.chars().count());
+        // An offset inside or at the start of a leading byte order mark has
+        // already snapped back to 0, so `origin <= pos` holds whenever pos > 0.
+        let origin = f.column_origin(line_idx, line_start).min(pos);
+        let chars = f.text.get(origin..pos).map_or(0, |s| s.chars().count());
         Some(Location {
             line: u32::try_from(after.max(1)).unwrap_or(u32::MAX),
             column: u32::try_from(chars).unwrap_or(u32::MAX).saturating_add(1),
@@ -153,10 +182,14 @@ impl SourceMap {
     }
 
     /// The text of a 1 based line without its LF, if the file and line exist.
+    ///
+    /// Line 1 starts after a byte order mark at byte 0, so the scalar value at
+    /// index `column - 1` of the returned text is the one at that column.
     pub fn line_text(&self, file: FileId, line: u32) -> Option<&str> {
         let f = self.file(file)?;
         let idx = usize::try_from(line).ok()?.checked_sub(1)?;
-        let start = usize::try_from(*f.line_starts.get(idx)?).ok()?;
+        let line_start = usize::try_from(*f.line_starts.get(idx)?).ok()?;
+        let start = f.column_origin(idx, line_start);
         let end = match f.line_starts.get(idx + 1) {
             Some(&next) => usize::try_from(next).ok()?.checked_sub(1)?,
             None => f.text.len(),
@@ -228,5 +261,77 @@ mod tests {
         assert_eq!(map.location(f, 0), loc(1, 1));
         assert_eq!(map.line_count(f), Some(1));
         assert_eq!(map.line_text(f, 1), Some(""));
+    }
+
+    #[test]
+    fn bom_at_byte_zero_is_not_a_column() {
+        let mut map = SourceMap::new();
+        let f = map.add("b.ostl", "\u{FEFF}@x\nyz").unwrap();
+        // The BOM itself, any offset inside it and the first byte after it are 1:1.
+        assert_eq!(map.location(f, 0), loc(1, 1));
+        assert_eq!(map.location(f, 1), loc(1, 1));
+        assert_eq!(map.location(f, 2), loc(1, 1));
+        assert_eq!(map.location(f, 3), loc(1, 1));
+        assert_eq!(map.location(f, 4), loc(1, 2));
+        assert_eq!(map.location(f, 5), loc(1, 3));
+        // Line 2 is not affected.
+        assert_eq!(map.location(f, 6), loc(2, 1));
+        assert_eq!(map.location(f, 7), loc(2, 2));
+        assert_eq!(map.location(f, u32::MAX), loc(2, 3));
+        assert_eq!(map.line_text(f, 1), Some("@x"));
+        assert_eq!(map.line_text(f, 2), Some("yz"));
+        assert_eq!(map.text(f), Some("\u{FEFF}@x\nyz"));
+    }
+
+    #[test]
+    fn bom_only_file() {
+        let mut map = SourceMap::new();
+        let f = map.add("o.ostl", "\u{FEFF}").unwrap();
+        assert_eq!(map.location(f, 0), loc(1, 1));
+        assert_eq!(map.location(f, 3), loc(1, 1));
+        assert_eq!(map.location(f, u32::MAX), loc(1, 1));
+        assert_eq!(map.line_count(f), Some(1));
+        assert_eq!(map.line_text(f, 1), Some(""));
+    }
+
+    #[test]
+    fn bom_followed_by_line_feed() {
+        let mut map = SourceMap::new();
+        let f = map.add("n.ostl", "\u{FEFF}\n\u{FEFF}a").unwrap();
+        assert_eq!(map.location(f, 3), loc(1, 1));
+        assert_eq!(map.line_text(f, 1), Some(""));
+        // A BOM at the start of line 2 is not at byte 0 and counts.
+        assert_eq!(map.location(f, 4), loc(2, 1));
+        assert_eq!(map.location(f, 7), loc(2, 2));
+        assert_eq!(map.line_text(f, 2), Some("\u{FEFF}a"));
+    }
+
+    #[test]
+    fn only_the_first_bom_is_skipped() {
+        let mut map = SourceMap::new();
+        let f = map.add("d.ostl", "\u{FEFF}\u{FEFF}@").unwrap();
+        assert_eq!(map.location(f, 3), loc(1, 1));
+        assert_eq!(map.location(f, 6), loc(1, 2));
+        assert_eq!(map.line_text(f, 1), Some("\u{FEFF}@"));
+    }
+
+    #[test]
+    fn bom_after_byte_zero_counts_as_a_column() {
+        let mut map = SourceMap::new();
+        let f = map.add("m.ostl", "a\u{FEFF}@").unwrap();
+        assert_eq!(map.location(f, 4), loc(1, 3));
+        assert_eq!(map.line_text(f, 1), Some("a\u{FEFF}@"));
+    }
+
+    #[test]
+    fn caret_index_matches_column_after_bom() {
+        let mut map = SourceMap::new();
+        let text = "\u{FEFF}let \u{e9} = @";
+        let f = map.add("c.ostl", text).unwrap();
+        let at = text.find('@').unwrap();
+        let col = map.location(f, u32::try_from(at).unwrap()).unwrap().column;
+        let line = map.line_text(f, 1).unwrap();
+        let idx = usize::try_from(col - 1).unwrap();
+        assert_eq!(line.chars().nth(idx), Some('@'));
     }
 }
