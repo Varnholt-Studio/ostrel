@@ -211,7 +211,7 @@ fn runtime_error_keeps_output_and_renders_one_line() -> R {
     assert!(err.starts_with("div.ostl:3:"), "{err:?}");
     assert_eq!(err.lines().count(), 1, "{err:?}");
     assert!(
-        err.ends_with(": runtime error[DivisionByZero]: division by zero\n"),
+        err.ends_with(": runtime error[DivisionByZero]: division or remainder by zero\n"),
         "{err:?}"
     );
 
@@ -339,20 +339,29 @@ fn empty_file_is_e0400_at_the_first_column() {
     }
 }
 
+/// The CLI renders the fixed message of the kind (D83): the golden of
+/// `tests/runtime/step_limit_small` matches byte for byte, and a different
+/// `--max-steps` value changes neither the message nor the position.
 #[test]
-fn runtime_messages_name_the_limit() {
-    let limits = Limits {
-        max_steps: 5,
-        ..Limits::default()
-    };
-    assert_eq!(
-        pipeline::runtime_message(RuntimeErrorKind::StepLimit, limits),
-        "program exceeds the limit of 5 steps; raise it with `--max-steps`"
-    );
-    assert_eq!(
-        pipeline::runtime_message(RuntimeErrorKind::CallDepth, limits),
-        "call depth exceeds 10000 frames; is the recursion unbounded?"
-    );
+fn runtime_error_uses_the_fixed_message_of_its_kind() -> R {
+    let case = "tests/runtime/step_limit_small.ostl";
+    let expected = sibling(case, ".expected")?;
+    let expected_err = sibling(case, ".expected_err")?;
+    for max_steps in [1000, 500] {
+        let limits = Limits {
+            max_steps,
+            ..Limits::default()
+        };
+        let (exit, out, err) = execute_file(Mode::Run(limits), case)?;
+        assert_eq!(exit, Exit::Failure, "--max-steps {max_steps}");
+        assert_eq!(out, expected, "--max-steps {max_steps}");
+        assert_eq!(err, expected_err, "--max-steps {max_steps}");
+    }
+    assert!(expected_err.ends_with(&format!(
+        ": runtime error[StepLimit]: {}\n",
+        RuntimeErrorKind::StepLimit.message()
+    )));
+    Ok(())
 }
 
 #[test]
