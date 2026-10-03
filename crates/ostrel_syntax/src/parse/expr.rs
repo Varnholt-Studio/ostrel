@@ -498,7 +498,7 @@ mod tests {
     fn let_values(m: &Module) -> Vec<ExprId> {
         let mut values = Vec::new();
         for item in m.items() {
-            let Item::Fn(decl) = item;
+            let Item::Fn(decl) = item else { continue };
             let stmts = m.block(decl.body).map_or(&[][..], |b| &b.stmts[..]);
             for stmt in stmts.iter().filter_map(|s| m.stmt(*s)) {
                 if let StmtKind::Let { value, .. } = &stmt.kind {
@@ -547,6 +547,8 @@ mod tests {
                 out + ")"
             }
             ExprKind::Paren(inner) => format!("(paren {})", sexpr(m, *inner)),
+            // The v0.1 parser builds none of the v0.2 kinds.
+            other => format!("<unexpected {other:?}>"),
         }
     }
 
@@ -763,6 +765,11 @@ mod tests {
                     })
                     .collect(),
                 ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Name(_) => Vec::new(),
+                // The v0.1 parser builds none of the v0.2 kinds.
+                other => {
+                    texts.push(format!("<unexpected {other:?}>"));
+                    Vec::new()
+                }
             };
             children.reverse();
             todo.extend(children);

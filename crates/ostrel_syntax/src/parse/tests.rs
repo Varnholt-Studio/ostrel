@@ -349,8 +349,9 @@ fn rendered(path: &str, src: &str) -> String {
 fn fn_items(m: &Module) -> Vec<&FnDecl> {
     m.items()
         .iter()
-        .map(|item| match item {
-            Item::Fn(decl) => &**decl,
+        .filter_map(|item| match item {
+            Item::Fn(decl) => Some(&**decl),
+            _ => None,
         })
         .collect()
 }
