@@ -125,6 +125,9 @@ bidi_u2067_in_comment.ostl 1 1
 bidi_u2068_in_comment.ostl 1 1
 bidi_u2069_in_comment.ostl 1 1
 bidi_escape_in_string.ostl 0 0
+# Red #1069: 300 000 diagnostics on one line (E0011 and E0012, SPEC 12.6) within the limit.
+bidi_many_one_line.ostl 1 1 error[E0011]
+lone_close_brace_many_one_line.ostl 1 1 error[E0012]
 invisible_in_string.ostl 0 0
 invisible_in_comment.ostl 0 0
 # Identifiers are ASCII only; any other character where a token is expected is E0008
