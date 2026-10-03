@@ -339,7 +339,7 @@ pub struct Stmt {
     height: u32,
 }
 
-/// The statements of the v0.1 slice.
+/// The statements of a function body.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum StmtKind {
@@ -413,7 +413,7 @@ pub struct Expr {
     height: u32,
 }
 
-/// The expressions of the v0.1 slice.
+/// The expressions of the language.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ExprKind {
@@ -852,8 +852,9 @@ pub struct Member {
 /// The members of SYNTAX 7 `member`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MemberKind {
-    /// A field.
-    Field(FieldDecl),
+    /// A field. Boxed so that a member stays within the node size budget of
+    /// ARCHITECTURE 3.4.
+    Field(Box<FieldDecl>),
     /// A rule `verb [field] if cond`.
     Rule(RuleDecl),
     /// `check cond`, an invariant.
@@ -864,7 +865,7 @@ impl Member {
     /// A field member with an empty range, for tests.
     pub fn field(field: FieldDecl) -> Member {
         Member {
-            kind: MemberKind::Field(field),
+            kind: MemberKind::Field(Box::new(field)),
             range: TextRange::default(),
         }
     }
@@ -1611,9 +1612,10 @@ impl Module {
             } => m.attach_exprs([*element, *collection], att)?,
             ExprKind::Range { lo, hi } => m.attach_exprs([*lo, *hi], att)?,
             ExprKind::Catch { value, kinds } => {
+                // The kind names are leaves one level below `catch`. The
+                // value is at least that tall, so it alone gives the height.
                 let value = m.attach_expr(*value, att)?;
-                let kinds_height = u32::from(!kinds.is_empty());
-                return Ok((value.max(kinds_height), kinds.len()));
+                return Ok((value, kinds.len()));
             }
             ExprKind::Fallback { value, fallback } => m.attach_exprs([*value, *fallback], att)?,
             ExprKind::Set(items) | ExprKind::List(items) => {
@@ -2746,13 +2748,40 @@ mod v02_tests {
         .all(|flags| flags.iter().all(|f| *f))
     }
 
+    /// Every value the tree holds once per source construct must fit the
+    /// node budget of ARCHITECTURE 3.4: the arena entries and every element
+    /// type of a boxed slice. A declaration payload behind the `Box` of an
+    /// item, an expression or a view node is one allocation per node, as for
+    /// [`FnDecl`] in v0.1.
     #[test]
     fn v02_node_sizes_stay_within_d54_budget() {
-        assert!(std::mem::size_of::<Ty>() <= 64);
-        assert!(std::mem::size_of::<ViewNode>() <= 64);
-        assert!(std::mem::size_of::<Expr>() <= 64);
-        assert!(std::mem::size_of::<Stmt>() <= 64);
-        assert!(std::mem::size_of::<Item>() <= 64);
+        fn fits<T>() -> bool {
+            std::mem::size_of::<T>() <= 64
+        }
+        // Arena entries and items.
+        assert!(fits::<Ty>());
+        assert!(fits::<ViewNode>());
+        assert!(fits::<Expr>());
+        assert!(fits::<Stmt>());
+        assert!(fits::<Block>());
+        assert!(fits::<Item>());
+        // Elements of boxed slices.
+        assert!(fits::<Member>());
+        assert!(fits::<AppItem>());
+        assert!(fits::<Attr>());
+        assert!(fits::<Handler>());
+        assert!(fits::<ElementChild>());
+        assert!(fits::<FieldInit>());
+        assert!(fits::<TypedParam>());
+        assert!(fits::<MapEntry>());
+        assert!(fits::<StrPart>());
+        assert!(fits::<Ident>());
+        assert!(fits::<Param>());
+        // Inline parts of boxed payloads that sema walks per line.
+        assert!(fits::<SortKey>());
+        assert!(fits::<Take>());
+        assert!(fits::<CallRule>());
+        assert!(fits::<Cond>());
     }
 
     #[test]
@@ -2958,6 +2987,103 @@ mod v02_tests {
         let bare = m.query("items", None, None, None)?;
         assert_eq!(m.expr_height(bare), Some(1));
         assert_eq!(m.node_count(), 9);
+        Ok(())
+    }
+
+    /// Levels and counts that taller siblings hide in the larger tests: each
+    /// construct is built with leaf children only.
+    #[test]
+    fn app_and_enum_lines_are_one_level() -> R {
+        let mut m = Module::new();
+        m.app_item("Bare", vec![])?;
+        m.enum_item("Empty", &[])?;
+        // root > app
+        assert_eq!(m.height(), 2);
+        assert_eq!(m.node_count(), 3);
+        m.app_item("Chat", vec![AppItem::home("Main")])?;
+        // root > app > line
+        assert_eq!(m.height(), 3);
+        assert_eq!(m.node_count(), 5);
+        let mut e = Module::new();
+        e.enum_item("Status", &["open", "done"])?;
+        // root > enum > variant
+        assert_eq!(e.height(), 3);
+        assert_eq!(e.node_count(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn catch_kinds_are_leaves_below_catch() -> R {
+        let mut m = Module::new();
+        let x = m.name("x")?;
+        let caught = m.catch(x, &["Denied", "NotFound"])?;
+        // catch > name, and catch > kind
+        assert_eq!(m.expr_height(caught), Some(2));
+        // root, `x`, catch, 2 kinds
+        assert_eq!(m.node_count(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn sort_key_alone_is_one_level() -> R {
+        let mut m = Module::new();
+        let q = m.query("Message", None, Some(("made", true)), None)?;
+        // query > sort key
+        assert_eq!(m.expr_height(q), Some(2));
+        // root, query, sort key
+        assert_eq!(m.node_count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn view_params_count_and_rise() -> R {
+        let mut m = Module::new();
+        m.view_item("Empty", Some(vec![]), vec![])?;
+        m.view_item("Plain", None, vec![])?;
+        // root > view
+        assert_eq!(m.height(), 2);
+        assert_eq!(m.node_count(), 3);
+        let room = m.named_ty("Room")?;
+        let user = m.named_ty("User")?;
+        m.view_item(
+            "Card",
+            Some(vec![
+                TypedParam::bare("r", room),
+                TypedParam::bare("u", user),
+            ]),
+            vec![],
+        )?;
+        // root > view > param > type
+        assert_eq!(m.height(), 4);
+        // 2 types, the item and its 2 params
+        assert_eq!(m.node_count(), 8);
+        assert!(all_attached(&m));
+        Ok(())
+    }
+
+    #[test]
+    fn call_rule_is_one_level_below_the_fn() -> R {
+        let mut m = Module::new();
+        let cond = m.keyword(KeywordValue::Signed)?;
+        let body = m.block_of(vec![])?;
+        let before = m.node_count();
+        m.add_item(Item::PlacedFn(Box::new(PlacedFnDecl {
+            placement: Placement::Server,
+            name: Ident::bare("ping"),
+            params: Box::new([]),
+            result: None,
+            elevated: None,
+            call_rule: Some(CallRule {
+                cond,
+                range: TextRange::default(),
+            }),
+            body,
+            range: TextRange::default(),
+        })))?;
+        // item and call rule
+        assert_eq!(m.node_count(), before + 2);
+        // root > fn > call rule > `signed`
+        assert_eq!(m.height(), 4);
         Ok(())
     }
 
