@@ -150,6 +150,17 @@ if [ "$(cat "$d/args.txt" 2>/dev/null)" != "args: --commands run --ostrel $tmp/b
 fi
 expect on_red 1 "" "${base[@]}" HOSTILE_DIR="$d" HOSTILE_RUN_COMPILER=on OSTREL="$tmp/bin/real" FAKE_RUNNER_CODE=1
 
+# Default without override: the compiler pass is on (G-2, D73), so a missing release binary
+# is red and a present one is handed to the runner.
+expect default_on_missing_binary 1 "compiler binary not found" "${base[@]}" HOSTILE_DIR="$d" HOSTILE_RUN_COMPILER=
+rm -f "$d/args.txt"
+expect default_on_green 0 "" "${base[@]}" HOSTILE_DIR="$d" HOSTILE_RUN_COMPILER= OSTREL="$tmp/bin/real"
+n=$((n + 1))
+if [ "$(cat "$d/args.txt" 2>/dev/null)" != "args: --commands run --ostrel $tmp/bin/real" ]; then
+  echo "   selftest default_on_args: runner called with '$(cat "$d/args.txt" 2>/dev/null)'"
+  fail=1
+fi
+
 if [ $fail -ne 0 ]; then
   echo "   56_hostile_run selftest: FAILED"
   exit 1

@@ -16,10 +16,10 @@
 #   * every Kind of ARCHITECTURE 3.4 is expected by at least one case, and the three run
 #     cases named by AC-04 (deep recursion, overflow, long loop by recursion) are present.
 # Part 2, compiler pass: tests/hostile/run.sh --commands run --ostrel <release binary>.
-#   Switched on below once the CLI implements `ostrel run` (INT-4). While it is off, a probe
-#   program is run; when the binary already behaves like a real `ostrel run`, the check
-#   prints a warning so the switch is not forgotten. HOSTILE_RUN_COMPILER=on|off overrides
-#   the switch for local runs.
+#   On since the CLI runs programs (G-2, D73): a missing release binary or any failing case
+#   makes the check red in scope full. HOSTILE_RUN_COMPILER=on|off overrides the switch for
+#   local runs only; gate evidence is taken without it (D73). With the pass off, a probe
+#   program is run and a warning is printed when the binary already runs programs.
 #
 # Environment for the self test (56_hostile_run_selftest.sh): HOSTILE_DIR (default
 # tests/hostile), ERROR_REGISTRY (default tests/errors/README.md) and OSTREL (default $CARGO_TARGET_DIR/release/ostrel, else target/release/ostrel).
@@ -27,7 +27,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
-compiler_pass=off
+compiler_pass=on
 
 dir="${HOSTILE_DIR:-tests/hostile}"
 readme="$dir/README"
@@ -158,7 +158,7 @@ if [ "$mode" = on ]; then
   exit $?
 fi
 
-echo "   hostile run: compiler pass off until the CLI implements run (INT-4)"
+echo "   hostile run: compiler pass off (G-2 expects it on; HOSTILE_RUN_COMPILER is for local runs only)"
 if [ -x "$ostrel" ]; then
   probe_dir=$(mktemp -d) || exit 1
   printf 'fn main()\n  print("hostile-run-probe")\n' > "$probe_dir/probe.ostl"
