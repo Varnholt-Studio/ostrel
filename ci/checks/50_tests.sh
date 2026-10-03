@@ -132,6 +132,80 @@ else
 fi
 ac_05_gate_runs_fmt_clippy_tests "$PWD" || fail=1
 
+# quick_scope_selftest: runs a copy of ci/gate.sh with GATE_SCOPE=quick on a scratch git
+# repository whose only check prints GATE_CRATES, and proves the crate selection: a change
+# to one crate selects that crate, a change under tests/, examples/ or ci/ selects the whole
+# workspace (shared files there are read by several crates), moving a file out of tests/ or a
+# crate counts for its old path, and a change elsewhere selects none.
+quick_scope_selftest() {
+  local scratch bad=0
+  scratch=$(mktemp -d) || return 1
+  (
+    set -e
+    cd "$scratch"
+    git init -q -b main .
+    git config user.name selftest
+    git config user.email selftest@example.invalid
+    mkdir -p ci/checks crates/a/src tests/errors examples docs
+    cp "$OLDPWD/ci/gate.sh" ci/gate.sh
+    printf 'echo "CRATES=[$GATE_CRATES]"\n' >ci/checks/00_print.sh
+    printf '[package]\nname = "pkg_a"\n' >crates/a/Cargo.toml
+    : >crates/a/src/lib.rs
+    : >tests/errors/one.ostl
+    : >examples/hello.ostl
+    : >docs/notes.txt
+    git add -A
+    git commit -q -m base
+    git branch base
+  ) >/dev/null 2>&1 || {
+    echo "   quick scope selftest: setup failed"
+    rm -rf "$scratch"
+    return 1
+  }
+  # qs LABEL WANT FILE: appends to FILE on a fresh branch and expects GATE_CRATES=WANT.
+  qs() {
+    local label=$1 want=$2 file=$3 got
+    got=$(cd "$scratch" && git checkout -q -f base 2>/dev/null && git clean -qfd \
+      && echo x >>"$file" && GATE_SCOPE=quick GATE_BASE=base bash ci/gate.sh 2>&1 \
+      | sed -n 's/^CRATES=\[\(.*\)\]$/\1/p')
+    if [ "$got" != "$want" ]; then
+      echo "   quick scope selftest '$label': want crates [$want], got [$got]"
+      return 1
+    fi
+  }
+  # qm LABEL WANT FROM TO: commits 'git mv FROM TO' on a fresh branch and expects WANT.
+  qm() {
+    local label=$1 want=$2 from=$3 to=$4 got
+    got=$(cd "$scratch" && git checkout -q -f base 2>/dev/null && git clean -qfd \
+      && git checkout -q -B qm-move && git mv "$from" "$to" && git commit -q -m move \
+      && GATE_SCOPE=quick GATE_BASE=base bash ci/gate.sh 2>&1 \
+      | sed -n 's/^CRATES=\[\(.*\)\]$/\1/p')
+    if [ "$got" != "$want" ]; then
+      echo "   quick scope selftest '$label': want crates [$want], got [$got]"
+      return 1
+    fi
+  }
+  qs "crate change selects the crate" pkg_a crates/a/src/lib.rs || bad=1
+  qs "tests/ change selects the workspace" all tests/errors/one.ostl || bad=1
+  qs "new file under tests/ selects the workspace" all tests/errors/two.ostl || bad=1
+  qs "ci/ change selects the workspace" all ci/checks/00_print.sh || bad=1
+  qs "examples/ change selects the workspace" all examples/hello.ostl || bad=1
+  qs "other change selects no crate" "" docs/notes.txt || bad=1
+  qm "move out of tests/ selects the workspace" all tests/errors/one.ostl docs/one.ostl || bad=1
+  qm "move out of examples/ selects the workspace" all examples/hello.ostl docs/hello.ostl \
+    || bad=1
+  qm "move out of a crate selects the crate" pkg_a crates/a/src/lib.rs docs/lib.rs || bad=1
+  rm -rf "$scratch"
+  return $bad
+}
+
+if ! quick_scope_selftest; then
+  echo "   quick scope: self test failed"
+  fail=1
+else
+  echo "   quick_scope_selftest ok"
+fi
+
 # Rust
 list rs_code -name '*.rs'
 if [ -f Cargo.toml ] && [ "${GATE_SCOPE:-full}" = quick ]; then
