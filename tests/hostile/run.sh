@@ -96,14 +96,14 @@ for f in "$here"/cases/*.ostl "$corpus"/*.ostl; do
   where[$name]="$f"
 done
 
-# AC-04 named cases, RED-B F17 string cases, A2-16 run cases, SPEC 12.6 cases.
+# AC-04 named cases, RED-B F17 string cases, A2-16 run cases, SPEC 12.6 cases, red #1069.
 required="empty.ostl invalid_utf8.ostl nul_bytes.ostl random_1mib.ostl nest_paren_100k.ostl
   long_line_10mib_comment.ostl unterminated_string_eof.ostl string_literal_in_interp.ostl
   nested_interp.ostl double_brace.ostl escaped_braces.ostl run_deep_recursion.ostl
   run_overflow_add.ostl run_long_loop_by_recursion.ostl chain_below.ostl chain_above.ostl
   wide_below.ostl wide_above.ostl bidi_u202e_in_string.ostl bidi_u202e_in_comment.ostl
   bidi_u202e_in_style_comment.ostl duplicate_main.ostl lone_close_brace.ostl indent_jump.ostl
-  cr_only_lines.ostl"
+  cr_only_lines.ostl bidi_many_one_line.ostl lone_close_brace_many_one_line.ostl"
 for name in $required; do
   [ -n "${where[$name]:-}" ] || problem "required case missing: $name"
 done

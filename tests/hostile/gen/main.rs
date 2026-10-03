@@ -321,6 +321,16 @@ fn named_cases(out: &mut Out, seed: u64) -> io::Result<()> {
             format!("// a{c}b\nfn main()\n  print(1)\n").as_bytes(),
         )?;
     }
+    // Red #1069: one diagnostic per character on one long line. Each needs its column, so a
+    // column lookup that scans the line makes check quadratic (300 000 E0011 or E0012).
+    out.write(
+        "bidi_many_one_line.ostl",
+        format!("fn main()\n  print(\"{}\")\n", repeat("\u{202e}", 300_000)).as_bytes(),
+    )?;
+    out.write(
+        "lone_close_brace_many_one_line.ostl",
+        format!("fn main()\n  print(\"{}\")\n", repeat("}", 300_000)).as_bytes(),
+    )?;
     out.write(
         "bidi_escape_in_string.ostl",
         b"fn main()\n  print(\"a\\u{202E}b\\u{2066}c\")\n",

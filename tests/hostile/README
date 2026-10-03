@@ -113,6 +113,10 @@ missing diagnostic code must be reported, and an unknown command must exit 2.
   in a comment (`bidi_u*`, exit 1), the same characters as `\u{...}` escapes and other
   invisible characters in strings and comments (exit 0), non ASCII identifiers (E0008),
   and raw characters in `style` text (a CSS comment and a declaration value, exit 1).
+* Many diagnostics on one line (red #1069): `bidi_many_one_line` (300 000 raw U+202E in one
+  string, E0011) and `lone_close_brace_many_one_line` (300 000 `}` in one string, E0012) must
+  end within the `check` limit, so the column of each diagnostic may not depend on the line
+  length.
 * SPEC 12.6 (D68): `duplicate_main` (E0201), `lone_close_brace` (E0012) and `indent_jump`
   (E0013) exit 1; CRLF and one BOM at byte 0 are valid, a lone CR and a BOM inside code are
   E0008; an empty file is E0400. Codes are pinned in `expect.txt` once they are registered
