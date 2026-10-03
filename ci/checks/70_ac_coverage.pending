@@ -5,7 +5,6 @@
 # Keeping uncovered criteria visible but not blocking needs a decision of the QA lead
 # (Refs #57).
 AC-09
-AC-10
 AC-11
 AC-12
 AC-13
@@ -22,7 +21,6 @@ AC-27
 AC-28
 AC-29
 AC-30
-AC-31
 AC-32
 AC-33
 AC-34
