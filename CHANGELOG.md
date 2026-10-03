@@ -15,10 +15,12 @@ pipeline and produces a result. This release covers the core language only.
   reports diagnostics, `ostrel run [--max-steps N] FILE` compiles a script program and runs its
   `fn main()`. `ostrel --help` and `ostrel --version` print usage and version.
 - Exit codes: 0 on success, 1 for any diagnostic or runtime error, 2 for a usage error. Exit code
-  70 marks an internal defect of the compiler and is always a bug.
+  70 marks an internal defect of the compiler and exit code 101 a crash (panic) of the compiler.
+  Both are always a bug.
 - Lexer with indentation based layout, string interpolation and escapes, and strict handling of
-  source text: invalid UTF-8, a byte order mark inside code, and bidirectional control characters
-  are rejected with their own diagnostics.
+  source text: invalid UTF-8 (`E0014`) and bidirectional control characters (`E0011`) are
+  rejected with their own codes. A byte order mark at the start of a file is skipped; one inside
+  code, like any other unexpected character, is rejected as `E0008`.
 - Parser, type checker, intermediate representation and a bytecode virtual machine for the core
   language: `Int`, `Bool` and `Text` values, `let`, functions with and without a result, `if` and
   `else`, `return`, recursion and `print`.
