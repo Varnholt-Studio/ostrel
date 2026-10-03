@@ -1,6 +1,7 @@
 //! Source files and the mapping from byte offsets to line and column.
 
 use std::fmt;
+use std::sync::OnceLock;
 
 use crate::span::FileId;
 
@@ -49,6 +50,10 @@ struct SourceFile {
     text: String,
     /// Byte offset of the first byte of every line. Always starts with 0.
     line_starts: Vec<u32>,
+    /// Column index, built on the first [`SourceMap::location`] call of the file.
+    /// Entry `k` is the number of Unicode scalar values that start before byte
+    /// `k * CHECKPOINT_STRIDE`; the last entry is the count for the whole text.
+    checkpoints: OnceLock<Vec<u32>>,
 }
 
 impl SourceFile {
@@ -70,6 +75,45 @@ impl SourceFile {
             line_start
         }
     }
+
+    /// Number of Unicode scalar values that start before byte `pos`, which must
+    /// be a char boundary. Scans at most [`CHECKPOINT_STRIDE`] bytes, so a
+    /// column costs the same on a long line as on a short one.
+    fn scalars_before(&self, pos: usize) -> usize {
+        let bytes = self.text.as_bytes();
+        let checkpoints = self.checkpoints.get_or_init(|| build_checkpoints(bytes));
+        let block = pos / CHECKPOINT_STRIDE;
+        let base = checkpoints
+            .get(block)
+            .and_then(|&n| usize::try_from(n).ok())
+            .unwrap_or(0);
+        let start = block * CHECKPOINT_STRIDE;
+        base + bytes.get(start..pos).map_or(0, count_scalar_starts)
+    }
+}
+
+/// Bytes between two entries of the column index. Bounds the scan per lookup
+/// and keeps the index at one `u32` per 256 bytes of text.
+const CHECKPOINT_STRIDE: usize = 256;
+
+/// Number of Unicode scalar values starting in `bytes`: every byte that is not
+/// a UTF-8 continuation byte starts one.
+fn count_scalar_starts(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b & 0xC0 != 0x80).count()
+}
+
+fn build_checkpoints(bytes: &[u8]) -> Vec<u32> {
+    let mut checkpoints = Vec::with_capacity(bytes.len() / CHECKPOINT_STRIDE + 2);
+    let mut total: u32 = 0;
+    for chunk in bytes.chunks(CHECKPOINT_STRIDE) {
+        checkpoints.push(total);
+        // At most CHECKPOINT_STRIDE per chunk, and the text has at most
+        // u32::MAX bytes, so the sum never saturates.
+        let n = u32::try_from(count_scalar_starts(chunk)).unwrap_or(u32::MAX);
+        total = total.saturating_add(n);
+    }
+    checkpoints.push(total);
+    checkpoints
 }
 
 /// The byte order mark that is skipped at byte 0 (D68).
@@ -113,6 +157,7 @@ impl SourceMap {
             path: path.into(),
             text,
             line_starts,
+            checkpoints: OnceLock::new(),
         });
         Ok(FileId::from_raw(id))
     }
@@ -149,6 +194,10 @@ impl SourceMap {
 
     /// Line and column of a byte offset.
     ///
+    /// Takes time independent of the length of the line (after a one time pass
+    /// over the file on the first call), so many diagnostics on one long line
+    /// stay linear in total.
+    ///
     /// Returns `None` only for an unknown file. An offset past the end of the
     /// text is treated as the end of the text, and an offset inside a multi byte
     /// character as the start of that character, so a wrong span from a buggy or
@@ -174,7 +223,9 @@ impl SourceMap {
         // An offset inside or at the start of a leading byte order mark has
         // already snapped back to 0, so `origin <= pos` holds whenever pos > 0.
         let origin = f.column_origin(line_idx, line_start).min(pos);
-        let chars = f.text.get(origin..pos).map_or(0, |s| s.chars().count());
+        let chars = f
+            .scalars_before(pos)
+            .saturating_sub(f.scalars_before(origin));
         Some(Location {
             line: u32::try_from(after.max(1)).unwrap_or(u32::MAX),
             column: u32::try_from(chars).unwrap_or(u32::MAX).saturating_add(1),
@@ -333,5 +384,127 @@ mod tests {
         let line = map.line_text(f, 1).unwrap();
         let idx = usize::try_from(col - 1).unwrap();
         assert_eq!(line.chars().nth(idx), Some('@'));
+    }
+
+    /// The column rule of [`Location`], counted directly from the text.
+    fn naive_location(text: &str, offset: usize) -> Location {
+        let mut pos = offset.min(text.len());
+        while !text.is_char_boundary(pos) {
+            pos -= 1;
+        }
+        let line_start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
+        let bom = if text.starts_with(BOM) {
+            BOM.len_utf8()
+        } else {
+            0
+        };
+        let origin = if line_start == 0 {
+            bom.min(pos)
+        } else {
+            line_start
+        };
+        Location {
+            line: u32::try_from(text[..pos].matches('\n').count() + 1).unwrap(),
+            column: u32::try_from(text[origin..pos].chars().count() + 1).unwrap(),
+        }
+    }
+
+    fn assert_matches_naive(text: &str) {
+        let mut map = SourceMap::new();
+        let f = map.add("n.ostl", text).unwrap();
+        for offset in 0..=text.len() + 2 {
+            let got = map.location(f, u32::try_from(offset).unwrap());
+            assert_eq!(got, Some(naive_location(text, offset)), "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn columns_across_index_checkpoints() {
+        // Lengths just below, at and above one and two strides, multi byte
+        // characters straddling a checkpoint, a BOM and several lines.
+        for len in [0, 1, 255, 256, 257, 511, 512, 513] {
+            assert_matches_naive(&"a".repeat(len));
+        }
+        for shift in 0..4 {
+            let mut text = "a".repeat(254 + shift);
+            text.push_str("\u{1F600}\u{e9}\u{202E}x\n");
+            text.push_str(&"\u{20AC}".repeat(200));
+            text.push_str("\n\u{FEFF}y");
+            assert_matches_naive(&text);
+            assert_matches_naive(&format!("\u{FEFF}{text}"));
+        }
+        assert_matches_naive(&"\u{202E}".repeat(700));
+        assert_matches_naive(&"}\n".repeat(300));
+    }
+
+    #[test]
+    fn last_column_of_a_long_line() {
+        let text = format!("fn main()\n  print(\"{}\")\n", "\u{202E}".repeat(100_000));
+        let mut map = SourceMap::new();
+        let f = map.add("l.ostl", text.as_str()).unwrap();
+        let end = u32::try_from(text.rfind('"').unwrap()).unwrap();
+        assert_eq!(map.location(f, end), loc(2, 100_010));
+        assert_eq!(map.location(f, end + 1), loc(2, 100_011));
+    }
+
+    /// Asserts that `run` does linear work in the size of its input, without an
+    /// absolute time bound (D74). The rule of `ostrel_syntax::test_support`:
+    /// one run on an input of size `small * 16` against 16 runs on inputs of
+    /// size `small`, alternating, fastest of three rounds per side. Linear work
+    /// gives a ratio of about 1, quadratic work about 16; the bound is 4.
+    fn assert_linear<T, R>(small: usize, build: impl Fn(usize) -> T, run: impl Fn(&T) -> R) {
+        use std::time::{Duration, Instant};
+        const FACTOR: usize = 16;
+        const MAX_RATIO: u32 = 4;
+        let smalls: Vec<T> = (0..FACTOR).map(|_| build(small)).collect();
+        let large = build(small * FACTOR);
+        let mut batch_time = Duration::MAX;
+        let mut large_time = Duration::MAX;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let outputs: Vec<R> = smalls.iter().map(&run).collect();
+            batch_time = batch_time.min(start.elapsed());
+            drop(outputs);
+
+            let start = Instant::now();
+            let output = run(&large);
+            large_time = large_time.min(start.elapsed());
+            drop(output);
+        }
+        let bound = batch_time.max(Duration::from_micros(100)) * MAX_RATIO;
+        assert!(
+            large_time < bound,
+            "not linear: {batch_time:?} for {FACTOR} inputs of size {small}, \
+             {large_time:?} for one input of size {}",
+            small * FACTOR
+        );
+    }
+
+    /// Red #1069: one diagnostic per character of one long line.
+    fn every_column_of_one_line(n: usize, unit: &str) {
+        assert_linear(
+            n,
+            |n| {
+                let mut map = SourceMap::new();
+                let f = map.add("x.ostl", format!("{}\n", unit.repeat(n))).unwrap();
+                (map, f, n)
+            },
+            |(map, f, n)| {
+                let step = unit.len();
+                (0..*n)
+                    .map(|i| {
+                        map.location(*f, u32::try_from(i * step).unwrap())
+                            .unwrap()
+                            .column
+                    })
+                    .max()
+            },
+        );
+    }
+
+    #[test]
+    fn many_locations_on_one_line_are_linear() {
+        every_column_of_one_line(4_000, "\u{202E}");
+        every_column_of_one_line(4_000, "}");
     }
 }
