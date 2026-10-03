@@ -18,7 +18,8 @@
 #   --count N          number of seeded cases (default 200)
 #   --seed S           base seed of the generator (default: built into the generator)
 #
-# Limits are read from the table in tests/hostile/README, nowhere else (A2-20).
+# Limits are read from the table in tests/hostile/README, nowhere else (A2-20). Time limits
+# are CPU time of the compiler process; wall clock is only a 60 s hang guard (D93).
 # Uses bash, coreutils and rustc from the pinned toolchain; no network.
 set -uo pipefail
 
@@ -151,10 +152,33 @@ case " ${commands:-} " in
   *" fmt "*) [ "$lim_fmt" != "-" ] || { echo "HOSTILE FAIL: --commands fmt, but milestone $milestone has no fmt limit in tests/hostile/README"; exit 1; } ;;
 esac
 mem_kib=$((lim_mem * 1024))
+errfile="$out/stderr.txt"
+# Wall clock guard against a hang (D93). It is not a time criterion; the limits of the README
+# are CPU time. Only the runner self test changes it.
+hang_guard=60
+
+# limited LIM ARGS...: runs ARGS with stdin from /dev/null and stderr in $errfile, under the
+# memory limit, LIM seconds of CPU time (user+sys, D93: soft limit, SIGXCPU; hard limit one
+# second later, SIGKILL) and the wall clock hang guard. Sets code to the exit code and stop
+# to "" (the process ended by itself), cpu (CPU time limit) or hang (hang guard). No core
+# files; the shell's own message about the signal is dropped.
+limited() {
+  local lim="$1" start=$SECONDS
+  shift
+  { ( ulimit -c 0; ulimit -v "$mem_kib"; ulimit -S -t "$lim"; ulimit -H -t $((lim + 1))
+      exec timeout -k 1 "$hang_guard" "$@" ) < /dev/null > /dev/null 2> "$errfile"; } 2> /dev/null
+  code=$?
+  stop=""
+  case "$code" in
+    124) stop=hang ;;
+    152) stop=cpu ;;
+    137) if [ $((SECONDS - start)) -ge "$hang_guard" ]; then stop=hang; else stop=cpu; fi ;;
+  esac
+}
 
 # run_cases BINARY "COMMANDS" NAME...: runs BINARY on the named cases, reports through problem.
 run_cases() {
-  local bin="$1" cmds="$2" name f cmd lim code want errfile="$out/stderr.txt"
+  local bin="$1" cmds="$2" name f cmd lim want
   shift 2
   total=0
   for name in "$@"; do
@@ -162,17 +186,20 @@ run_cases() {
     for cmd in $cmds; do
       case "$cmd" in check) lim=$lim_check ;; run) lim=$lim_run ;; *) lim=$lim_fmt ;; esac
       total=$((total + 1))
-      ( ulimit -v "$mem_kib"; exec timeout -k 1 "$lim" "$bin" "$cmd" "$f" ) < /dev/null > /dev/null 2> "$errfile"
-      code=$?
+      limited "$lim" "$bin" "$cmd" "$f"
+      if [ "$stop" = hang ]; then
+        problem "$cmd $name: hang guard: no exit within ${hang_guard}s wall clock (code $code)"
+        continue
+      elif [ "$stop" = cpu ]; then
+        if [ "$cmd" = run ] && [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ]; then
+          problem "run $name: default StepLimit not reached within ${lim}s CPU time (code $code); defect, BLOCKER to chief per SPEC 12.4, do not loosen the limit"
+        else
+          problem "$cmd $name: CPU time limit of ${lim}s exceeded (code $code)"
+        fi
+        continue
+      fi
       case "$code" in
         0|1) ;;
-        124|137)
-          if [ "$cmd" = run ] && [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ]; then
-            problem "run $name: default StepLimit not reached within ${lim}s (code $code); defect, BLOCKER to chief per SPEC 12.4, do not loosen the limit"
-          else
-            problem "$cmd $name: no exit within ${lim}s (code $code)"
-          fi
-          continue ;;
         101) problem "$cmd $name: panic (exit 101)"; continue ;;
         *) if [ "$code" -gt 128 ]; then problem "$cmd $name: killed by signal $((code - 128))"; else problem "$cmd $name: exit $code, expected 0 or 1"; fi; continue ;;
       esac
@@ -194,9 +221,12 @@ run_cases() {
     case " $cmds " in *" run "*) ;; *) continue ;; esac
     if [ "${exp_err[$name]:-}" = "runtime error[StepLimit]" ]; then
       total=$((total + 1))
-      ( ulimit -v "$mem_kib"; exec timeout -k 1 "$lim_run" "$bin" run --max-steps "$small_steps" "$f" ) < /dev/null > /dev/null 2> "$errfile"
-      code=$?
-      if [ "$code" != 1 ]; then
+      limited "$lim_run" "$bin" run --max-steps "$small_steps" "$f"
+      if [ "$stop" = hang ]; then
+        problem "run --max-steps $small_steps $name: hang guard: no exit within ${hang_guard}s wall clock (code $code)"
+      elif [ "$stop" = cpu ]; then
+        problem "run --max-steps $small_steps $name: CPU time limit of ${lim_run}s exceeded (code $code)"
+      elif [ "$code" != 1 ]; then
         problem "run --max-steps $small_steps $name: exit $code, expected 1; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
       elif ! grep -qF -- "runtime error[StepLimit]" "$errfile"; then
         problem "run --max-steps $small_steps $name: stderr lacks 'runtime error[StepLimit]'; stderr: $(head -c 300 "$errfile" | tr '\n' ' ')"
@@ -258,6 +288,41 @@ if [ "$mode" = self ]; then
   stub_run check "run duplicate_main.ostl" duplicate_main.ostl || problem "runner self test: '--commands check' looked at the run half"
   # A diagnostic code is checked under check too (SPEC 12.6).
   stub_run check "stderr duplicate_main.ostl" duplicate_main.ostl && problem "runner self test: missing error[E0201] under check not reported"
+  # Time limits (D93): CPU time over the limit is red under check, run and the --max-steps
+  # second run; wall clock over the limit is not, unless the hang guard fires. Fake compilers
+  # with a 1 s limit keep this short.
+  fake="$out/bin/fake"
+  mkdir -p "$fake"
+  printf '#!/usr/bin/env bash\nwhile :; do :; done\n' > "$fake/spin"
+  printf '#!/usr/bin/env bash\n[ "${2:-}" = --max-steps ] && while :; do :; done\nexec "%s" "$@"\n' "$stub" > "$fake/spin_small_steps"
+  printf '#!/usr/bin/env bash\nsleep 2\nexec "%s" "$@"\n' "$stub" > "$fake/sleep"
+  printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$fake/hang"
+  chmod +x "$fake"/*
+  # time_run BINARY COMMANDS HANG_GUARD CASE: like stub_run with limits of 1 s CPU time.
+  time_run() {
+    : > "$stub_log"
+    ( fail=0 lim_check=1 lim_run=1 lim_fmt=1 hang_guard="$3"
+      export HOSTILE_STUB_LOG="$stub_log" HOSTILE_STUB_EXPECT="$here/expect.txt" HOSTILE_STUB_BREAK=""
+      run_cases "$1" "$2" "$4" > "$out/stub.out"
+      exit $fail )
+  }
+  # time_red LABEL TEXT BINARY COMMANDS HANG_GUARD CASE: the run must fail and name TEXT.
+  time_red() {
+    local label="$1" text="$2"
+    shift 2
+    if time_run "$@"; then
+      problem "runner self test: $label not reported"
+    elif ! grep -qF -- "$text" "$out/stub.out"; then
+      problem "runner self test: $label reported without '$text': $(head -c 300 "$out/stub.out" | tr '\n' ' ')"
+    fi
+  }
+  time_red "CPU time over the limit under check" "check duplicate_main.ostl: CPU time limit of 1s exceeded" "$fake/spin" check 60 duplicate_main.ostl
+  time_red "CPU time over the limit under run" "run run_overflow_add.ostl: CPU time limit of 1s exceeded" "$fake/spin" run 60 run_overflow_add.ostl
+  time_red "default StepLimit over the CPU time limit" "run run_long_loop_by_recursion.ostl: default StepLimit not reached within 1s CPU time" "$fake/spin" run 60 run_long_loop_by_recursion.ostl
+  time_red "CPU time over the limit in the --max-steps run" "run --max-steps $small_steps run_long_loop_by_recursion.ostl: CPU time limit of 1s exceeded" "$fake/spin_small_steps" run 60 run_long_loop_by_recursion.ostl
+  time_run "$fake/sleep" run 60 run_overflow_add.ostl || problem "runner self test: wall clock over the CPU time limit reported as a failure: $(head -c 300 "$out/stub.out" | tr '\n' ' ')"
+  time_red "hang guard" "run run_overflow_add.ostl: hang guard: no exit within 1s wall clock" "$fake/hang" run 1 run_overflow_add.ostl
+  rm -rf "$fake"
   for bad in "bogus" "" "run,lint"; do
     bash "$here/run.sh" --commands "$bad" --self-test > /dev/null 2>&1
     [ $? = 2 ] || problem "runner self test: --commands '$bad' does not exit 2"

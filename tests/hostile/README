@@ -3,13 +3,15 @@
 Acceptance criterion AC-04 (and AC-36 from v0.3): no input file makes the Ostrel compiler
 panic, crash, hang or exhaust memory. Every file of the corpus is given to both
 `ostrel check <file>` and `ostrel run <file>`; each must end within the limit below with
-exit code 0 or 1. Exit code 101 (panic), any signal, exit code 2 or a timeout is a failure.
+exit code 0 or 1. Exit code 101 (panic), any signal, exit code 2, the CPU time limit or the
+hang guard is a failure.
 
 ## Limits per milestone
 
 This table is the only place where the limits are written down (A2-20). `run.sh` reads it.
-Times are wall clock seconds per case and per command, memory is the virtual memory limit
-of the compiler process. `-` means the command is not run in that milestone.
+Times are CPU seconds (user+sys) of the compiler process per case and per command (D93),
+memory is the virtual memory limit of the compiler process. `-` means the command is not
+run in that milestone.
 
 | Milestone | check (s) | run (s) | fmt (s) | memory (MiB) |
 |---|---|---|---|---|
@@ -29,9 +31,21 @@ default `StepLimit` cannot be reached within the `run` time limit on the gate ma
 is a compiler defect reported as BLOCKER to the chief; QA does not loosen the time limit
 and does not lower the step limit to hide it. `run.sh` names this in the failure message.
 
-ASSUMPTION: the margin between 100 000 000 steps and 5 s on the 2 core gate machine is not
-measured yet, because no VM exists. It is measured with the first VM build (time of
-`run_long_loop_by_recursion.ostl` on the gate machine) and written here.
+Measurement condition (D93): the `run` limit of 5 s is CPU time (user+sys) of the `ostrel`
+process, not wall clock, because wall clock on the shared 2 core gate machine measures the
+load of the machine and not the compiler. Measured on dev eddcf36, release binary, 2 cores,
+`run_long_loop_by_recursion.ostl` (default step limit, exit 1 with `StepLimit` in all 11
+runs): CPU user 2.34 to 2.60 s, sys at most 0.12 s, total at most 2.72 s, a margin of factor
+1.84 to the 5 s limit, independent of load. For comparison, wall clock was 3.47 to 4.28 s
+at a load of about 1.5 and 12.68 to 13.73 s with four extra busy loops. If the CPU time of
+this case rises above 4 s (margin under 1.25), that is a FINDING to T2 and the chief.
+
+How `run.sh` applies the limits (D93): every `check`, `run` and `fmt` call and the
+`--max-steps` second run below gets a soft CPU limit of the README value (`ulimit -t`; the
+process gets SIGXCPU) and a hard limit one second later (SIGKILL). Either signal is a
+failure, reported as "CPU time limit". A wall clock guard of 60 s (`timeout -k 1 60`) only
+catches a process that hangs without using CPU; it is reported as "hang guard" and is not a
+time criterion.
 
 To check the `StepLimit` path independently of machine speed, every case that expects
 `runtime error[StepLimit]` runs a second time with a small step limit and must again end
@@ -99,7 +113,10 @@ required case exists (the seven named cases of AC-04, the string cases of RED-B 
 small, and that two generator runs produce the same manifest. It also tests the runner
 itself against `stub_ostrel.sh`, a stand-in that answers every committed case as
 `expect.txt` says: each `--commands` set must make exactly its calls, a wrong exit code or a
-missing diagnostic code must be reported, and an unknown command must exit 2.
+missing diagnostic code must be reported, and an unknown command must exit 2. With fake
+compilers and a limit of 1 s it shows that a CPU loop is red under `check`, `run` and the
+`--max-steps` second run, that a call sleeping longer than the limit on the wall clock but
+well under the hang guard stays green, and that the hang guard reports a hanging call.
 
 ## Coverage
 
