@@ -19,7 +19,10 @@
 #   On since the CLI runs programs (G-2, D73): a missing release binary or any failing case
 #   makes the check red in scope full. HOSTILE_RUN_COMPILER=on|off overrides the switch for
 #   local runs only; gate evidence is taken without it (D73). With the pass off, a probe
-#   program is run and a warning is printed when the binary already runs programs.
+#   program is run: when the binary already runs programs, the check is red (D73), because a
+#   warning in a green gate would leave the run half of AC-04 unchecked.
+#   Time limits are CPU seconds of the compiler process (D93): `ulimit -t` with the v0.1 run
+#   limit of the README; the wall clock is only a hang guard of 60 s and no time criterion.
 #
 # Environment for the self test (56_hostile_run_selftest.sh): HOSTILE_DIR (default
 # tests/hostile), ERROR_REGISTRY (default tests/errors/README.md) and OSTREL (default $CARGO_TARGET_DIR/release/ostrel, else target/release/ostrel).
@@ -160,13 +163,22 @@ fi
 
 echo "   hostile run: compiler pass off (G-2 expects it on; HOSTILE_RUN_COMPILER is for local runs only)"
 if [ -x "$ostrel" ]; then
+  hang_guard=60
   probe_dir=$(mktemp -d) || exit 1
   printf 'fn main()\n  print("hostile-run-probe")\n' > "$probe_dir/probe.ostl"
-  out=$( (ulimit -v $((lim_mem * 1024)); exec timeout -k 1 "$lim_run_v01" "$ostrel" run "$probe_dir/probe.ostl") < /dev/null 2> /dev/null)
+  # CPU time limit as in tests/hostile/run.sh (D93): soft limit sends SIGXCPU, hard limit
+  # one second later SIGKILL; the wall clock only guards against a hang.
+  out=$( (ulimit -c 0; ulimit -v $((lim_mem * 1024)); ulimit -S -t "$lim_run_v01"
+      ulimit -H -t $((lim_run_v01 + 1))
+      exec timeout -k 1 "$hang_guard" "$ostrel" run "$probe_dir/probe.ostl") < /dev/null 2> /dev/null)
   code=$?
   rm -rf "$probe_dir"
+  if [ "$code" = 124 ]; then
+    echo "   hostile run: probe stopped by the hang guard (${hang_guard} s wall clock)"
+  fi
   if [ "$code" = 0 ] && [ "$out" = "hostile-run-probe" ]; then
-    echo "   hostile run: WARNING: $ostrel already runs programs; switch compiler_pass on in ci/checks/56_hostile_run.sh (G-2)"
+    echo "   hostile run: FAIL: $ostrel already runs programs while the compiler pass is off; switch compiler_pass on in ci/checks/56_hostile_run.sh and do not set HOSTILE_RUN_COMPILER=off (G-2, D73)"
+    exit 1
   fi
 fi
 exit 0

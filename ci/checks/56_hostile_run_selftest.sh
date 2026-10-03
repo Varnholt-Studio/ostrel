@@ -44,7 +44,11 @@ fixture() {
 mkdir -p "$tmp/bin"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/bin/stub"
 printf '#!/usr/bin/env bash\n[ "$1" = run ] && grep -q hostile-run-probe "$2" && echo hostile-run-probe\nexit 0\n' > "$tmp/bin/real"
-chmod +x "$tmp/bin/stub" "$tmp/bin/real"
+# Time limit fakes (D93): one runs the probe after 2 s of wall clock without using CPU, one
+# burns far more than 1 s of CPU (a fixed amount of work, independent of load) first.
+printf '#!/usr/bin/env bash\nsleep 2\n[ "$1" = run ] && grep -q hostile-run-probe "$2" && echo hostile-run-probe\nexit 0\n' > "$tmp/bin/sleepy"
+printf '#!/usr/bin/env bash\nfor ((i = 0; i < 3000000; i++)); do :; done\n[ "$1" = run ] && grep -q hostile-run-probe "$2" && echo hostile-run-probe\nexit 0\n' > "$tmp/bin/busy"
+chmod +x "$tmp/bin/stub" "$tmp/bin/real" "$tmp/bin/sleepy" "$tmp/bin/busy"
 
 base=(HOSTILE_DIR= GATE_SCOPE=full HOSTILE_RUN_COMPILER=off OSTREL="$tmp/bin/missing")
 
@@ -115,11 +119,31 @@ expect off_no_binary 0 "compiler pass off" "${base[@]}" HOSTILE_DIR="$d"
 expect off_stub 0 "compiler pass off" "${base[@]}" HOSTILE_DIR="$d" OSTREL="$tmp/bin/stub"
 out=$(env "${base[@]}" HOSTILE_DIR="$d" OSTREL="$tmp/bin/stub" bash "$check" 2>&1)
 n=$((n + 1))
-if grep -q WARNING <<< "$out"; then
-  echo "   selftest off_stub_quiet: placeholder binary must not trigger the warning"
+if grep -q "already runs programs" <<< "$out"; then
+  echo "   selftest off_stub_quiet: placeholder binary must not be taken for a running compiler"
   fail=1
 fi
-expect off_real_warns 0 "WARNING" "${base[@]}" HOSTILE_DIR="$d" OSTREL="$tmp/bin/real"
+# Pass off while the binary already runs programs: red, not a warning (D73, ylvi #1052).
+expect off_real_red 1 "already runs programs while the compiler pass is off" "${base[@]}" HOSTILE_DIR="$d" OSTREL="$tmp/bin/real"
+
+# The probe limit is CPU time (D93). With a v0.1 run limit of 1 s, a probe that waits 2 s of
+# wall clock is still detected (a wall clock limit would hide it), and a probe that burns
+# more than 1 s of CPU is stopped before it prints.
+d=$(fixture cpu_limit)
+sed -i -E 's/^\| v0\.1 \| ([^|]*)\| [^|]*\|/| v0.1 | \1| 1 |/' "$d/README"
+n=$((n + 1))
+if ! grep -qE '^\| v0\.1 \| [^|]*\| 1 \|' "$d/README"; then
+  echo "   selftest cpu_limit_fixture: could not set the v0.1 run limit to 1 s"
+  fail=1
+fi
+expect off_probe_wall_clock_red 1 "already runs programs" "${base[@]}" HOSTILE_DIR="$d" OSTREL="$tmp/bin/sleepy"
+expect off_probe_cpu_stopped 0 "compiler pass off" "${base[@]}" HOSTILE_DIR="$d" OSTREL="$tmp/bin/busy"
+out=$(env "${base[@]}" HOSTILE_DIR="$d" OSTREL="$tmp/bin/busy" bash "$check" 2>&1)
+n=$((n + 1))
+if grep -q "already runs programs" <<< "$out"; then
+  echo "   selftest off_probe_cpu_quiet: probe over the CPU limit must be stopped before it prints"
+  fail=1
+fi
 expect bad_switch 1 "must be on or off" "${base[@]}" HOSTILE_DIR="$d" HOSTILE_RUN_COMPILER=maybe
 expect quick_skips 0 "skipped (GATE_SCOPE=quick)" "${base[@]}" HOSTILE_DIR="$d" GATE_SCOPE=quick HOSTILE_RUN_COMPILER=on
 
