@@ -8,7 +8,9 @@
 #   GATE_SCOPE unset or "full"  every check on the whole workspace. Only this is evidence.
 #   GATE_SCOPE=quick            for builders: Rust checks only for the crates touched on the
 #                               branch against GATE_BASE (default origin/dev); checks may
-#                               skip expensive steps such as the release build.
+#                               skip expensive steps such as the release build. A change
+#                               under tests/ or ci/ widens the set to the whole workspace,
+#                               because crate tests read the shared suites under tests/.
 # The last line is "GATE: GRUEN (<scope>)" or "GATE: ROT (<scope>)". The scope in that line
 # is derived from GATE_SCOPE only, so a quick run never prints the full line.
 #
@@ -44,7 +46,9 @@ export GATE_SCOPE="$scope"
 
 # touched_crates: prints the package names of the crates touched on this branch (committed,
 # staged, unstaged and untracked changes), one per line, or the single word "all" when the
-# set cannot be narrowed safely (no git checkout, unknown base, workspace or ci files touched).
+# set cannot be narrowed safely (no git checkout, unknown base, workspace, ci or shared test
+# files touched). Files under tests/ are read by tests of several crates (goldens, hostile
+# corpus, conformance vectors), so a change there runs the tests of every crate.
 touched_crates() {
   local base="${GATE_BASE:-origin/dev}" mb path dir name
   if [[ "$base" == -* ]] || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -58,7 +62,7 @@ touched_crates() {
   declare -A seen=()
   while IFS= read -r -d '' path; do
     case "$path" in
-      Cargo.toml | Cargo.lock | rust-toolchain.toml | .cargo/* | ci/*)
+      Cargo.toml | Cargo.lock | rust-toolchain.toml | .cargo/* | ci/* | tests/*)
         echo all
         return
         ;;
