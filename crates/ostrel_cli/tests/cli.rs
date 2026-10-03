@@ -75,18 +75,10 @@ fn lexer_golden_through_the_binary_keeps_the_path_as_given() {
 }
 
 #[test]
-fn hello_world_exits_0_with_its_expected_output_or_names_the_missing_parser() {
+fn hello_world_exits_0_with_its_expected_output() {
     let out = ostrel(&["run", "examples/v0_1/01_hello.ostl"]);
-    match out.status.code() {
-        Some(0) => {
-            let expected = std::fs::read(repo().join("examples/v0_1/01_hello.expected")).unwrap();
-            assert_eq!(out.stdout, expected);
-            assert!(out.stderr.is_empty());
-        }
-        Some(70) => assert_eq!(
-            text(&out.stderr),
-            "ostrel: internal error: the parser is not part of this build\n"
-        ),
-        other => panic!("exit {other:?}, stderr {}", text(&out.stderr)),
-    }
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let expected = std::fs::read(repo().join("examples/v0_1/01_hello.expected")).unwrap();
+    assert_eq!(out.stdout, expected);
+    assert!(out.stderr.is_empty());
 }
