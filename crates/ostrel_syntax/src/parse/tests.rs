@@ -346,14 +346,19 @@ fn rendered(path: &str, src: &str) -> String {
         .collect()
 }
 
+/// The functions of a parsed module. The parser builds only plain functions
+/// so far, so any other item fails the test instead of being skipped.
 fn fn_items(m: &Module) -> Vec<&FnDecl> {
-    m.items()
+    let fns: Vec<&FnDecl> = m
+        .items()
         .iter()
         .filter_map(|item| match item {
             Item::Fn(decl) => Some(&**decl),
             _ => None,
         })
-        .collect()
+        .collect();
+    assert_eq!(fns.len(), m.items().len(), "item that is not a plain fn");
+    fns
 }
 
 fn block_stmts(m: &Module, id: BlockId) -> Vec<&StmtKind> {
