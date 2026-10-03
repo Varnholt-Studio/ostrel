@@ -18,6 +18,13 @@
 //!
 //! Element and key order is the wire order of D61,
 //! [`compare_key`](ostrel_core::value::compare_key), never the canonical bytes.
+//! Values that compare equal there are one element or key: `Int 1` and `Float 1.0` are the
+//! same element of a set and the same key of a map. The set keeps the variant it saw first for
+//! an element; a later add with the other variant only adds its tag. The map stores the key as
+//! written by the entry that wins, so a newer write with the other variant replaces it.
+//!
+//! A set remove only deletes tags of the element it names (D96): a tag that belongs to another
+//! element is ignored like a tag the replica never received.
 //!
 //! Every method validates its input before it changes anything: on `Err` the replica is
 //! unchanged. Every [`CrdtError`] maps to the protocol reason `Invalid`.

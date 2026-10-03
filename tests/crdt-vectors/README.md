@@ -84,7 +84,8 @@ or the end of the list.
 The server log delivers a remove only after the adds it names, and there are no tag tombstones
 (ARCHITECTURE 6.2). The validator therefore refuses a delivery in which a named add comes after
 the remove, including a replay of that add. A remove names between 1 and 64 tags (ARCHITECTURE
-5.9); a tag the replica never received is ignored.
+5.9); a tag the replica never received is ignored, and so is a tag that adds another element
+(D96), so the delivery rule above does not apply to it.
 
 ## Canonical encoding cases
 

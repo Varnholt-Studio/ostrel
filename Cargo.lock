@@ -182,6 +182,13 @@ name = "ostrel_core"
 version = "0.0.0"
 
 [[package]]
+name = "ostrel_crdt"
+version = "0.0.0"
+dependencies = [
+ "ostrel_core",
+]
+
+[[package]]
 name = "ostrel_db"
 version = "0.0.0"
 dependencies = [
