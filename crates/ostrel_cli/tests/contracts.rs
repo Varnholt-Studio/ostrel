@@ -223,7 +223,7 @@ fn file_above_the_source_limit_is_refused_before_reading() {
 }
 
 #[test]
-fn invalid_utf8_is_one_diagnostic_with_exit_1() {
+fn ac_04_invalid_utf8_is_one_e0014_diagnostic_with_exit_1() {
     let dir = scratch("invalid_utf8");
     for (name, bytes, at) in [
         ("lead.ostl", &b"\xFF"[..], "1:1"),
@@ -237,7 +237,9 @@ fn invalid_utf8_is_one_diagnostic_with_exit_1() {
             assert_eq!(out.status.code(), Some(1), "{cmd} {name}");
             assert!(out.stdout.is_empty(), "{cmd} {name}");
             let err = text(&out.stderr);
-            let prefix = format!("{}:{at}: error[E", path.to_string_lossy());
+            // SPEC 12.6: invalid UTF-8 is E0014 at the lead byte of the first ill formed
+            // sequence, from check and run, exit 1.
+            let prefix = format!("{}:{at}: error[E0014]: ", path.to_string_lossy());
             assert!(err.starts_with(&prefix), "{cmd} {name}: {err}");
             assert_eq!(err.lines().count(), 1, "{cmd} {name}: {err}");
         }
@@ -245,7 +247,7 @@ fn invalid_utf8_is_one_diagnostic_with_exit_1() {
 }
 
 #[test]
-fn empty_file_is_e0400_at_1_1() {
+fn ac_04_empty_file_is_e0400_at_1_1() {
     let dir = scratch("empty");
     let path = dir.join("empty.ostl");
     fs::write(&path, b"").unwrap();
