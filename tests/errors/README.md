@@ -52,6 +52,7 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0011 | `lex_bidi_in_string` | 2:12 | bidirectional control character U+2066 is not allowed in source; write `\u{2066}` inside a string if it is needed |
 | E0012 | `lex_lone_close_brace` | 2:10 | `}` in a string literal must be written as `\}` |
 | E0013 | `lex_indent_jump` | 2:1 | indentation is more than one level deeper than the line above; indent a block by two spaces |
+| E0014 | `lex_invalid_utf8` | 2:18 | source is not valid UTF-8 (byte 0xFF) |
 | E0020 | `parse_compound_assign` | 3:5 | Ostrel assigns with `=`; compound assignment does not exist |
 | E0020 | `parse_walrus_assign` | 2:5 | Ostrel assigns with `=`; `:=` does not exist, declare a new name with `let` |
 | E0021 | `parse_is_operator` | 3:8 | `is` is not Ostrel; to unwrap an optional write `if let y = x` |
@@ -104,6 +105,13 @@ subtracts 1. Depth 32 is accepted; the brace that would reach depth 33 is E0007 
   this directory that carry such a character, and no `.expected_err` file ever does. The lexer
   continues after it, so the rest of the string or comment gives no second diagnostic.
 * `}` in string text outside an interpolation is E0012 at the brace; it is written `\}`.
+* A source file that is not valid UTF-8 is E0014 at the first invalid byte, with line and column
+  counted over the valid prefix (D84, SPEC 12.6). The message names that byte with two upper case
+  hex digits. Nothing after it is lexed, so a later invalid byte or an unexpected character gives
+  no second diagnostic. `lex_invalid_utf8` puts byte 0xFF after `Grüße ` on line 2: column 18
+  counts scalars, while counting bytes would give 20. Its comment holds a second invalid byte
+  (0xC0) and an `@`, which must not be reported. It is the only file in this directory that is
+  not valid UTF-8; its `.expected_err` is valid UTF-8 and never carries the raw byte.
 * `lex_non_ascii_name` holds exactly one non ASCII character, so its single diagnostic does not
   depend on whether the lexer merges a run of unexpected characters.
 
@@ -127,6 +135,7 @@ subtracts 1. Depth 32 is accepted; the brace that would reach depth 33 is E0007 
 * False friends (`+=`, `:=`, `is`, text joined with `+`, implicit return in a branch): SYNTAX 9.
 * Diagnostic format, columns, interpolation depth, code catalog: SPEC 12.1.
 * E0011 to E0013, E0201 for a second `main`, E0304, E0305: SPEC 12.6, D53, D68, ARCHITECTURE 3.5.
+* E0014 for a source file that is not valid UTF-8: SPEC 12.6, D84, ARCHITECTURE 3.4.
 * Identifiers are ASCII only, `else if` on one line is a parser diagnostic: SPEC 12.2.
 * Escapes, including the malformed `\u{}` forms: SPEC 12.4.
 * Block structure without braces or `:` heads, one statement per line: SYNTAX 2 P1 and P2.
