@@ -16,9 +16,10 @@
 
 use std::fmt::Write as _;
 
-use ostrel_core::{Code, Diagnostic, FileId, SourceMap, Span};
+use ostrel_core::{Diagnostic, FileId, SourceMap, Span};
 use ostrel_syntax::ast::Module;
-use ostrel_vm::{Host, Limits, RuntimeError, RuntimeErrorKind};
+use ostrel_syntax::lex::codes::{INVALID_UTF8, msg_invalid_utf8};
+use ostrel_vm::{Host, Limits, RuntimeError};
 
 use crate::frontend;
 
@@ -57,13 +58,6 @@ pub enum Mode {
     Run(Limits),
 }
 
-/// The code reported for a source file that is not valid UTF 8.
-///
-/// ASSUMPTION: the catalog `tests/errors/README.md` has no code for invalid
-/// UTF 8 yet. E0008 (unexpected character, SPEC 12.2) is the nearest lexer code
-/// until T1 registers one.
-const INVALID_UTF8: Code = Code::new(8);
-
 /// Compiles the file `path` with content `bytes` and, for [`Mode::Run`], runs it.
 pub fn execute(
     mode: Mode,
@@ -98,7 +92,7 @@ pub fn execute(
         let diag = Diagnostic::error(
             INVALID_UTF8,
             Span::point(file, offset),
-            format!("source is not valid UTF-8 (byte 0x{byte:02X})"),
+            msg_invalid_utf8(byte),
         );
         report(&map, &[diag], err);
         return Exit::Failure;
@@ -106,23 +100,8 @@ pub fn execute(
     let src = map.text(file).unwrap_or_default();
 
     let (tokens, mut diags) = ostrel_syntax::lex::lex(src, file);
-    let module = match frontend::parse(src, file, &tokens, &diags) {
-        Ok((module, parsed)) => {
-            diags.extend(parsed);
-            module
-        }
-        Err(frontend::ParserMissing) => {
-            if has_error(&diags) {
-                report(&map, &diags, err);
-                return Exit::Failure;
-            }
-            let _ = writeln!(
-                err,
-                "ostrel: internal error: the parser is not part of this build"
-            );
-            return Exit::Internal;
-        }
-    };
+    let (module, parsed) = frontend::parse(src, file, &tokens, &diags);
+    diags.extend(parsed);
     if has_error(&diags) {
         report(&map, &diags, err);
         return Exit::Failure;
@@ -168,7 +147,7 @@ pub fn execute_module(
     match ostrel_vm::run(&image, host, limits) {
         Ok(()) => Exit::Success,
         Err(e) => {
-            render_runtime_error(map, &e, limits, err);
+            render_runtime_error(map, &e, err);
             Exit::Failure
         }
     }
@@ -190,7 +169,10 @@ fn report(map: &SourceMap, diags: &[Diagnostic], err: &mut String) {
 }
 
 /// Appends `file:line:column: runtime error[Kind]: message` (ARCHITECTURE 3.4).
-pub fn render_runtime_error(map: &SourceMap, e: &RuntimeError, limits: Limits, err: &mut String) {
+///
+/// The message is the fixed text of the kind (D83), so it never depends on the
+/// limits or flags of the run.
+pub fn render_runtime_error(map: &SourceMap, e: &RuntimeError, err: &mut String) {
     let file = FileId::from_raw(e.span.file);
     let (path, line, column) = match (map.path(file), map.location(file, e.span.start)) {
         (Some(path), Some(loc)) => (path, loc.line, loc.column),
@@ -201,41 +183,8 @@ pub fn render_runtime_error(map: &SourceMap, e: &RuntimeError, limits: Limits, e
         "{}:{line}:{column}: runtime error[{}]: {}",
         escape(path),
         e.kind,
-        runtime_message(e.kind, limits)
+        e.kind.message()
     );
-}
-
-/// The message of a runtime error.
-///
-/// ASSUMPTION: ARCHITECTURE 3.4 fixes the kinds and the line format but no
-/// message texts; the goldens of `tests/runtime/` (T2-4) pin them.
-pub fn runtime_message(kind: RuntimeErrorKind, limits: Limits) -> String {
-    match kind {
-        RuntimeErrorKind::IntOverflow => format!(
-            "result is outside the `Int` range of {} to {}",
-            ostrel_ir::INT_MIN,
-            ostrel_ir::INT_MAX
-        ),
-        RuntimeErrorKind::DivisionByZero => "division by zero".to_string(),
-        RuntimeErrorKind::CallDepth => format!(
-            "call depth exceeds {} frames; is the recursion unbounded?",
-            limits.max_frames
-        ),
-        RuntimeErrorKind::StepLimit => format!(
-            "program exceeds the limit of {} steps; raise it with `--max-steps`",
-            limits.max_steps
-        ),
-        RuntimeErrorKind::HeapLimit => {
-            format!(
-                "memory use exceeds the limit of {} bytes",
-                limits.max_heap_bytes
-            )
-        }
-        RuntimeErrorKind::TextLimit => format!(
-            "text exceeds the limit of {} UTF-8 bytes",
-            limits.max_text_bytes
-        ),
-    }
 }
 
 /// Escapes characters that could break the one line form or mislead a

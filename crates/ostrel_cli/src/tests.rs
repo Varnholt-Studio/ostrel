@@ -167,8 +167,6 @@ fn files(dir: &str, ext: &str) -> R<Vec<String>> {
     Ok(names)
 }
 
-const PARSER_MISSING: &str = "ostrel: internal error: the parser is not part of this build\n";
-
 #[test]
 fn hello_world_runs_through_checker_lowering_and_vm() -> R {
     let src = include_str!("../../../examples/v0_1/01_hello.ostl");
@@ -213,7 +211,7 @@ fn runtime_error_keeps_output_and_renders_one_line() -> R {
     assert!(err.starts_with("div.ostl:3:"), "{err:?}");
     assert_eq!(err.lines().count(), 1, "{err:?}");
     assert!(
-        err.ends_with(": runtime error[DivisionByZero]: division by zero\n"),
+        err.ends_with(": runtime error[DivisionByZero]: division or remainder by zero\n"),
         "{err:?}"
     );
 
@@ -270,7 +268,7 @@ fn invalid_utf8_is_one_diagnostic_at_the_first_bad_byte() {
     assert_eq!((exit, out.as_str()), (Exit::Failure, ""));
     assert_eq!(
         err,
-        "bad.ostl:2:11: error[E0008]: source is not valid UTF-8 (byte 0xFF)\n"
+        "bad.ostl:2:11: error[E0014]: source is not valid UTF-8 (byte 0xFF)\n"
     );
 }
 
@@ -285,54 +283,85 @@ fn small_hostile_inputs_never_succeed_silently() {
     ] {
         for mode in [Mode::Check, run_mode()] {
             let (exit, _, err) = execute_bytes(mode, "x.ostl", src.to_vec());
-            assert!(
-                matches!(exit, Exit::Failure | Exit::Internal),
-                "{src:?}: {exit:?}"
-            );
+            assert!(exit == Exit::Failure, "{src:?}: {exit:?}, stderr {err:?}");
             assert!(!err.is_empty(), "{src:?}");
         }
     }
 }
 
-/// Every example either runs exactly as its expected file says, or, while the
-/// parser is not part of the build, stops with the internal error that names
-/// it. Once the parser is wired in, the first branch is the only one left.
+/// Every example runs exactly as its expected file says.
 #[test]
-fn examples_run_or_name_the_missing_parser() -> R {
+fn examples_run_with_their_expected_output() -> R {
     let cases = files("examples/v0_1", ".ostl")?;
     assert!(cases.len() >= 10, "examples not found: {cases:?}");
     for case in cases {
         let expected = sibling(&case, ".expected")?;
         let (exit, out, err) = execute_file(run_mode(), &case)?;
-        match exit {
-            Exit::Success => {
-                assert_eq!(err, "", "{case}");
-                assert_eq!(out, expected, "{case}");
-            }
-            Exit::Internal => {
-                assert_eq!(err, PARSER_MISSING, "{case}");
-                assert_eq!(out, "", "{case}");
-            }
-            other => return Err(format!("{case}: {other:?}, stderr {err:?}")),
+        if exit != Exit::Success {
+            return Err(format!("{case}: {exit:?}, stderr {err:?}"));
         }
+        assert_eq!(err, "", "{case}");
+        assert_eq!(out, expected, "{case}");
     }
     Ok(())
 }
 
 #[test]
-fn runtime_messages_name_the_limit() {
-    let limits = Limits {
-        max_steps: 5,
-        ..Limits::default()
-    };
-    assert_eq!(
-        pipeline::runtime_message(RuntimeErrorKind::StepLimit, limits),
-        "program exceeds the limit of 5 steps; raise it with `--max-steps`"
-    );
-    assert_eq!(
-        pipeline::runtime_message(RuntimeErrorKind::CallDepth, limits),
-        "call depth exceeds 10000 frames; is the recursion unbounded?"
-    );
+fn invalid_utf8_stops_before_the_lexer_in_check_and_run() {
+    for (src, line) in [
+        (
+            &b"\xFE"[..],
+            "x.ostl:1:1: error[E0014]: source is not valid UTF-8 (byte 0xFE)\n",
+        ),
+        (
+            &b"fn main()\n  @\x80"[..],
+            "x.ostl:2:4: error[E0014]: source is not valid UTF-8 (byte 0x80)\n",
+        ),
+    ] {
+        for mode in [Mode::Check, run_mode()] {
+            let (exit, out, err) = execute_bytes(mode, "x.ostl", src.to_vec());
+            assert_eq!(
+                (exit, out.as_str(), err.as_str()),
+                (Exit::Failure, "", line),
+                "{src:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn empty_file_is_e0400_at_the_first_column() {
+    for mode in [Mode::Check, run_mode()] {
+        let (exit, out, err) = execute_bytes(mode, "empty.ostl", Vec::new());
+        assert_eq!((exit, out.as_str()), (Exit::Failure, ""));
+        assert!(err.starts_with("empty.ostl:1:1: error[E0400]: "), "{err:?}");
+        assert_eq!(err.lines().count(), 1, "{err:?}");
+    }
+}
+
+/// The CLI renders the fixed message of the kind (D83): the golden of
+/// `tests/runtime/step_limit_small` matches byte for byte, and a different
+/// `--max-steps` value changes neither the message nor the position.
+#[test]
+fn runtime_error_uses_the_fixed_message_of_its_kind() -> R {
+    let case = "tests/runtime/step_limit_small.ostl";
+    let expected = sibling(case, ".expected")?;
+    let expected_err = sibling(case, ".expected_err")?;
+    for max_steps in [1000, 500] {
+        let limits = Limits {
+            max_steps,
+            ..Limits::default()
+        };
+        let (exit, out, err) = execute_file(Mode::Run(limits), case)?;
+        assert_eq!(exit, Exit::Failure, "--max-steps {max_steps}");
+        assert_eq!(out, expected, "--max-steps {max_steps}");
+        assert_eq!(err, expected_err, "--max-steps {max_steps}");
+    }
+    assert!(expected_err.ends_with(&format!(
+        ": runtime error[StepLimit]: {}\n",
+        RuntimeErrorKind::StepLimit.message()
+    )));
+    Ok(())
 }
 
 #[test]

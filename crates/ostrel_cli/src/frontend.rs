@@ -1,16 +1,11 @@
 //! The one place where the CLI calls the parser (WP T1-3, T1-3b).
 //!
-//! [`parse`] is a single call to `ostrel_syntax::parse::parse`. It keeps the
-//! `Result` shape of the time before the parser was part of the build, so the
-//! pipeline is unchanged; [`ParserMissing`] is no longer produced.
+//! [`parse`] is a single call to the frozen parser entry
+//! `ostrel_syntax::parse::parse` (ARCHITECTURE 3).
 
 use ostrel_core::{Diagnostic, FileId};
 use ostrel_syntax::ast::Module;
 use ostrel_syntax::lex::Token;
-
-/// The parser is not available in this build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParserMissing;
 
 /// Parses the tokens of one file.
 ///
@@ -21,8 +16,8 @@ pub fn parse(
     file: FileId,
     tokens: &[Token],
     lexed: &[Diagnostic],
-) -> Result<(Module, Vec<Diagnostic>), ParserMissing> {
-    Ok(ostrel_syntax::parse::parse(src, file, tokens, lexed))
+) -> (Module, Vec<Diagnostic>) {
+    ostrel_syntax::parse::parse(src, file, tokens, lexed)
 }
 
 #[cfg(test)]
