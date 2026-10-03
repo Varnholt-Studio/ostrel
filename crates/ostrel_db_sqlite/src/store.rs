@@ -711,6 +711,8 @@ fn apply_set_change(
             .map_err(backend)?;
         }
         SetChange::Remove { .. } => {
+            // Only the full tuple (row, field, element, replica, seq) names a live tag; a tag of
+            // another element is ignored like an unknown one (D96).
             conn.prepare_cached(
                 "DELETE FROM ostrel_set_tags
                  WHERE row_id = ?1 AND field = ?2 AND k = ?3 AND tag_replica = ?4 AND tag_seq = ?5",
