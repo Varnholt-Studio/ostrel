@@ -55,6 +55,83 @@ rust_picks() {
   return 0
 }
 
+# AC05_RULES: FILE<TAB>ERE pairs. Each FILE must hold a line, outside comments, that matches
+# the anchored ERE. Together they are the AC-05 contract: the gate runs every check and is
+# red when one fails, and the full scope runs fmt --check, clippy -D warnings and all tests.
+AC05_RULES=(
+  $'ci/gate.sh\t^[[:space:]]*for check in ci/checks/\\*\\.sh; do[[:space:]]*$'
+  $'ci/gate.sh\t^[[:space:]]*if bash "\\$check"; then[[:space:]]*$'
+  $'ci/gate.sh\t^[[:space:]]*failed\\+=\\("\\$check"\\)[[:space:]]*$'
+  $'ci/gate.sh\t^[[:space:]]*if \\[ \\$\\{#failed\\[@\\]\\} -gt 0 \\]; then[[:space:]]*$'
+  $'ci/checks/20_fmt.sh\t^[[:space:]]*cargo fmt --all -- --check[[:space:]]*$'
+  $'ci/checks/25_clippy.sh\t^[[:space:]]*cargo clippy --workspace --all-targets --locked -- -D warnings( \\|\\| bad=1)?[[:space:]]*$'
+  $'ci/checks/50_tests.sh\t^[[:space:]]*run cargo test --workspace --locked --no-fail-fast[[:space:]]*$'
+)
+
+# ac_05_gate_runs_fmt_clippy_tests ROOT: checks the AC05_RULES on the tree at ROOT; prints
+# one line per violation and returns 1 if any. A static contract on the gate scripts: it
+# proves that the commands are part of the gate, not that they pass.
+ac_05_gate_runs_fmt_clippy_tests() {
+  local root=$1 bad=0 rule file re
+  for rule in "${AC05_RULES[@]}"; do
+    file=${rule%%$'\t'*}
+    re=${rule#*$'\t'}
+    if [ ! -f "$root/$file" ]; then
+      echo "   AC-05: $file missing"
+      bad=1
+    elif ! grep -vE '^[[:space:]]*#' "$root/$file" | grep -E -- "$re" >/dev/null; then
+      echo "   AC-05: $file has no line matching: $re"
+      bad=1
+    fi
+  done
+  return $bad
+}
+
+# ac05_selftest: proves on scratch copies of the gate files that every rule can fail.
+ac05_selftest() {
+  local scratch bad=0 f
+  scratch=$(mktemp -d) || return 1
+  for f in ci/gate.sh ci/checks/20_fmt.sh ci/checks/25_clippy.sh ci/checks/50_tests.sh; do
+    mkdir -p "$scratch/clean/$(dirname "$f")" && cp "$f" "$scratch/clean/$f" || return 1
+  done
+  # sel LABEL WANT SETUP: runs the rules on a fresh copy after SETUP.
+  sel() {
+    local label=$1 want=$2 got
+    shift 2
+    rm -rf "$scratch/tree" && cp -r "$scratch/clean" "$scratch/tree" || return 1
+    (cd "$scratch/tree" && eval "$*") || {
+      echo "   selftest '$label': setup failed"
+      return 1
+    }
+    ac_05_gate_runs_fmt_clippy_tests "$scratch/tree" >"$scratch/out" 2>&1
+    got=$?
+    if [ "$got" != "$want" ]; then
+      echo "   selftest '$label': want exit $want, got $got"
+      sed 's/^/      /' "$scratch/out"
+      return 1
+    fi
+  }
+  sel "repository gate files pass" 0 true || bad=1
+  sel "fmt without --check" 1 "sed -i 's/^\\( *cargo fmt --all\\) -- --check/\\1/' ci/checks/20_fmt.sh" || bad=1
+  sel "fmt only in a comment" 1 "sed -i 's/^\\( *\\)cargo fmt --all -- --check/\\1# cargo fmt --all -- --check/' ci/checks/20_fmt.sh" || bad=1
+  sel "clippy without -D warnings" 1 "sed -i 's/ -- -D warnings//' ci/checks/25_clippy.sh" || bad=1
+  sel "clippy without --all-targets" 1 "sed -i 's/--workspace --all-targets/--workspace/' ci/checks/25_clippy.sh" || bad=1
+  sel "tests without --workspace" 1 "sed -i 's/^\\( *run cargo test\\) --workspace/\\1/' ci/checks/50_tests.sh" || bad=1
+  sel "tests check missing" 1 "rm ci/checks/50_tests.sh" || bad=1
+  sel "gate runs no checks" 1 "sed -i 's|^for check in ci/checks/\\*\\.sh; do|for check in; do|' ci/gate.sh" || bad=1
+  sel "gate ignores failures" 1 "sed -i '/failed+=(\"\\\$check\")/d' ci/gate.sh" || bad=1
+  rm -rf "$scratch"
+  return $bad
+}
+
+if ! ac05_selftest; then
+  echo "   AC-05: self test failed"
+  fail=1
+else
+  echo "   ac05_selftest ok"
+fi
+ac_05_gate_runs_fmt_clippy_tests "$PWD" || fail=1
+
 # Rust
 list rs_code -name '*.rs'
 if [ -f Cargo.toml ] && [ "${GATE_SCOPE:-full}" = quick ]; then

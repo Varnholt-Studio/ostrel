@@ -4,9 +4,6 @@
 # A milestone cannot be signed off while any of its criteria is listed here (SPEC 3).
 # Keeping uncovered criteria visible but not blocking needs a decision of the QA lead
 # (Refs #57).
-AC-01
-AC-05
-AC-07
 AC-09
 AC-10
 AC-11
