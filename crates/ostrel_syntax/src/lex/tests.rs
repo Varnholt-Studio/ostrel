@@ -733,6 +733,26 @@ fn large_input_is_linear() {
     crate::test_support::assert_linear(4_000, source, |src| lex(src));
 }
 
+#[test]
+fn bom_does_not_shift_diagnostic_columns() {
+    // D68: the BOM at byte 0 is skipped and line 1 column 1 starts after it.
+    assert_eq!(
+        rendered("b.ostl", "\u{FEFF}@\n"),
+        "b.ostl:1:1: error[E0008]: unexpected character `@`\n"
+    );
+    // A second BOM is an unexpected character at column 1, the first is not.
+    assert_eq!(
+        rendered("b.ostl", "\u{FEFF}\u{FEFF}\n"),
+        "b.ostl:1:1: error[E0008]: unexpected character `\u{FEFF}`\n"
+    );
+    // Columns after the error and on later lines are unchanged.
+    assert_eq!(
+        rendered("b.ostl", "\u{FEFF}x @\ny @\n"),
+        "b.ostl:1:3: error[E0008]: unexpected character `@`\n\
+         b.ostl:2:3: error[E0008]: unexpected character `@`\n"
+    );
+}
+
 macro_rules! golden {
     ($name:ident) => {
         #[test]
