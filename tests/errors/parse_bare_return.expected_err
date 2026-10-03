@@ -1,0 +1,1 @@
+tests/errors/parse_bare_return.ostl:2:9: error[E0028]: expected a value after `return`, found end of line

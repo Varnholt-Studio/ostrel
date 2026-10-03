@@ -53,6 +53,7 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0012 | `lex_lone_close_brace` | 2:10 | `}` in a string literal must be written as `\}` |
 | E0013 | `lex_indent_jump` | 2:1 | indentation is more than one level deeper than the line above; indent a block by two spaces |
 | E0014 | `lex_invalid_utf8` | 2:18 | source is not valid UTF-8 (byte 0xFF) |
+| E0014 | `lex_invalid_utf8_truncated` | 2:14 | source is not valid UTF-8 (byte 0xE2) |
 | E0020 | `parse_compound_assign` | 3:5 | Ostrel assigns with `=`; compound assignment does not exist |
 | E0020 | `parse_walrus_assign` | 2:5 | Ostrel assigns with `=`; `:=` does not exist, declare a new name with `let` |
 | E0021 | `parse_is_operator` | 3:8 | `is` is not Ostrel; to unwrap an optional write `if let y = x` |
@@ -62,6 +63,7 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0025 | `parse_unclosed_paren` | 2:8 | unclosed `(` |
 | E0026 | `parse_keyword_as_name` | 2:7 | `if` is a keyword and cannot be used as a name |
 | E0027 | `parse_comparison_chain` | 5:15 | comparisons do not chain; write `a < b and b < c` |
+| E0028 | `parse_bare_return` | 2:9 | expected a value after `return`, found end of line |
 | E0100 | `check_float_type_v0_1` | 1:14 | type `Float` is not available in v0.1 |
 | E0200 | `name_unknown` | 3:9 | unknown name `y` |
 | E0201 | `name_duplicate_fn` | 4:4 | function `f` is already declared |
@@ -110,8 +112,13 @@ subtracts 1. Depth 32 is accepted; the brace that would reach depth 33 is E0007 
   hex digits. Nothing after it is lexed, so a later invalid byte or an unexpected character gives
   no second diagnostic. `lex_invalid_utf8` puts byte 0xFF after `Grüße ` on line 2: column 18
   counts scalars, while counting bytes would give 20. Its comment holds a second invalid byte
-  (0xC0) and an `@`, which must not be reported. It is the only file in this directory that is
-  not valid UTF-8; its `.expected_err` is valid UTF-8 and never carries the raw byte.
+  (0xC0) and an `@`, which must not be reported. Its `.expected_err` never carries the raw byte.
+* A multi byte sequence that is cut short is reported at its lead byte, the first byte after the
+  longest valid prefix (SPEC 12.6, answer to #969). `lex_invalid_utf8_truncated` has `E2 82`
+  followed by `A` after `€ 5 ` on line 2, so the diagnostic names byte 0xE2 at 2:14 (counting
+  bytes would give 2:16, and naming the continuation byte 0x82 or the `A` is wrong). Its third
+  line holds byte 0xFF and an `@`, which must not be reported. These two files are the only ones
+  in this directory that are not valid UTF-8; their `.expected_err` files are valid UTF-8.
 * `lex_non_ascii_name` holds exactly one non ASCII character, so its single diagnostic does not
   depend on whether the lexer merges a run of unexpected characters.
 
@@ -125,6 +132,10 @@ subtracts 1. Depth 32 is accepted; the brace that would reach depth 33 is E0007 
   v0.1 slice, so the checker reports it with E0100, while a name that is no type at all, such as
   `Integer`, is E0203. The parser reads any type name, so this case needs no construct beyond
   T1-3.
+* A bare `return` without a value is E0028 at the token after `return`, in every function, with
+  or without a result type (D90, #917, SPEC 12.6). It is never E0304. `parse_bare_return` has it
+  in a function without a result type, where a reader could expect it to be allowed; the
+  diagnostic is at the end of line, 2:9, and the checker does not run.
 * `type_implicit_return_in_branch`: the diagnostic is at the start of the expression that a
   reader would take as the implicit result of the branch (SYNTAX 4.10 and 9).
 
@@ -135,7 +146,9 @@ subtracts 1. Depth 32 is accepted; the brace that would reach depth 33 is E0007 
 * False friends (`+=`, `:=`, `is`, text joined with `+`, implicit return in a branch): SYNTAX 9.
 * Diagnostic format, columns, interpolation depth, code catalog: SPEC 12.1.
 * E0011 to E0013, E0201 for a second `main`, E0304, E0305: SPEC 12.6, D53, D68, ARCHITECTURE 3.5.
-* E0014 for a source file that is not valid UTF-8: SPEC 12.6, D84, ARCHITECTURE 3.4.
+* E0014 for a source file that is not valid UTF-8: SPEC 12.6, D84, ARCHITECTURE 3.4; lead byte
+  of a truncated sequence: SPEC 12.6 (answer to #969).
+* E0028 for a bare `return`: SPEC 12.6, D90 (#917).
 * Identifiers are ASCII only, `else if` on one line is a parser diagnostic: SPEC 12.2.
 * Escapes, including the malformed `\u{}` forms: SPEC 12.4.
 * Block structure without braces or `:` heads, one statement per line: SYNTAX 2 P1 and P2.
