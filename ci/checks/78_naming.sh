@@ -10,11 +10,15 @@
 # (also with other separators, case or a line break) and address in the fixture below must be
 # caught, and the clean fixture must pass. This file is the fixture and is therefore excluded
 # from the repository scan.
+# The file list comes from git when the repository root is a git work tree, otherwise from
+# the file system (for example an exported tree without .git). The check fails closed: a file
+# list that is empty or misses a required file (REQUIRED below) is a failure, never a pass.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
 DOMAIN_CONFIRMED=0
 SELF=ci/checks/78_naming.sh
+REQUIRED=(README.md Cargo.toml)
 
 PHRASES=(
   "Ostrel Inc" "Ostrel GmbH" "Ostrel Studio" "Ostrel team" "Ostrel company"
@@ -59,6 +63,41 @@ readme_ok() {
   return 1
 }
 
+# list_files: NUL separated paths, relative to the current directory, of the files to scan.
+list_files() {
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+    [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)" ]; then
+    git ls-files -z
+  else
+    find . \( -path ./.git -o -path ./target -o -name node_modules \) -prune -o -type f -print0 |
+      sed -z 's|^\./||'
+  fi
+}
+
+# check_tree: runs the whole check on the tree in the current directory, returns 1 on any
+# violation, including an empty file list or a missing required file.
+check_tree() {
+  local bad=0 f r found n=0 files=()
+  mapfile -d '' files < <(list_files)
+  for r in "${REQUIRED[@]}"; do
+    found=0
+    for f in "${files[@]}"; do [ "$f" = "$r" ] && { found=1; break; }; done
+    [ "$found" = 1 ] || { echo "file list misses required file $r (${#files[@]} files listed)"; bad=1; }
+  done
+  if [ -f README.md ]; then
+    readme_ok README.md || { echo "README.md: first heading or sentence must name \"Ostrel programming language\""; bad=1; }
+  fi
+  for f in "${files[@]}"; do
+    [ "$f" = "$SELF" ] && continue
+    [ -f "$f" ] || continue
+    grep -qI '' "$f" 2>/dev/null || continue
+    n=$((n + 1))
+    scan "$f" || bad=1
+  done
+  [ "$n" -gt 0 ] || { echo "no file scanned"; bad=1; }
+  return $bad
+}
+
 ac_53_naming_selftest() {
   local tmp ok=0 p a v DOMAIN_CONFIRMED
   tmp=$(mktemp -d) || return 1
@@ -91,18 +130,25 @@ EOF
   readme_ok "$tmp/f" || { echo "selftest: README rule rejects a good first sentence"; ok=1; }
   printf '# Ostrel\n\nA language. The Ostrel programming language.\n' > "$tmp/f"
   readme_ok "$tmp/f" && { echo "selftest: README rule accepts a missing name"; ok=1; }
+  # Fail closed: an empty tree and a tree without required files must fail.
+  mkdir "$tmp/empty" "$tmp/partial" "$tmp/export"
+  (cd "$tmp/empty" && check_tree > /dev/null) && { echo "selftest: empty file list passes"; ok=1; }
+  printf '# Ostrel programming language\n' > "$tmp/partial/README.md"
+  (cd "$tmp/partial" && check_tree > /dev/null) &&
+    { echo "selftest: file list without Cargo.toml passes"; ok=1; }
+  # An exported tree without .git is scanned from the file system.
+  printf '# Ostrel programming language\n' > "$tmp/export/README.md"
+  printf '[workspace]\n' > "$tmp/export/Cargo.toml"
+  mkdir "$tmp/export/docs"
+  printf 'Plain text.\n' > "$tmp/export/docs/probe.md"
+  (cd "$tmp/export" && check_tree > /dev/null) || { echo "selftest: clean export rejected"; ok=1; }
+  printf 'Made by the Ostrel GmbH.\n' > "$tmp/export/docs/probe.md"
+  (cd "$tmp/export" && check_tree > /dev/null) &&
+    { echo "selftest: exported tree without .git not scanned"; ok=1; }
   return $ok
 }
 
 ac_53_naming_selftest || { echo "naming check self test failed"; exit 1; }
 echo "   ac_53_naming_selftest ok"
 
-bad=0
-readme_ok README.md || { echo "README.md: first heading or sentence must name \"Ostrel programming language\""; bad=1; }
-while IFS= read -r -d '' f; do
-  [ "$f" = "$SELF" ] && continue
-  [ -f "$f" ] || continue
-  grep -qI '' "$f" 2>/dev/null || continue
-  scan "$f" || bad=1
-done < <(git ls-files -z)
-exit $bad
+check_tree
