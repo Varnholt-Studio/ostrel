@@ -27,3 +27,4 @@ ed25519-dalek        std,rand_core,fast,zeroize                      # ostrel_au
 getrandom            *                                               # ostrel_auth, ostrel_core
 base64               alloc                                           # ostrel_auth, base64url (D63)
 rustc-hash           *                                               # ostrel_sema, ostrel_vm
+sha2                 std                                             # ostrel_server, audit and replica_secret hash (D118)
