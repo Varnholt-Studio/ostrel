@@ -199,6 +199,9 @@ run_overflow_by_recursion.ostl 0 1 runtime error[IntOverflow]
 run_division_by_zero.ostl 0 1 runtime error[DivisionByZero]
 run_modulo_by_zero.ostl 0 1 runtime error[DivisionByZero]
 run_long_loop_by_recursion.ostl 0 1 runtime error[StepLimit]
+# D94 (red #1136): a step is weighted by the bytes an instruction reads, so comparing two
+# equal 16 MiB texts once per level of a 9 900 deep recursion reaches the step limit.
+run_text_compare_cost.ostl 0 1 runtime error[StepLimit]
 # D44, SPEC 12.4: the 22nd doubling would make a 32 MiB text, over the 16 MiB text limit,
 # while the live heap is still far under 256 MiB.
 run_text_growth.ostl 0 1 runtime error[TextLimit]
