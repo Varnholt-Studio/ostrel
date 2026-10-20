@@ -1,0 +1,17 @@
+// T148 F2: prints one 16 MiB text until StepLimit; about 6.4 GB reach stdout within the
+// default step limit, because print is weighted but output volume has no limit of its own.
+
+fn double(t: Text, rounds: Int) -> Text
+  if rounds == 0
+    return t
+  return double("{t}{t}", rounds - 1)
+
+fn spam(t: Text, n: Int) -> Int
+  print(t)
+  if n == 0
+    return 0
+  return spam(t, n - 1)
+
+fn main()
+  let big = double("a", 24)
+  print(spam(big, 9000))

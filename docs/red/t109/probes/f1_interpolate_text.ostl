@@ -1,0 +1,26 @@
+// T148 F1: every "{s}" of a short Text is a one part Concat (2 steps, three allocations).
+// Expected: StepLimit after CPU time close to step_limit_default. Actual: about twice as long.
+
+fn w(n: Int, s: Text) -> Int
+  let t1 = "{s}"
+  let t2 = "{s}"
+  let t3 = "{s}"
+  let t4 = "{s}"
+  let t5 = "{s}"
+  let t6 = "{s}"
+  let t7 = "{s}"
+  let t8 = "{s}"
+  let t9 = "{s}"
+  let t10 = "{s}"
+  let t11 = "{s}"
+  let t12 = "{s}"
+  let t13 = "{s}"
+  let t14 = "{s}"
+  let t15 = "{s}"
+  let t16 = "{s}"
+  if n < 2
+    return n
+  return w(n - 1, s) + w(n - 2, s)
+
+fn main()
+  print(w(60, "a"))

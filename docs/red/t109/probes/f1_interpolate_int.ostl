@@ -1,0 +1,26 @@
+// T148 F1: every "{m}" of an Int is ToText (1 step) plus a one part Concat (2 steps).
+// Expected: StepLimit after CPU time close to step_limit_default. Actual: about 3.5 times as long.
+
+fn w(n: Int, m: Int) -> Int
+  let t1 = "{m}"
+  let t2 = "{m}"
+  let t3 = "{m}"
+  let t4 = "{m}"
+  let t5 = "{m}"
+  let t6 = "{m}"
+  let t7 = "{m}"
+  let t8 = "{m}"
+  let t9 = "{m}"
+  let t10 = "{m}"
+  let t11 = "{m}"
+  let t12 = "{m}"
+  let t13 = "{m}"
+  let t14 = "{m}"
+  let t15 = "{m}"
+  let t16 = "{m}"
+  if n < 2
+    return n
+  return w(n - 1, m) + w(n - 2, m)
+
+fn main()
+  print(w(60, -9007199254740991))

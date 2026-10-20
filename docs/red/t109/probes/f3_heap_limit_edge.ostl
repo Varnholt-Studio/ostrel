@@ -1,0 +1,17 @@
+// T148 F3: the Concat in hold is refused by HeapLimit. With --max-steps in a window of
+// 131 072 values below the threshold the run reports StepLimit instead (see repro.sh).
+
+fn double(t: Text, rounds: Int) -> Text
+  if rounds == 0
+    return t
+  return double("{t}{t}", rounds - 1)
+
+fn hold(t: Text, k: Int) -> Int
+  let mine = "{t}"
+  if k == 0
+    return 0
+  return hold(t, k - 1)
+
+fn main()
+  let big = double("a", 23)
+  print(hold(big, 100))
