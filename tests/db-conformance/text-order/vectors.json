@@ -1,0 +1,579 @@
+{
+ "format": 1,
+ "ac": "AC-29",
+ "doc": "Shared Text vectors: order by Unicode code point (ARCHITECTURE 6.2, D50), len in Unicode scalar values and inclusive ranges (SYNTAX 4.2, B-F14). Run by the conformance harness (T70), the VM (T2) and the JS runtime (T3).",
+ "order": [
+  {
+   "name": "ascii_case",
+   "doc": "Upper case before lower case; no locale folding.",
+   "sorted": [
+    {
+     "text": "A"
+    },
+    {
+     "text": "Z"
+    },
+    {
+     "text": "a"
+    },
+    {
+     "text": "z"
+    }
+   ]
+  },
+  {
+   "name": "prefix_first",
+   "doc": "A proper prefix sorts first; the empty text is smallest.",
+   "sorted": [
+    {
+     "text": ""
+    },
+    {
+     "text": "a"
+    },
+    {
+     "text": "a\u0000"
+    },
+    {
+     "text": "aa"
+    },
+    {
+     "text": "ab"
+    }
+   ]
+  },
+  {
+   "name": "nul_and_controls",
+   "doc": "NUL and control characters are ordinary code points.",
+   "sorted": [
+    {
+     "text": "\u0000"
+    },
+    {
+     "text": "\u0001"
+    },
+    {
+     "text": "\t"
+    },
+    {
+     "text": " "
+    },
+    {
+     "text": "0"
+    }
+   ]
+  },
+  {
+   "name": "astral_after_bmp_private_use",
+   "doc": "U+1F600 sorts after U+E000 to U+FFFF; UTF-16 unit order puts it before them.",
+   "sorted": [
+    {
+     "text": "\uD7FF"
+    },
+    {
+     "text": "\uE000"
+    },
+    {
+     "text": "\uFF01"
+    },
+    {
+     "text": "\uFFFD"
+    },
+    {
+     "text": "\uFFFF"
+    },
+    {
+     "text": "\uD800\uDC00"
+    },
+    {
+     "text": "\uD83D\uDE00"
+    },
+    {
+     "text": "\uDBFF\uDFFF"
+    }
+   ]
+  },
+  {
+   "name": "emoji_sequences",
+   "doc": "Emoji sequences compare code point by code point, not as graphemes.",
+   "sorted": [
+    {
+     "text": "\uD83C\uDDE9"
+    },
+    {
+     "text": "\uD83C\uDDE9\uD83C\uDDEA"
+    },
+    {
+     "text": "\uD83D\uDC68"
+    },
+    {
+     "text": "\uD83D\uDC68\u200D"
+    },
+    {
+     "text": "\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67"
+    },
+    {
+     "text": "\uD83D\uDE00"
+    }
+   ]
+  },
+  {
+   "name": "combining_not_normalised",
+   "doc": "e plus U+0301 is not U+00E9; nothing is normalised (NFC would make them equal).",
+   "sorted": [
+    {
+     "text": "e"
+    },
+    {
+     "text": "ez"
+    },
+    {
+     "text": "e\u0301"
+    },
+    {
+     "text": "\u00E9"
+    }
+   ]
+  },
+  {
+   "name": "combining_mark_order",
+   "doc": "Combining marks keep their stored order; U+0301 U+0323 and U+0323 U+0301 differ.",
+   "sorted": [
+    {
+     "text": "a\u0301\u0323"
+    },
+    {
+     "text": "a\u0323\u0301"
+    }
+   ]
+  },
+  {
+   "name": "utf8_lengths_mixed",
+   "doc": "One, two, three and four byte UTF-8 sequences in code point order.",
+   "sorted": [
+    {
+     "text": "\u007F"
+    },
+    {
+     "text": "\u0080"
+    },
+    {
+     "text": "\u07FF"
+    },
+    {
+     "text": "\u0800"
+    },
+    {
+     "text": "\uFFFF"
+    },
+    {
+     "text": "\uD800\uDC00"
+    }
+   ]
+  },
+  {
+   "name": "astral_inside_text",
+   "doc": "The difference sits after an equal prefix: x U+FF01 before x U+1F600.",
+   "sorted": [
+    {
+     "text": "x\uFF01y"
+    },
+    {
+     "text": "x\uD83D\uDE00"
+    },
+    {
+     "text": "x\uD83D\uDE00a"
+    }
+   ]
+  }
+ ],
+ "compare": [
+  {
+   "name": "equal_ascii",
+   "a": {
+    "text": "abc"
+   },
+   "b": {
+    "text": "abc"
+   },
+   "expect": 0
+  },
+  {
+   "name": "equal_empty",
+   "a": {
+    "text": ""
+   },
+   "b": {
+    "text": ""
+   },
+   "expect": 0
+  },
+  {
+   "name": "equal_emoji",
+   "a": {
+    "text": "\uD83D\uDE00"
+   },
+   "b": {
+    "text": "\uD83D\uDE00"
+   },
+   "expect": 0
+  },
+  {
+   "name": "nfc_vs_nfd_not_equal",
+   "a": {
+    "text": "\u00E9"
+   },
+   "b": {
+    "text": "e\u0301"
+   },
+   "expect": 1
+  },
+  {
+   "name": "astral_vs_fullwidth",
+   "a": {
+    "text": "\uD83D\uDE00"
+   },
+   "b": {
+    "text": "\uFF01"
+   },
+   "expect": 1
+  },
+  {
+   "name": "fullwidth_vs_astral",
+   "a": {
+    "text": "\uFF01"
+   },
+   "b": {
+    "text": "\uD83D\uDE00"
+   },
+   "expect": -1
+  },
+  {
+   "name": "max_scalar_vs_bmp_max",
+   "a": {
+    "text": "\uDBFF\uDFFF"
+   },
+   "b": {
+    "text": "\uFFFF"
+   },
+   "expect": 1
+  },
+  {
+   "name": "empty_vs_nul",
+   "a": {
+    "text": ""
+   },
+   "b": {
+    "text": "\u0000"
+   },
+   "expect": -1
+  },
+  {
+   "name": "long_equal_prefix",
+   "a": {
+    "text_repeat": [
+     "\uD83D\uDE00",
+     1000
+    ]
+   },
+   "b": {
+    "text_repeat": [
+     "\uD83D\uDE00",
+     1001
+    ]
+   },
+   "expect": -1
+  }
+ ],
+ "len": [
+  {
+   "name": "empty",
+   "text": {
+    "text": ""
+   },
+   "expect": 0
+  },
+  {
+   "name": "ascii",
+   "text": {
+    "text": "hello"
+   },
+   "expect": 5
+  },
+  {
+   "name": "nul",
+   "text": {
+    "text": "\u0000"
+   },
+   "expect": 1
+  },
+  {
+   "name": "two_byte",
+   "text": {
+    "text": "\u00E9"
+   },
+   "expect": 1
+  },
+  {
+   "name": "three_byte",
+   "text": {
+    "text": "\u20AC"
+   },
+   "expect": 1
+  },
+  {
+   "name": "emoji_one_scalar",
+   "doc": "Two UTF-16 units, four UTF-8 bytes, one scalar.",
+   "text": {
+    "text": "\uD83D\uDE00"
+   },
+   "expect": 1
+  },
+  {
+   "name": "max_scalar",
+   "text": {
+    "text": "\uDBFF\uDFFF"
+   },
+   "expect": 1
+  },
+  {
+   "name": "combining_acute",
+   "doc": "e plus U+0301 is two scalars; nothing is normalised.",
+   "text": {
+    "text": "e\u0301"
+   },
+   "expect": 2
+  },
+  {
+   "name": "combining_stack",
+   "text": {
+    "text": "a\u0301\u0323\u0308"
+   },
+   "expect": 4
+  },
+  {
+   "name": "zwj_family",
+   "doc": "One grapheme, five scalars.",
+   "text": {
+    "text": "\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67"
+   },
+   "expect": 5
+  },
+  {
+   "name": "flag",
+   "doc": "One grapheme, two regional indicators.",
+   "text": {
+    "text": "\uD83C\uDDE9\uD83C\uDDEA"
+   },
+   "expect": 2
+  },
+  {
+   "name": "skin_tone",
+   "text": {
+    "text": "\uD83D\uDC4D\uD83C\uDFFD"
+   },
+   "expect": 2
+  },
+  {
+   "name": "variation_selector",
+   "text": {
+    "text": "\u2764\uFE0F"
+   },
+   "expect": 2
+  },
+  {
+   "name": "bom_inside",
+   "text": {
+    "text": "\uFEFFa"
+   },
+   "expect": 2
+  },
+  {
+   "name": "emoji_2000",
+   "text": {
+    "text_repeat": [
+     "\uD83D\uDE00",
+     2000
+    ]
+   },
+   "expect": 2000
+  }
+ ],
+ "range": [
+  {
+   "name": "len_below_lower",
+   "doc": "check text.len in 1..2000 refuses 0.",
+   "text": {
+    "text": ""
+   },
+   "lo": 1,
+   "hi": 2000,
+   "expect": false
+  },
+  {
+   "name": "len_at_lower",
+   "text": {
+    "text": "a"
+   },
+   "lo": 1,
+   "hi": 2000,
+   "expect": true
+  },
+  {
+   "name": "len_at_lower_emoji",
+   "doc": "One emoji is length 1, not 2.",
+   "text": {
+    "text": "\uD83D\uDE00"
+   },
+   "lo": 1,
+   "hi": 1,
+   "expect": true
+  },
+  {
+   "name": "len_at_upper_ascii",
+   "text": {
+    "text_repeat": [
+     "a",
+     2000
+    ]
+   },
+   "lo": 1,
+   "hi": 2000,
+   "expect": true
+  },
+  {
+   "name": "len_above_upper_ascii",
+   "text": {
+    "text_repeat": [
+     "a",
+     2001
+    ]
+   },
+   "lo": 1,
+   "hi": 2000,
+   "expect": false
+  },
+  {
+   "name": "len_at_upper_emoji",
+   "doc": "2000 emoji are 4000 UTF-16 units and 8000 UTF-8 bytes, still length 2000.",
+   "text": {
+    "text_repeat": [
+     "\uD83D\uDE00",
+     2000
+    ]
+   },
+   "lo": 1,
+   "hi": 2000,
+   "expect": true
+  },
+  {
+   "name": "len_above_upper_emoji",
+   "text": {
+    "text_repeat": [
+     "\uD83D\uDE00",
+     2001
+    ]
+   },
+   "lo": 1,
+   "hi": 2000,
+   "expect": false
+  },
+  {
+   "name": "len_at_upper_combining",
+   "doc": "1000 times e plus U+0301 is length 2000.",
+   "text": {
+    "text_repeat": [
+     "e\u0301",
+     1000
+    ]
+   },
+   "lo": 1,
+   "hi": 2000,
+   "expect": true
+  },
+  {
+   "name": "len_above_upper_combining",
+   "text": {
+    "text_repeat": [
+     "e\u0301",
+     1000
+    ]
+   },
+   "lo": 1,
+   "hi": 1999,
+   "expect": false
+  },
+  {
+   "name": "len_title_200_emoji",
+   "doc": "check title.len in 1..200 accepts 200 emoji (400 UTF-16 units).",
+   "text": {
+    "text_repeat": [
+     "\uD83D\uDE00",
+     200
+    ]
+   },
+   "lo": 1,
+   "hi": 200,
+   "expect": true
+  },
+  {
+   "name": "len_title_201_emoji",
+   "text": {
+    "text_repeat": [
+     "\uD83D\uDE00",
+     201
+    ]
+   },
+   "lo": 1,
+   "hi": 200,
+   "expect": false
+  },
+  {
+   "name": "len_family_in_1_4",
+   "doc": "A five scalar grapheme does not fit 1..4.",
+   "text": {
+    "text": "\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67"
+   },
+   "lo": 1,
+   "hi": 4,
+   "expect": false
+  },
+  {
+   "name": "len_single_point_range",
+   "text": {
+    "text": "ab"
+   },
+   "lo": 2,
+   "hi": 2,
+   "expect": true
+  },
+  {
+   "name": "int_at_both_safe_bounds",
+   "int": "9007199254740991",
+   "lo": "-9007199254740991",
+   "hi": "9007199254740991",
+   "expect": true
+  },
+  {
+   "name": "int_at_lower_safe_bound",
+   "int": "-9007199254740991",
+   "lo": "-9007199254740991",
+   "hi": "0",
+   "expect": true
+  },
+  {
+   "name": "int_below_lower",
+   "int": "-1",
+   "lo": "0",
+   "hi": "10",
+   "expect": false
+  },
+  {
+   "name": "int_above_upper",
+   "int": "11",
+   "lo": "0",
+   "hi": "10",
+   "expect": false
+  }
+ ]
+}
