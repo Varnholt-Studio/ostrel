@@ -2750,9 +2750,10 @@ mod v02_tests {
 
     /// Every value the tree holds once per source construct must fit the
     /// node budget of ARCHITECTURE 3.4: the arena entries and every element
-    /// type of a boxed slice. A declaration payload behind the `Box` of an
-    /// item, an expression or a view node is one allocation per node, as for
-    /// [`FnDecl`] in v0.1.
+    /// type of a boxed slice. A payload behind the `Box` of an item, an
+    /// expression, a member or a view node (as [`FnDecl`] in v0.1) belongs
+    /// to that node and is not counted as a node of its own; its size limit
+    /// is checked by `box_payloads_stay_within_d104_limit` (D104).
     #[test]
     fn v02_node_sizes_stay_within_d54_budget() {
         fn fits<T>() -> bool {
@@ -2782,6 +2783,35 @@ mod v02_tests {
         assert!(fits::<Take>());
         assert!(fits::<CallRule>());
         assert!(fits::<Cond>());
+    }
+
+    /// D104 (ARCHITECTURE 3.4): a payload behind the `Box` of a node has
+    /// at most 128 bytes, so one counted node costs at most 64 + 128 bytes.
+    /// The list names every `Box<T>` payload of the tree; a new boxed
+    /// payload must be added here.
+    #[test]
+    fn box_payloads_stay_within_d104_limit() {
+        fn fits<T>() -> bool {
+            std::mem::size_of::<T>() <= 128
+        }
+        // Items.
+        assert!(fits::<FnDecl>());
+        assert!(fits::<AppDecl>());
+        assert!(fits::<EnumDecl>());
+        assert!(fits::<DataDecl>());
+        assert!(fits::<VarDecl>());
+        assert!(fits::<PlacedFnDecl>());
+        assert!(fits::<ViewDecl>());
+        assert!(fits::<StyleDecl>());
+        // Members.
+        assert!(fits::<FieldDecl>());
+        // Expressions.
+        assert!(fits::<MakeExpr>());
+        assert!(fits::<Query>());
+        // View nodes.
+        assert!(fits::<Element>());
+        assert!(fits::<ViewIf>());
+        assert!(fits::<ViewFor>());
     }
 
     #[test]
@@ -2987,6 +3017,19 @@ mod v02_tests {
         let bare = m.query("items", None, None, None)?;
         assert_eq!(m.expr_height(bare), Some(1));
         assert_eq!(m.node_count(), 9);
+
+        // Each clause alone, so no taller sibling hides its level.
+        // `Message limit 5`: query > take > 5.
+        let five = m.int(5)?;
+        let take_only = m.query("Message", None, None, Some((TakeKind::Limit, five)))?;
+        assert_eq!(m.expr_height(take_only), Some(3));
+        // 5, query, take clause
+        assert_eq!(m.node_count(), 12);
+        // `Message sort made desc`: query > sort key.
+        let sort_only = m.query("Message", None, Some(("made", true)), None)?;
+        assert_eq!(m.expr_height(sort_only), Some(2));
+        // query, sort key
+        assert_eq!(m.node_count(), 14);
         Ok(())
     }
 
