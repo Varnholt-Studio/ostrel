@@ -29,8 +29,9 @@ pub struct LiveRow {
 }
 
 /// The rules of [`Write`] on one row that do not depend on where a driver stores its rows
-/// (D139). Whether an id is taken, by a live row or by a deleted one, and removing a deleted row
-/// are rules of the driver's storage and stay in the driver.
+/// (D139). Both drivers apply every write through them, the SQLite driver after loading the one
+/// row a write names (D143). Whether an id is taken, by a live row or by a deleted one, and
+/// removing a deleted row are rules of the driver's storage and stay in the driver.
 impl LiveRow {
     /// The row a [`Write::Insert`] creates: version 1, its fields and its collection changes
     /// applied to empty collections.
