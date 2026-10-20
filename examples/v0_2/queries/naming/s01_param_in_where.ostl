@@ -1,0 +1,14 @@
+// Case S-01 (EXPECTED.md 4): a parameter named like a field of the queried type.
+app Naming
+
+data Post
+  text: Text
+  pos: Int
+  see if true
+  drop if true
+
+fn dropAt(pos: Int)
+  drop Post where pos == pos
+
+view Main
+  text "Naming"

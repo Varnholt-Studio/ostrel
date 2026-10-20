@@ -1,0 +1,14 @@
+// Case S-06 (EXPECTED.md 4): a local named like a field is in scope but not used in the query.
+app Naming
+
+data Post
+  text: Text
+  pos: Int
+  see if true
+  drop if true
+
+fn dropText(pos: Int, t: Text)
+  drop Post where text == t
+
+view Main
+  text "Naming"

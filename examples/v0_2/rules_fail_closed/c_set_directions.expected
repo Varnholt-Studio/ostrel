@@ -1,0 +1,31 @@
+case: c_set_directions
+ac: AC-33 (c), reading per SPEC 5.0: several elements are sent as several ops, each checked on its own (G12)
+kind: ops
+compile: ostrel check exits 0 with exactly one warning, on line 14 (`edit watchers ...`), saying
+  that the rule does not mention removals, so every removal from `watchers` is denied (AC-55);
+  its code and text are assigned by the v0.2 checker task
+principals: alice, bob, carol, dave (development identities, debug build, AC-12)
+given: alice has made Project p1 { name: "Launch" }, so p1.author = alice and p1.watchers = {alice}
+steps:
+  1. bob sends one op: add bob to p1.watchers
+     rule: added = {bob}, removed = {}; added == {me} is true
+     expect: Ack; watchers = {alice, bob}
+  2. carol sends one op: add dave to p1.watchers
+     rule: author == me is false, added == {me} is false
+     expect: Reject Denied; watchers = {alice, bob}
+  3. alice replaces bob by dave, sent as two ops in two separate batches:
+     3a. add dave to p1.watchers
+         rule: author == me is true, direction added
+         expect: Ack; watchers = {alice, bob, dave}
+     3b. remove bob from p1.watchers
+         rule: the expression `author == me or added == {me}` is true for alice, but the rule
+         does not mention removals
+         expect: Reject Denied; watchers = {alice, bob, dave}
+  4. bob sends one op: remove bob from p1.watchers (leave)
+     expect: Reject Denied; watchers = {alice, bob, dave}
+final db: p1.watchers = {alice, bob, dave}; no removal of any element is stored in the op log or
+  in the side table of `watchers`
+must not: step 3b or step 4 accepted; a removal evaluated as allowed because the expression is
+  true for its principal
+not covered here: one wire op that carries more than one element or both directions (Invalid,
+  AC-55); whether ops in one batch are accepted together is not assumed, so step 3 uses two batches

@@ -1,0 +1,18 @@
+// Case C-01 (EXPECTED.md 4): a local named like a field of another type, not of the queried one.
+app Naming
+
+data Slot
+  at: Int
+  see if true
+  drop if true
+
+data Post
+  text: Text
+  pos: Int
+  see if true
+
+fn dropSlotsAt(pos: Int)
+  drop Slot where at == pos
+
+view Main
+  text "Naming"

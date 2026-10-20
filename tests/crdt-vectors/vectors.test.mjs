@@ -127,3 +127,28 @@ test('validator refuses a remove with more than 64 tags', () => {
 test('validator refuses a vector filed under the wrong strategy', () => {
   assert.throws(() => validateVector(setVector({}), 'map'), /does not match directory/);
 });
+
+// A tag is the OpId of an add (README.md); the id of a remove is an authoring error.
+const B1 = '000000000000000b00000001';
+const C1 = '000000000000000c00000001';
+const HLC_C = '018bcfe568020000000000000000000c';
+
+test('validator refuses a tag that names another remove', () => {
+  const vector = setVector({ deliveries: [[0, 1, 2]] });
+  vector.ops.push({ id: C1, hlc: HLC_C, op: { remove: 'x', tags: [B1] } });
+  const reason = /names tag 000000000000000b00000001, which is the id of the remove ops\[1\]/;
+  assert.throws(() => validateVector(vector, 'set'), reason);
+});
+
+test('validator refuses a remove that names its own id', () => {
+  const vector = setVector({});
+  vector.ops[1] = { ...vector.ops[1], op: { remove: 'x', tags: [A1, B1] } };
+  assert.throws(() => validateVector(vector, 'set'), /which is the id of the remove ops\[1\]/);
+});
+
+test('validator refuses a set op that is both add and remove', () => {
+  const vector = setVector({ deliveries: [[0, 1, 2]] });
+  vector.ops.push({ id: C1, hlc: HLC_C, op: { remove: 'x', tags: [B1] } });
+  vector.ops[1] = { ...vector.ops[1], op: { add: 'x', remove: 'x', tags: [A1] } };
+  assert.throws(() => validateVector(vector, 'set'), /must be \{ "add": e \} or/);
+});
