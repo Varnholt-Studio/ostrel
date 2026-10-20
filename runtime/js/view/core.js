@@ -9,6 +9,11 @@
 //   { kind: "el", tag, key, attrs, on, children }
 // Mounting stores the created DOM node in `node`. A virtual node belongs to at
 // most one place in a tree; reusing a mounted node elsewhere is an error.
+//
+// Only nodes made by el() and text() are accepted. An object of the same shape
+// from anywhere else (JSON, a bridge value, a copy) is rejected, so the tag
+// checks cannot be bypassed. The tag is checked again when the DOM is built,
+// because a virtual node is a mutable object.
 
 /** Error raised for invalid view descriptions. `code` is stable for tests. */
 export class ViewError extends Error {
@@ -48,6 +53,40 @@ function checkTag(tag) {
   }
 }
 
+// Virtual nodes created by this module. A WeakSet keeps the mark out of the
+// object itself, so it cannot be copied, serialised or set from outside.
+const made = new WeakSet();
+
+function isVnode(value) {
+  return typeof value === "object" && value !== null && made.has(value);
+}
+
+// A value that did not come from el() or text() is a child of the wrong type.
+function checkVnode(vnode) {
+  if (!isVnode(vnode)) {
+    throw new ViewError("ChildType", "virtual node was not created by el() or text()");
+  }
+}
+
+// Checks the whole tree before mount or patch touches the DOM, so a forged node
+// or a replaced children list deep in the tree leaves the DOM unchanged. A node
+// that occurs twice is walked once; create() reports the reuse as before.
+function checkTree(root) {
+  const seen = new Set();
+  const stack = [root];
+  while (stack.length > 0) {
+    const vnode = stack.pop();
+    checkVnode(vnode);
+    if (seen.has(vnode)) continue;
+    seen.add(vnode);
+    if (vnode.kind !== "el") continue;
+    if (!Array.isArray(vnode.children)) {
+      throw new ViewError("ChildType", "children must be an array of virtual nodes");
+    }
+    for (const child of vnode.children) stack.push(child);
+  }
+}
+
 function toText(value) {
   if (typeof value === "string") return value;
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
@@ -62,7 +101,9 @@ function keyId(key) {
 
 /** Creates a text virtual node. */
 export function text(value) {
-  return { kind: "text", text: toText(value), node: null };
+  const vnode = { kind: "text", text: toText(value), node: null };
+  made.add(vnode);
+  return vnode;
 }
 
 /**
@@ -90,12 +131,14 @@ export function el(tag, props, children) {
   for (const child of children ?? []) {
     if (child === null || child === undefined || child === false) continue;
     if (typeof child === "string" || typeof child === "number") kids.push(text(child));
-    else if (child && (child.kind === "el" || child.kind === "text")) kids.push(child);
+    else if (isVnode(child)) kids.push(child);
     else throw new ViewError("ChildType", "child must be a virtual node, string or number");
   }
   const key = p.key === undefined ? undefined : p.key;
   if (key !== undefined) keyId(key);
-  return { kind: "el", tag, key, attrs, on, children: kids, node: null };
+  const vnode = { kind: "el", tag, key, attrs, on, children: kids, node: null };
+  made.add(vnode);
+  return vnode;
 }
 
 // Children are either all keyed or all unkeyed; keys are unique among siblings.
@@ -187,11 +230,13 @@ export function createRenderer(doc, sinks) {
   }
 
   function create(vnode) {
+    checkVnode(vnode);
     if (vnode.node) throw new ViewError("VnodeReused", "virtual node is already mounted");
     if (vnode.kind === "text") {
       vnode.node = doc.createTextNode(vnode.text);
       return vnode.node;
     }
+    checkTag(vnode.tag);
     const element = doc.createElement(vnode.tag);
     for (const name of Object.keys(vnode.attrs)) sinks.setAttr(element, name, vnode.attrs[name]);
     setEvents(element, vnode.on, {});
@@ -209,6 +254,7 @@ export function createRenderer(doc, sinks) {
 
   function patchNode(parent, oldV, newV) {
     if (oldV === newV) return;
+    checkVnode(newV);
     if (!same(oldV, newV)) {
       parent.insertBefore(create(newV), oldV.node);
       parent.removeChild(oldV.node);
@@ -276,11 +322,13 @@ export function createRenderer(doc, sinks) {
   return {
     /** Appends the DOM for `vnode` to `parent`; returns `vnode`. */
     mount(parent, vnode) {
+      checkTree(vnode);
       parent.appendChild(create(vnode));
       return vnode;
     },
     /** Updates the DOM of `oldV` under `parent` to match `newV`; returns `newV`. */
     patch(parent, oldV, newV) {
+      checkTree(newV);
       patchNode(parent, oldV, newV);
       return newV;
     },
