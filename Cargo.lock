@@ -334,6 +334,7 @@ dependencies = [
  "ostrel_core",
  "ostrel_db",
  "ostrel_db_memory",
+ "ostrel_db_sqlite",
  "ostrel_ir",
  "ostrel_sema",
  "ostrel_syntax",

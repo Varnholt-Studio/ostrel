@@ -46,6 +46,7 @@ pub struct TaskHost<'a> {
     clock: &'a mut dyn Clock,
     audit: &'a mut dyn AuditStore,
     output: Vec<String>,
+    audit_failure: Option<AuditError>,
 }
 
 impl<'a> TaskHost<'a> {
@@ -60,6 +61,7 @@ impl<'a> TaskHost<'a> {
             clock,
             audit,
             output: Vec::new(),
+            audit_failure: None,
         }
     }
 
@@ -68,9 +70,19 @@ impl<'a> TaskHost<'a> {
         &self.output
     }
 
+    /// The first audit entry of this task that could not be written, if any (D134).
+    pub fn audit_failure(&self) -> Option<&AuditError> {
+        self.audit_failure.as_ref()
+    }
+
     /// Ends the task and returns its printed lines.
     pub fn into_output(self) -> Vec<String> {
         self.output
+    }
+
+    /// Ends the task and returns its printed lines and its first failed audit entry.
+    pub fn finish(self) -> (Vec<String>, Option<AuditError>) {
+        (self.output, self.audit_failure)
     }
 }
 
@@ -79,6 +91,7 @@ impl fmt::Debug for TaskHost<'_> {
         f.debug_struct("TaskHost")
             .field("principal", &self.principal.map(RowId::to_hex))
             .field("output_lines", &self.output.len())
+            .field("audit_failed", &self.audit_failure.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -117,9 +130,21 @@ impl ServerHost for TaskHost<'_> {
 
     /// Hashes the arguments and stores only the [`AuditRecord`] (D117, D118). The entry
     /// itself, with its arguments, is not kept and not logged.
+    ///
+    /// A failure is returned to the VM, which then does not run the body, and is also kept
+    /// in the host, so that the task reports the call as `Unavailable` (D134) and not as a
+    /// runtime error of the program.
     fn audit<'b>(&'b mut self, entry: &'b AuditEntry) -> BoxFuture<'b, Result<(), AuditError>> {
         let record = AuditRecord::from_entry(entry);
-        self.audit.append(record)
+        Box::pin(async move {
+            let result = self.audit.append(record).await;
+            if let Err(error) = &result
+                && self.audit_failure.is_none()
+            {
+                self.audit_failure = Some(error.clone());
+            }
+            result
+        })
     }
 }
 
@@ -153,7 +178,7 @@ pub(crate) mod tests {
     }
 
     /// An audit store that refuses every record.
-    struct ClosedLog;
+    pub(crate) struct ClosedLog;
 
     impl AuditStore for ClosedLog {
         fn append<'a>(&'a mut self, _: AuditRecord) -> BoxFuture<'a, Result<(), AuditError>> {
@@ -208,6 +233,55 @@ pub(crate) mod tests {
             ready(host.audit(&entry)),
             Err(AuditError("log closed".to_owned()))
         );
+        // D134: the host keeps the failure, so the task can report `Unavailable`.
+        assert_eq!(
+            host.audit_failure(),
+            Some(&AuditError("log closed".to_owned()))
+        );
+        assert!(format!("{host:?}").contains("audit_failed: true"));
+    }
+
+    /// An audit store that refuses the first record and accepts every later one.
+    #[derive(Default)]
+    struct FlakyLog {
+        refused: bool,
+        stored: usize,
+    }
+
+    impl AuditStore for FlakyLog {
+        fn append<'a>(&'a mut self, _: AuditRecord) -> BoxFuture<'a, Result<(), AuditError>> {
+            Box::pin(async move {
+                if self.refused {
+                    self.stored += 1;
+                    Ok(())
+                } else {
+                    self.refused = true;
+                    Err(AuditError("disk full".to_owned()))
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn first_audit_failure_stays_after_later_entries() {
+        let mut clock = StepClock::default();
+        let mut log = FlakyLog::default();
+        let (output, failure) = {
+            let mut host = TaskHost::new(None, &mut clock, &mut log);
+            assert_eq!(host.audit_failure(), None);
+            let entry = AuditEntry {
+                function: "f".to_owned(),
+                principal: None,
+                arguments: Vec::new(),
+                time: host.now(),
+            };
+            assert!(ready(host.audit(&entry)).is_err());
+            assert_eq!(ready(host.audit(&entry)), Ok(()));
+            host.finish()
+        };
+        assert!(output.is_empty());
+        assert_eq!(failure, Some(AuditError("disk full".to_owned())));
+        assert_eq!(log.stored, 1);
     }
 
     #[test]

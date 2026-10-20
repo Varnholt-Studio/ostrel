@@ -13,7 +13,7 @@ use std::fmt;
 
 use ostrel_core::ids::RowId;
 use ostrel_db::api::Connection;
-use ostrel_vm::host::ServerContext;
+use ostrel_vm::host::{AuditError, ServerContext};
 use ostrel_vm::{Image, Limits, RuntimeError};
 
 use crate::audit::AuditStore;
@@ -41,6 +41,18 @@ pub enum TaskError {
         /// Lines printed before the error.
         output: Vec<String>,
     },
+    /// The audit entry of an elevated function could not be written, so its body did not
+    /// run; a retry is safe. This is the call error kind `Unavailable` of D134, neither a
+    /// runtime error of the program nor `Denied`.
+    ///
+    /// ASSUMPTION (D134, henrik #1767): `CallError::Unavailable` of the sync protocol (T5)
+    /// does not exist yet; the transport maps this variant to it once it does.
+    Unavailable {
+        /// Why the audit store refused the entry.
+        error: AuditError,
+        /// Lines printed before the call failed.
+        output: Vec<String>,
+    },
 }
 
 impl fmt::Display for TaskError {
@@ -50,6 +62,7 @@ impl fmt::Display for TaskError {
             TaskError::Runtime { error, .. } => {
                 write!(f, "runtime error[{}]: {}", error.kind, error.kind.message())
             }
+            TaskError::Unavailable { error, .. } => write!(f, "call error[Unavailable]: {error}"),
         }
     }
 }
@@ -96,11 +109,14 @@ impl Server {
             host: &mut host,
         };
         let result = run_in(&self.image, ctx, self.limits);
-        let output = host.into_output();
-        match result {
-            Ok(()) => Ok(Outcome { principal, output }),
-            Err(error) => Err(TaskError::Runtime { error, output }),
-        }
+        let (output, audit_failure) = host.finish();
+        outcome(principal, result, output, audit_failure)
+    }
+
+    /// The connection of the server to the database of the app, for migrations at startup
+    /// and for checks of what a request wrote.
+    pub fn connection(&mut self) -> &mut dyn Connection {
+        self.db.as_mut()
     }
 }
 
@@ -109,6 +125,28 @@ impl fmt::Debug for Server {
         f.debug_struct("Server")
             .field("limits", &self.limits)
             .finish_non_exhaustive()
+    }
+}
+
+/// The result of a task from what the VM returned and what the host saw.
+///
+/// A task that stops after an audit entry could not be written ends with
+/// [`TaskError::Unavailable`] (D134): the VM did not run that body, whatever error it reports
+/// for the failed call. A task that ends normally stays `Ok`, because the program may have
+/// handled the failure with `catch Unavailable`.
+///
+/// ASSUMPTION: the VM entry of elevated functions (T2) does not yet say how it reports a
+/// failed audit, so the host record decides.
+fn outcome(
+    principal: Option<RowId>,
+    result: Result<(), RuntimeError>,
+    output: Vec<String>,
+    audit_failure: Option<AuditError>,
+) -> Result<Outcome, TaskError> {
+    match (result, audit_failure) {
+        (Ok(()), _) => Ok(Outcome { principal, output }),
+        (Err(_), Some(error)) => Err(TaskError::Unavailable { error, output }),
+        (Err(error), None) => Err(TaskError::Runtime { error, output }),
     }
 }
 
@@ -126,7 +164,7 @@ pub fn run_in(
 mod tests {
     use super::*;
     use crate::audit::MemoryAuditLog;
-    use crate::host::tests::{StepClock, ready};
+    use crate::host::tests::{ClosedLog, StepClock, ready};
     use crate::identity::{NoTokens, TokenRejected};
     use ostrel_core::FileId;
     use ostrel_db::api::Driver;
@@ -225,6 +263,81 @@ mod tests {
                 TokenRejected("bad signature".to_owned())
             )))
         );
+    }
+
+    fn runtime_error(src: &str) -> RuntimeError {
+        let mut server = server(src, Box::new(NoTokens));
+        match server.run(&Credentials::anonymous()) {
+            Err(TaskError::Runtime { error, .. }) => error,
+            other => unreachable!("expected a runtime error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_audit_makes_the_call_unavailable() {
+        let error = runtime_error("fn main()\n  print(1 / 0)\n");
+        let refused = AuditError("log closed".to_owned());
+        let result = outcome(
+            None,
+            Err(error),
+            vec!["before".to_owned()],
+            Some(refused.clone()),
+        );
+        assert_eq!(
+            result,
+            Err(TaskError::Unavailable {
+                error: refused,
+                output: vec!["before".to_owned()],
+            })
+        );
+        let shown = match result {
+            Err(e) => e.to_string(),
+            Ok(o) => unreachable!("expected Unavailable, got {o:?}"),
+        };
+        assert_eq!(
+            shown,
+            "call error[Unavailable]: audit entry not written: log closed"
+        );
+        assert!(!shown.contains("runtime error"), "{shown}");
+    }
+
+    #[test]
+    fn handled_audit_failure_keeps_the_task_successful() {
+        let refused = AuditError("log closed".to_owned());
+        assert_eq!(
+            outcome(Some(user(3)), Ok(()), Vec::new(), Some(refused)),
+            Ok(Outcome {
+                principal: Some(user(3)),
+                output: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_error_without_audit_failure_stays_a_runtime_error() {
+        let error = runtime_error("fn main()\n  print(1 / 0)\n");
+        assert_eq!(
+            outcome(None, Err(error), Vec::new(), None),
+            Err(TaskError::Runtime {
+                error,
+                output: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn closed_audit_log_does_not_touch_code_that_is_not_elevated() {
+        let db = ready(MemoryDriver::new().connect("memory:"))
+            .unwrap_or_else(|e| unreachable!("memory driver: {e:?}"));
+        let mut server = Server::new(
+            image(HELLO),
+            Limits::default(),
+            db,
+            Box::new(ClosedLog),
+            Box::new(StepClock::default()),
+            Box::new(NoTokens),
+        );
+        assert!(server.run(&Credentials::anonymous()).is_ok());
     }
 
     /// Groundwork for AC-12 (the release proof is T133): without the feature `dev-identity` the

@@ -22,6 +22,7 @@ sha2 = { version = "0.10", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 ostrel_db_memory = { path = "../ostrel_db_memory" }
+ostrel_db_sqlite = { path = "../ostrel_db_sqlite" }
 ostrel_ir.workspace = true
 ostrel_sema.workspace = true
 ostrel_syntax.workspace = true

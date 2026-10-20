@@ -87,7 +87,9 @@ impl fmt::Display for AuditRecord {
 /// transaction of the body, D117) comes with the server task that wires the database; until
 /// then [`MemoryAuditLog`] is the only implementation.
 pub trait AuditStore {
-    /// Appends `record`. On `Err` nothing was stored and the VM does not run the body.
+    /// Appends `record`. On `Err` nothing was stored. The error goes back to the VM through
+    /// [`ServerHost::audit`](ostrel_vm::host::ServerHost::audit), whose contract is that the
+    /// body then does not run, and the task reports the call as `Unavailable` (D134).
     fn append<'a>(&'a mut self, record: AuditRecord) -> BoxFuture<'a, Result<(), AuditError>>;
 }
 
