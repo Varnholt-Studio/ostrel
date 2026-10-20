@@ -138,7 +138,61 @@ fn field_types_are_the_rows_of_the_type_table() {
         Ty::Error,
         Ty::Set(boxed(Ty::Unit)),
         Ty::Map(boxed(Ty::Int), boxed(Ty::Rows(model))),
+        Ty::Optional(boxed(Ty::Optional(boxed(Ty::Int)))),
     ] {
         assert!(!ty.is_field_type(), "{ty:?}");
     }
+}
+
+#[test]
+fn sort_by_an_implicit_field_is_representable() {
+    // `Message where room == r sort made last 200` (SYNTAX 4.5).
+    let span = Span::point(file(), 0);
+    let message = DefId(0);
+    let mut program = Program::default();
+    let expr = |program: &mut Program, kind| {
+        program.exprs.push(Expr {
+            kind,
+            span,
+            ty: None,
+        });
+        ExprId(program.exprs.len() as u32 - 1)
+    };
+    let room = expr(
+        &mut program,
+        ExprKind::Name(Res::Field(message, FieldRef::Declared(FieldId(0)))),
+    );
+    let r = expr(&mut program, ExprKind::Name(Res::Local(LocalId(0))));
+    let filter = expr(
+        &mut program,
+        ExprKind::Binary {
+            op: ast::BinaryOp::Eq,
+            lhs: room,
+            rhs: r,
+        },
+    );
+    let n = expr(&mut program, ExprKind::Int(200));
+    let query = Query {
+        model: message,
+        filter: Some(filter),
+        sort: Some((FieldRef::Implicit(ImplicitField::Made), false)),
+        take: Some((ast::TakeKind::Last, n)),
+    };
+    assert_eq!(
+        query.sort,
+        Some((FieldRef::Implicit(ImplicitField::Made), false))
+    );
+    // `m.author` on a loop variable `m`.
+    let m = expr(&mut program, ExprKind::Name(Res::Local(LocalId(1))));
+    let author = ExprKind::Field {
+        base: m,
+        field: (message, FieldRef::Implicit(ImplicitField::Author)),
+    };
+    assert!(matches!(
+        author,
+        ExprKind::Field {
+            field: (_, FieldRef::Implicit(ImplicitField::Author)),
+            ..
+        }
+    ));
 }

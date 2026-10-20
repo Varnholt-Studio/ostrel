@@ -80,6 +80,34 @@ id_type!(
     ViewNodeId
 );
 
+/// A field of a model as a name in a body refers to it: declared in the model
+/// or implicit on every row (SYNTAX 4.2, ARCHITECTURE 5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FieldRef {
+    /// A field of [`ModelDef::fields`].
+    Declared(FieldId),
+    /// A field every row has without declaring it.
+    Implicit(ImplicitField),
+}
+
+/// The implicit fields. Their types are fixed by the language, so they have
+/// no [`FieldDef`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImplicitField {
+    /// `id`, assigned by the runtime, never writable.
+    Id,
+    /// `made`, the server accepted stamp of the `make`.
+    Made,
+    /// `changed`, the server accepted stamp of the last write.
+    Changed,
+    /// `author`, only in an app with `auth` (G8).
+    Author,
+    /// `pending`, client only sync state (ARCHITECTURE 5.1).
+    Pending,
+    /// `rejected`, client only sync state (ARCHITECTURE 5.1).
+    Rejected,
+}
+
 /// One source file as input to [`resolve`]: the tree and what the tree does
 /// not know, its file and its text (positions of operators, ARCHITECTURE 3).
 #[derive(Clone, Copy, Debug)]
@@ -142,7 +170,7 @@ impl Program {
         self.view_nodes.get(id.index())
     }
 
-    /// The field of a model.
+    /// A declared field of a model; implicit fields have no [`FieldDef`].
     pub fn field(&self, model: DefId, field: FieldId) -> Option<&FieldDef> {
         match &self.def(model)?.kind {
             DefKind::Model(m) => m.fields.get(field.index()),
@@ -200,8 +228,8 @@ pub enum Registration {
     Invite,
 }
 
-/// A model with its fields, rules and checks. The implicit fields (`id`,
-/// `made`, `changed`, `author`) are not listed; `check` knows them by name.
+/// A model with its fields, rules and checks. The implicit fields are not
+/// listed; names in bodies refer to them by [`FieldRef::Implicit`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelDef {
     /// Declared fields in source order, indexed by [`FieldId`].
@@ -304,7 +332,8 @@ pub enum Placement {
 /// and `call` rule (D95).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FnDef {
-    /// `server` or `client` as written; wins over inference.
+    /// `server` or `client` as written; wins over inference. Never
+    /// [`Placement::Shared`], which is only inferred.
     pub declared: Option<Placement>,
     /// The placement: `declared` after `resolve`, the inferred one after
     /// `check` when nothing was declared.

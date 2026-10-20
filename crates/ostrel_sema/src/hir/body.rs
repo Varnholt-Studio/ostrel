@@ -7,7 +7,7 @@
 use ostrel_core::Span;
 use ostrel_syntax::ast::{BinaryOp, TakeKind, UnaryOp};
 
-use super::{BlockId, DefId, ExprId, FieldId, LocalId, StmtId, Ty, ViewNodeId};
+use super::{BlockId, DefId, ExprId, FieldId, FieldRef, LocalId, StmtId, Ty, ViewNodeId};
 
 /// What a name refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -19,7 +19,7 @@ pub enum Res {
     Def(DefId),
     /// A field of the model in scope: a bare name in a rule, a `check`, or the
     /// `where` and `sort` of a query (SYNTAX 4.4, 4.5).
-    Field(DefId, FieldId),
+    Field(DefId, FieldRef),
     /// A variant of an enum, by position in declaration order.
     Variant(DefId, u32),
     /// A contextual name of SYNTAX 6 in the place where it has meaning.
@@ -111,10 +111,11 @@ pub enum ExprKind {
         /// The record.
         base: ExprId,
         /// The model and field.
-        field: (DefId, FieldId),
+        field: (DefId, FieldRef),
     },
-    /// `base.name` that is not a model field, for example `text.len`;
-    /// `check` decides what it means for the type of `base`.
+    /// `base.name` that is neither a declared nor an implicit model field,
+    /// for example `text.len`; `check` decides what it means for the type of
+    /// `base`.
     Property {
         /// The accessed value.
         base: ExprId,
@@ -164,7 +165,8 @@ pub enum ExprKind {
     List(Box<[ExprId]>),
     /// `[k: v]`.
     Map(Box<[(ExprId, ExprId)]>),
-    /// `make Model { f: e }`, fields resolved.
+    /// `make Model { f: e }`, fields resolved. Only declared fields: implicit
+    /// fields are never written by `make` (SYNTAX 4.2).
     Make {
         /// The model.
         model: DefId,
@@ -193,7 +195,7 @@ pub struct Query {
     /// The `where` condition; its bare names are [`Res::Field`].
     pub filter: Option<ExprId>,
     /// The sort field and `desc`; the tie break by `id` is implied.
-    pub sort: Option<(FieldId, bool)>,
+    pub sort: Option<(FieldRef, bool)>,
     /// `limit n` or `last n`.
     pub take: Option<(TakeKind, ExprId)>,
 }

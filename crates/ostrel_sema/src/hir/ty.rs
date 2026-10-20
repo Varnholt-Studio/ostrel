@@ -66,7 +66,8 @@ impl Ty {
             | Ty::Rank
             | Ty::Enum(_)
             | Ty::Ref(_) => true,
-            Ty::Optional(inner) | Ty::Set(inner) | Ty::List(inner) => inner.is_field_type(),
+            Ty::Optional(inner) => !matches!(**inner, Ty::Optional(_)) && inner.is_field_type(),
+            Ty::Set(inner) | Ty::List(inner) => inner.is_field_type(),
             Ty::Map(key, value) => key.is_field_type() && value.is_field_type(),
             Ty::Remote(_) | Ty::Rows(_) | Ty::Range(_) | Ty::Unit | Ty::Error => false,
         }
