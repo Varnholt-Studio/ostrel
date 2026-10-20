@@ -12,8 +12,12 @@
 #   - The environment provides OSTREL_CHROMIUM (absolute path of the Chromium binary) and,
 #     when set by the caller, OSTREL_BIN (absolute path of the release `ostrel` binary).
 #     A test starts its own browser with --headless=new and its own --user-data-dir.
+#   - A single test runs at most 5 minutes (--test-timeout); the whole job at most 30.
 #   - *.spec.ts and *.spec.mts are counted by the coverage check but cannot run without a
 #     build step, so their presence fails the job instead of being skipped silently.
+#   - Node 22 reads every argument of `node --test` as a glob pattern, so a file whose path
+#     contains a glob character (* ? [ ] { } ( ) ! + @ \) would match other files or none and
+#     never run. Such a path fails the job instead (glob_unsafe, checked by its self test).
 #
 # Before the tests the job proves that the browser starts and renders a page, so a job
 # without any browser test still fails when Chromium is broken.
@@ -24,6 +28,30 @@ fail() {
   echo "browser job: $*" >&2
   exit 1
 }
+
+# glob_unsafe PATH: true when PATH contains a character that `node --test` reads as glob syntax.
+glob_unsafe() {
+  case "$1" in
+    *[][*?{}\(\)!+@\\]*) return 0 ;;
+  esac
+  return 1
+}
+
+# glob_selftest: proves that glob_unsafe rejects every glob character and passes plain paths.
+glob_selftest() {
+  local c p bad=0
+  for c in '*' '?' '[' ']' '{' '}' '(' ')' '!' '+' '@' '\'; do
+    for p in "./a/x${c}1.spec.mjs" "./a${c}/x.spec.js"; do
+      glob_unsafe "$p" || { echo "browser job: selftest: not rejected: $p" >&2; bad=1; }
+    done
+  done
+  for p in './a/x1.spec.mjs' './a b/x-1_2.spec.js' './-a/x.y,z.spec.mjs'; do
+    ! glob_unsafe "$p" || { echo "browser job: selftest: rejected: $p" >&2; bad=1; }
+  done
+  return $bad
+}
+
+glob_selftest || fail "self test of glob_unsafe failed"
 
 find_chromium() {
   local name
@@ -49,8 +77,12 @@ echo "browser job: $(node --version 2>/dev/null || echo 'node missing'), image $
 profile=$(mktemp -d) || fail "cannot create a browser profile directory"
 trap 'rm -rf "$profile"' EXIT
 
+# The marker is written by a script, so a passing smoke page also proves that JavaScript runs;
+# the page source never contains the rendered text.
 marker="ostrel-browser-job-$$"
-page="data:text/html,<p id=m>$marker</p>"
+# Base64, because Chromium does not load a plain data: URL holding this script.
+html="<p id=m></p><script>m.textContent='ostrel-browser-job-'+$$</script>"
+page="data:text/html;base64,$(printf '%s' "$html" | base64 -w0)" || fail "cannot encode the smoke page"
 dom=$(timeout 60 "$chromium" --headless=new --no-sandbox --disable-gpu \
   --user-data-dir="$profile" --dump-dom "$page" 2>/dev/null)
 grep -q "<p id=\"m\">$marker</p>" <<<"$dom" || fail "headless Chromium did not render the smoke page"
@@ -72,7 +104,17 @@ if [ ${#specs[@]} -eq 0 ]; then
   exit 0
 fi
 
+unsafe=()
+for spec in "${specs[@]}"; do
+  if glob_unsafe "$spec"; then unsafe+=("$spec"); fi
+done
+if [ ${#unsafe[@]} -gt 0 ]; then
+  printf 'browser job: path contains a glob character, node --test would not run it: %s\n' \
+    "${unsafe[@]}" >&2
+  exit 1
+fi
+
 printf 'browser job: %s\n' "${specs[@]}"
 export OSTREL_CHROMIUM="$chromium"
-node --test --test-reporter=spec "${specs[@]}" || fail "browser tests failed"
+node --test --test-reporter=spec --test-timeout=300000 "${specs[@]}" || fail "browser tests failed"
 echo "browser job: ${#specs[@]} file(s) passed"

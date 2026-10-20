@@ -39,7 +39,7 @@ jobs:
             target
           key: cargo-browser-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-browser-${{ runner.os }}-
       - name: Fetch dependencies
         run: cargo fetch --locked
       - name: Build the compiler
