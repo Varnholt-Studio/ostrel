@@ -12,7 +12,9 @@
 # from the repository scan.
 # The file list comes from git when the repository root is a git work tree, otherwise from
 # the file system (for example an exported tree without .git). The check fails closed: a file
-# list that is empty or misses a required file (REQUIRED below) is a failure, never a pass.
+# list that is empty or misses a required file (REQUIRED below) is a failure, never a pass, and
+# so is a required file that is listed but not present as a file on disk (for example tracked
+# and deleted). The README rule always runs.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -69,7 +71,9 @@ list_files() {
     [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)" ]; then
     git ls-files -z
   else
-    find . \( -path ./.git -o -path ./target -o -name node_modules \) -prune -o -type f -print0 |
+    # Like git ls-files: skip .git at any depth, keep symbolic links.
+    find . \( -name .git -o -path ./target -o -name node_modules \) -prune -o \
+      \( -type f -o -type l \) -print0 |
       sed -z 's|^\./||'
   fi
 }
@@ -83,9 +87,11 @@ check_tree() {
     found=0
     for f in "${files[@]}"; do [ "$f" = "$r" ] && { found=1; break; }; done
     [ "$found" = 1 ] || { echo "file list misses required file $r (${#files[@]} files listed)"; bad=1; }
+    [ -f "$r" ] || { echo "required file $r is not present on disk"; bad=1; }
   done
-  if [ -f README.md ]; then
-    readme_ok README.md || { echo "README.md: first heading or sentence must name \"Ostrel programming language\""; bad=1; }
+  if ! { [ -f README.md ] && readme_ok README.md; }; then
+    echo "README.md: first heading or sentence must name \"Ostrel programming language\""
+    bad=1
   fi
   for f in "${files[@]}"; do
     [ "$f" = "$SELF" ] && continue
@@ -145,6 +151,26 @@ EOF
   printf 'Made by the Ostrel GmbH.\n' > "$tmp/export/docs/probe.md"
   (cd "$tmp/export" && check_tree > /dev/null) &&
     { echo "selftest: exported tree without .git not scanned"; ok=1; }
+  # The file system scan skips .git at any depth and follows symbolic links like git ls-files.
+  printf 'Plain text.\n' > "$tmp/export/docs/probe.md"
+  mkdir -p "$tmp/export/sub/.git" "$tmp/link"
+  printf 'Made by the Ostrel GmbH.\n' > "$tmp/export/sub/.git/config"
+  (cd "$tmp/export" && check_tree > /dev/null) || { echo "selftest: nested .git scanned"; ok=1; }
+  printf 'Made by the Ostrel GmbH.\n' > "$tmp/link/target.md"
+  ln -s "$tmp/link/target.md" "$tmp/export/docs/link.md"
+  (cd "$tmp/export" && check_tree > /dev/null) &&
+    { echo "selftest: symbolic link not scanned"; ok=1; }
+  rm "$tmp/export/docs/link.md"
+  # A git checkout with a tracked README.md that is deleted on disk must fail.
+  if git -C "$tmp/export" init -q 2>/dev/null &&
+    git -C "$tmp/export" add README.md Cargo.toml docs/probe.md 2>/dev/null; then
+    (cd "$tmp/export" && check_tree > /dev/null) || { echo "selftest: clean checkout rejected"; ok=1; }
+    rm "$tmp/export/README.md"
+    (cd "$tmp/export" && check_tree > /dev/null) &&
+      { echo "selftest: tracked, deleted README.md passes"; ok=1; }
+  else
+    echo "selftest: cannot create a git checkout"; ok=1
+  fi
   return $ok
 }
 
