@@ -13,6 +13,7 @@ use std::rc::Rc;
 use ostrel_ir::{INT_MAX, INT_MIN, Span, Ty};
 
 use crate::bytecode::{Arith, Code, Op, Order};
+use crate::output::{MAX_OUTPUT_BYTES, Output};
 use crate::{Host, Limits, RuntimeError, RuntimeErrorKind};
 
 /// Heap bytes charged for a `Text` value in addition to its UTF 8 bytes: the shared
@@ -68,6 +69,16 @@ struct Work {
 fn step_cost(work: Work) -> u64 {
     1u64.saturating_add(work.bytes.div_ceil(WORK_BYTES))
         .saturating_add(work.allocs.saturating_mul(ALLOC_STEPS))
+}
+
+/// Bytes of the text form `print` writes for `value`, without the newline.
+fn printed_len(value: &Value) -> u64 {
+    match value {
+        Value::Text(t) => t.text.len() as u64,
+        Value::Int(v) => int_text_len(*v),
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+    }
 }
 
 /// UTF 8 bytes of `value` if it is a `Text`, else 0.
@@ -202,6 +213,8 @@ struct Vm<'a, H: Host + ?Sized> {
     limits: Limits,
     meter: Meter,
     steps: u64,
+    /// Bytes written by `print` so far (`OutputLimit`).
+    output: Output,
     /// Text constants of the image, allocated on the VM heap at their first load.
     texts: Vec<Option<Value>>,
     /// The empty text, initial value of `Text` registers.
@@ -214,6 +227,17 @@ pub(crate) fn run<H: Host + ?Sized>(
     code: &Code,
     host: &mut H,
     limits: Limits,
+) -> Result<(), RuntimeError> {
+    run_with_output(code, host, limits, Output::new(MAX_OUTPUT_BYTES))
+}
+
+/// [`run`] with an explicit output budget, so tests can reach `OutputLimit` without
+/// writing 256 MiB.
+fn run_with_output<H: Host + ?Sized>(
+    code: &Code,
+    host: &mut H,
+    limits: Limits,
+    output: Output,
 ) -> Result<(), RuntimeError> {
     let Some(main) = code.main else {
         return Ok(());
@@ -230,6 +254,7 @@ pub(crate) fn run<H: Host + ?Sized>(
         limits,
         meter,
         steps: 0,
+        output,
         texts: vec![None; code.texts.len()],
         empty,
         stack: Vec::new(),
@@ -361,10 +386,13 @@ impl<H: Host + ?Sized> Vm<'_, H> {
     }
 
     /// Work `op` does beyond a plain instruction when it runs in `cur`, computed
-    /// before it runs. Work that a limit refuses is not counted: an instruction whose
-    /// result would exceed `TextLimit` or the heap that is left is charged only its
-    /// register references, so it fails with `TextLimit` or `HeapLimit` and is not
-    /// reported as `StepLimit` (ARCHITECTURE 3.4, D112).
+    /// before it runs (ARCHITECTURE 3.4, D112, D115). Work that a limit refuses is not
+    /// counted: a `Concat` whose result would exceed `TextLimit` or the heap that is
+    /// left is charged only its register references, a call whose frame would not fit
+    /// the heap keeps the bytes of the registers it initialises but has no allocation
+    /// surcharge, and a `print` refused by `OutputLimit` is a plain instruction. The
+    /// step check still comes first, so at the exact step boundary a refused
+    /// instruction reports `StepLimit`; otherwise it reports the limit that refuses it.
     fn work(&self, cur: &Frame, op: &Op) -> Work {
         let refs = |n: usize| Work {
             bytes: (n as u64).saturating_mul(VALUE_BYTES),
@@ -411,24 +439,27 @@ impl<H: Host + ?Sized> Vm<'_, H> {
                     refs
                 }
             }
-            Op::Print { arg } => Work {
-                bytes: cur.text_len(*arg),
-                allocs: 0,
-            },
-            Op::Call { func, args, .. } => {
+            Op::Print { arg } => {
+                let fits = cur
+                    .regs
+                    .get(*arg as usize)
+                    .is_some_and(|value| self.output.fits(printed_len(value)));
+                Work {
+                    bytes: if fits { cur.text_len(*arg) } else { 0 },
+                    allocs: 0,
+                }
+            }
+            // The registers a call initialises are its references, so a call refused
+            // by the heap keeps them; its allocation surcharge is 0 either way.
+            Op::Call { func, .. } => {
                 let locals = self
                     .code
                     .funcs
                     .get(*func as usize)
                     .map_or(0, |f| f.locals.len() as u64);
-                let regs = locals.saturating_mul(VALUE_BYTES);
-                if regs.saturating_add(FRAME_OVERHEAD) <= self.heap_left() {
-                    Work {
-                        bytes: regs,
-                        allocs: CALL_ALLOCS,
-                    }
-                } else {
-                    refs(args.len())
+                Work {
+                    bytes: locals.saturating_mul(VALUE_BYTES),
+                    allocs: CALL_ALLOCS,
                 }
             }
             _ => Work::default(),
@@ -534,11 +565,15 @@ impl<H: Host + ?Sized> Vm<'_, H> {
                     let callee = self.new_frame(*func, &values, *dst, depth, span)?;
                     self.stack.push(std::mem::replace(&mut cur, callee));
                 }
-                Op::Print { arg } => match cur.reg(*arg) {
-                    Value::Text(t) => self.host.print(&t.text),
-                    Value::Int(v) => self.host.print(&v.to_string()),
-                    Value::Bool(v) => self.host.print(if v { "true" } else { "false" }),
-                },
+                Op::Print { arg } => {
+                    let value = cur.reg(*arg);
+                    self.output.admit(printed_len(&value)).map_err(error)?;
+                    match value {
+                        Value::Text(t) => self.host.print(&t.text),
+                        Value::Int(v) => self.host.print(&v.to_string()),
+                        Value::Bool(v) => self.host.print(if v { "true" } else { "false" }),
+                    }
+                }
                 Op::Jump { target } => cur.pc = *target,
                 Op::Branch {
                     cond,
@@ -1004,11 +1039,12 @@ mod tests {
     }
 
     #[test]
-    fn call_refused_by_the_heap_reports_heap_limit() {
+    fn refused_call_keeps_register_cost() {
         // `fn main() { big() }` where the frame of `big` (200 registers) does not fit
-        // the heap. Charged in full, the call would cost 1 + 50 steps (its registers,
-        // no allocation surcharge, D114); it is charged only its references (none),
-        // so every step limit that lets it start reports `HeapLimit`.
+        // the heap. The registers a call initialises are its references, so the
+        // refused call keeps its bytes of work and costs 1 + 50 steps, with no
+        // allocation surcharge (ARCHITECTURE 3.4, D114, D115). The step check comes
+        // first: below 51 steps it reports `StepLimit`, from 51 on `HeapLimit`.
         let main = func(
             "main",
             0,
@@ -1029,6 +1065,7 @@ mod tests {
                 term: Terminator::Return(None),
             }],
         );
+        assert_eq!(VALUE_BYTES, 16, "the count below assumes 16 byte registers");
         let image = image(vec![main, big]);
         assert!(image.is_some(), "program compiles");
         let Some(image) = image else { return };
@@ -1037,17 +1074,138 @@ mod tests {
             max_heap_bytes: FRAME_OVERHEAD + 200 * VALUE_BYTES + FRAME_OVERHEAD - 1,
             ..Limits::default()
         };
-        assert_eq!(
-            run_kind(&image, limits(0)),
-            Err(RuntimeErrorKind::StepLimit)
-        );
-        for max_steps in [1, 2, 5, 49, 50, 51, 52, 1000] {
+        for max_steps in [0, 1, 2, 5, 49, 50] {
+            assert_eq!(
+                run_kind(&image, limits(max_steps)),
+                Err(RuntimeErrorKind::StepLimit),
+                "{max_steps}"
+            );
+        }
+        for max_steps in [51, 52, 1000] {
             assert_eq!(
                 run_kind(&image, limits(max_steps)),
                 Err(RuntimeErrorKind::HeapLimit),
                 "{max_steps}"
             );
         }
+    }
+
+    fn print(arg: u32) -> InstKind {
+        InstKind::Print { arg: Local(arg) }
+    }
+
+    /// Runs `image` with an output budget of `max_output` bytes.
+    fn run_output(
+        image: &Image,
+        limits: Limits,
+        max_output: u64,
+    ) -> (Result<(), RuntimeError>, Vec<String>) {
+        let mut host = Capture(Vec::new());
+        let result = run_with_output(&image.code, &mut host, limits, Output::new(max_output));
+        (result, host.0)
+    }
+
+    #[test]
+    fn output_limit_counts_newlines_and_refuses_the_whole_line() {
+        // `fn main() { let t = "abcd"; let n = -12; let b = false; print(t); print(n);
+        // print(b) }` writes 5 + 4 + 6 = 15 bytes.
+        let main = func(
+            "main",
+            0,
+            &[Ty::Text, Ty::Int, Ty::Bool],
+            0,
+            vec![Block {
+                insts: vec![
+                    at(1, text(0, "abcd")),
+                    at(2, int(1, -12)),
+                    at(
+                        3,
+                        InstKind::Const {
+                            dst: Local(2),
+                            value: Const::Bool(false),
+                        },
+                    ),
+                    at(10, print(0)),
+                    at(20, print(1)),
+                    at(30, print(2)),
+                ],
+                term: Terminator::Return(None),
+            }],
+        );
+        let image = image(vec![main]);
+        assert!(image.is_some(), "program compiles");
+        let Some(image) = image else { return };
+        let all = ["abcd", "-12", "false"].map(String::from).to_vec();
+        assert_eq!(run_output(&image, Limits::default(), 15), (Ok(()), all));
+        let refused = |at: u32| {
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::OutputLimit,
+                span: sp(at),
+            })
+        };
+        let before = ["abcd", "-12"].map(String::from).to_vec();
+        assert_eq!(
+            run_output(&image, Limits::default(), 14),
+            (refused(30), before)
+        );
+        assert_eq!(
+            run_output(&image, Limits::default(), 9),
+            (refused(30), vec!["abcd".to_string(), "-12".to_string()])
+        );
+        assert_eq!(
+            run_output(&image, Limits::default(), 8),
+            (refused(20), vec!["abcd".to_string()])
+        );
+        assert_eq!(
+            run_output(&image, Limits::default(), 4),
+            (refused(10), Vec::new())
+        );
+    }
+
+    #[test]
+    fn print_refused_by_the_output_limit_costs_one_step() {
+        // `fn main() { let t = "<640 bytes>"; print(t) }`: the constant costs 1 step,
+        // the print 1 + 10 when it fits, the return 1. A print refused by
+        // `OutputLimit` writes nothing and is a plain instruction (1 step).
+        let long = "a".repeat(640);
+        let main = func(
+            "main",
+            0,
+            &[Ty::Text],
+            0,
+            vec![Block {
+                insts: vec![at(1, text(0, &long)), at(2, print(0))],
+                term: Terminator::Return(None),
+            }],
+        );
+        let image = image(vec![main]);
+        assert!(image.is_some(), "program compiles");
+        let Some(image) = image else { return };
+        let steps = |max_steps| Limits {
+            max_steps,
+            ..Limits::default()
+        };
+        let kind =
+            |(result, _): (Result<(), RuntimeError>, Vec<String>)| result.map_err(|e| e.kind);
+        assert_eq!(
+            kind(run_output(&image, steps(1), 640)),
+            Err(RuntimeErrorKind::StepLimit)
+        );
+        for max_steps in [2, 3, 11, 12, 1000] {
+            assert_eq!(
+                kind(run_output(&image, steps(max_steps), 640)),
+                Err(RuntimeErrorKind::OutputLimit),
+                "{max_steps}"
+            );
+        }
+        assert_eq!(
+            kind(run_output(&image, steps(12), 641)),
+            Err(RuntimeErrorKind::StepLimit)
+        );
+        assert_eq!(
+            run_output(&image, steps(13), 641),
+            (Ok(()), vec![long.clone()])
+        );
     }
 
     #[test]

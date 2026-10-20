@@ -10,6 +10,10 @@ publish.workspace = true
 [dependencies]
 ostrel_core.workspace = true
 ostrel_db.workspace = true
+# Both crates are on the dependency allowlist (ARCHITECTURE 11); JSON frames are read with
+# serde_json only (D77, D106).
+serde = "1"
+serde_json = "1"
 
 [lints]
 workspace = true

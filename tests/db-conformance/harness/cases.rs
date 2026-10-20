@@ -1,12 +1,18 @@
 //! Decodes a case file (format 1, `tests/db-conformance/cases/README.md`) into driver calls.
 //!
+//! Format 1 grew the op log steps of D110 (`append_ops`, `reject`, `last_seq`, `replay`)
+//! without a new version number: they only add keys, every older file reads as before.
+//!
 //! Every key is checked: an unknown or missing key, a value that does not fit its field type,
 //! or an insert that does not set every field makes the whole file invalid. Decoding never
 //! panics on a malformed file.
 
 use std::collections::BTreeMap;
 
-use ostrel_db::api::{DbError, Dir, FieldId, ModelId, Query, Row, RowId, Value, Write};
+use ostrel_db::api::{
+    DbError, Dir, FieldId, Hlc, ModelId, NewOp, OpId, Query, ReplayOutcome, ReplicaId, Row, RowId,
+    ServerSeq, StoredOp, Value, Write,
+};
 
 use super::json::Json;
 
@@ -29,14 +35,31 @@ pub struct Step {
 }
 
 pub enum Action {
-    Tx(Vec<Write>),
+    Tx(Vec<Call>),
     Query(Query),
+    /// `Transaction::last_seq` in a transaction that is rolled back.
+    LastSeq(ReplicaId),
+    /// `Transaction::replay_outcome` in a transaction that is rolled back.
+    Replay(OpId),
+}
+
+/// One call inside a transaction step.
+pub enum Call {
+    /// `Transaction::apply` with this one write.
+    Write(Write),
+    /// `Transaction::append_ops` with all these ops in one call.
+    AppendOps(Vec<NewOp>),
+    /// `Transaction::record_reject`.
+    Reject(OpId, String),
 }
 
 pub enum Expect {
     Ok,
+    /// A failure with this variant; the text of [`DbError::Invalid`] is not compared.
     Error(DbError),
     Rows(Vec<Row>),
+    LastSeq(u32),
+    Outcome(Option<ReplayOutcome>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,9 +183,9 @@ fn decode_step(json: &Json, schema: &[Model]) -> Result<Step> {
         if raw.is_empty() {
             return Err("tx: a transaction needs at least one write".to_string());
         }
-        let mut writes = Vec::new();
+        let mut calls = Vec::new();
         for (i, w) in raw.iter().enumerate() {
-            writes.push(decode_write(w, schema).map_err(|e| format!("tx[{i}]: {e}"))?);
+            calls.push(decode_call(w, schema).map_err(|e| format!("tx[{i}]: {e}"))?);
         }
         let expect = match get(&s, "expect") {
             Json::String(s) if s == "ok" => Expect::Ok,
@@ -172,14 +195,48 @@ fn decode_step(json: &Json, schema: &[Model]) -> Result<Step> {
                     "Conflict" => DbError::Conflict,
                     "VersionMismatch" => DbError::VersionMismatch,
                     "NotFound" => DbError::NotFound,
+                    "Invalid" => DbError::Invalid(""),
                     other => return Err(format!("expect.error: unknown error {other:?}")),
                 })
             }
             _ => return Err("expect: \"ok\" or {\"error\": ...}".to_string()),
         };
         Ok(Step {
-            action: Action::Tx(writes),
+            action: Action::Tx(calls),
             expect,
+        })
+    } else if members.iter().any(|(k, _)| k == "last_seq") {
+        let s = object(json, &["last_seq", "expect"], &[], "step")?;
+        let replica = replica_id(get(&s, "last_seq"), "last_seq")?;
+        let want = u32::try_from(number(get(&s, "expect"), "expect")?)
+            .map_err(|_| "expect: last_seq is a u32".to_string())?;
+        Ok(Step {
+            action: Action::LastSeq(replica),
+            expect: Expect::LastSeq(want),
+        })
+    } else if members.iter().any(|(k, _)| k == "replay") {
+        let s = object(json, &["replay", "expect"], &[], "step")?;
+        let id = op_id(get(&s, "replay"), "replay")?;
+        let want = match get(&s, "expect") {
+            Json::Null => None,
+            e @ Json::Object(m) if m.len() == 1 && m[0].0 == "rejected" => {
+                let e = object(e, &["rejected"], &[], "expect")?;
+                Some(ReplayOutcome::Rejected(
+                    string(get(&e, "rejected"), "expect.rejected")?.to_string(),
+                ))
+            }
+            e => {
+                let e = object(e, &["accepted"], &[], "expect")?;
+                let a = object(get(&e, "accepted"), &["position", "op"], &[], "accepted")?;
+                Some(ReplayOutcome::Accepted(StoredOp {
+                    seq: ServerSeq(number(get(&a, "position"), "accepted.position")?),
+                    op: decode_op(get(&a, "op"), schema).map_err(|e| format!("accepted.{e}"))?,
+                }))
+            }
+        };
+        Ok(Step {
+            action: Action::Replay(id),
+            expect: Expect::Outcome(want),
         })
     } else {
         let s = object(json, &["query", "expect"], &[], "step")?;
@@ -232,6 +289,75 @@ fn decode_step(json: &Json, schema: &[Model]) -> Result<Step> {
             expect: Expect::Rows(rows),
         })
     }
+}
+
+fn decode_call(json: &Json, schema: &[Model]) -> Result<Call> {
+    let (kind, body) = match json {
+        Json::Object(m) if m.len() == 1 => (m[0].0.as_str(), &m[0].1),
+        _ => return Err("a write is an object with one key".to_string()),
+    };
+    match kind {
+        "append_ops" => {
+            let raw = array(body, kind)?;
+            let mut ops = Vec::new();
+            for (i, o) in raw.iter().enumerate() {
+                ops.push(decode_op(o, schema).map_err(|e| format!("append_ops[{i}].{e}"))?);
+            }
+            Ok(Call::AppendOps(ops))
+        }
+        "reject" => {
+            let r = object(body, &["replica", "seq", "reason"], &[], kind)?;
+            let id = op_id_of(&r, kind)?;
+            Ok(Call::Reject(
+                id,
+                string(get(&r, "reason"), kind)?.to_string(),
+            ))
+        }
+        _ => decode_write(json, schema).map(Call::Write),
+    }
+}
+
+/// An op of the log: `{replica, seq, wall, model, row, body}`. The accepted stamp is
+/// `Hlc(wall, 0, replica)`; `body` is stored as its UTF-8 bytes.
+fn decode_op(json: &Json, schema: &[Model]) -> Result<NewOp> {
+    let o = object(
+        json,
+        &["replica", "seq", "wall", "model", "row", "body"],
+        &[],
+        "op",
+    )?;
+    let id = op_id_of(&o, "op")?;
+    let wall = number(get(&o, "wall"), "op.wall")?;
+    let hlc = Hlc::new(wall, 0, id.replica).map_err(|e| format!("op.wall: {e}"))?;
+    Ok(NewOp {
+        id,
+        hlc,
+        model: model_id(get(&o, "model"), schema, "op.model")?,
+        row: row_id(get(&o, "row"), "op.row")?,
+        body: string(get(&o, "body"), "op.body")?.as_bytes().to_vec(),
+    })
+}
+
+/// `{replica, seq}` as an [`OpId`].
+fn op_id(json: &Json, at: &str) -> Result<OpId> {
+    op_id_of(&object(json, &["replica", "seq"], &[], at)?, at)
+}
+
+fn op_id_of(map: &BTreeMap<&str, &Json>, at: &str) -> Result<OpId> {
+    let seq = number(get(map, "seq"), at)?;
+    Ok(OpId {
+        replica: replica_id(get(map, "replica"), at)?,
+        seq: u32::try_from(seq).map_err(|_| format!("{at}: seq {seq} is not a u32"))?,
+    })
+}
+
+/// A `ReplicaId` as a decimal string (u64 does not fit a JSON number).
+fn replica_id(json: &Json, at: &str) -> Result<ReplicaId> {
+    let s = string(json, at)?;
+    canonical_decimal(s)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(ReplicaId)
+        .ok_or_else(|| format!("{at}: replica {s:?} is not a u64 in decimal"))
 }
 
 fn decode_write(json: &Json, schema: &[Model]) -> Result<Write> {

@@ -12,7 +12,7 @@
 //!   statement. A second connection that wants to write waits up to the busy timeout and then
 //!   fails with [`DbError::Backend`]; nothing is half applied. `query` outside a transaction
 //!   reads one consistent snapshot of committed state.
-//! * Each `apply` and `append_ops` call runs in a savepoint: a refused call changes nothing.
+//! * Each `apply`, `append_ops` and `record_reject` call runs in a savepoint: a refused call changes nothing.
 //!   After a call inside a transaction failed, every further call except rollback fails too.
 //! * Dropping a transaction without commit rolls it back.
 //!
@@ -36,7 +36,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ostrel_db::api::{
     AppliedSchema, BoxFuture, Capabilities, Connection, DbError, Driver, EnumColumn, MigrationPlan,
-    NewOp, Query, Rows, ServerSeq, StoredOp, Transaction, Write, check_writes,
+    NewOp, OpId, Query, ReplayOutcome, ReplicaId, Rows, ServerSeq, StoredOp, Transaction, Write,
+    check_writes,
 };
 use rusqlite::OpenFlags;
 
@@ -340,6 +341,25 @@ impl<'c> Transaction<'c> for SqliteTransaction<'c> {
         limit: u32,
     ) -> BoxFuture<'a, Result<Vec<StoredOp>, DbError>> {
         Box::pin(async move { self.step(|conn, _| store::ops_since(conn, after, limit)) })
+    }
+
+    fn record_reject<'a>(
+        &'a mut self,
+        op: OpId,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<(), DbError>> {
+        Box::pin(async move { self.atomic(|conn, _| store::record_reject(conn, op, reason)) })
+    }
+
+    fn last_seq<'a>(&'a mut self, replica: ReplicaId) -> BoxFuture<'a, Result<u32, DbError>> {
+        Box::pin(async move { self.step(|conn, _| store::last_seq(conn, replica)) })
+    }
+
+    fn replay_outcome<'a>(
+        &'a mut self,
+        op: OpId,
+    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
+        Box::pin(async move { self.step(|conn, _| store::replay_outcome(conn, op)) })
     }
 
     fn next_in_sequence<'a>(&'a mut self, key: &'a str) -> BoxFuture<'a, Result<u64, DbError>> {

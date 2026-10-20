@@ -47,9 +47,11 @@ getrandom 0.2.17 registry+https://github.com/rust-lang/crates.io-index ff2abc00b
 hashbrown 0.16.1 registry+https://github.com/rust-lang/crates.io-index 841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100
 hashbrown 0.17.1 registry+https://github.com/rust-lang/crates.io-index ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a
 hashlink 0.12.2 registry+https://github.com/rust-lang/crates.io-index a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb
+itoa 1.0.18 registry+https://github.com/rust-lang/crates.io-index 8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682
 js-sys 0.3.106 registry+https://github.com/rust-lang/crates.io-index 7883d941dae510fb2d978fc3fe018c71c9e2892fd38854de3e8b92c2e5ad9cc5
 libc 0.2.190 registry+https://github.com/rust-lang/crates.io-index ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78
 libsqlite3-sys 0.38.2 registry+https://github.com/rust-lang/crates.io-index f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8
+memchr 2.8.3 registry+https://github.com/rust-lang/crates.io-index cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98
 once_cell 1.21.4 registry+https://github.com/rust-lang/crates.io-index 9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50
 pkcs8 0.10.2 registry+https://github.com/rust-lang/crates.io-index f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7
 pkg-config 0.3.34 registry+https://github.com/rust-lang/crates.io-index f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548
@@ -64,6 +66,7 @@ semver 1.0.28 registry+https://github.com/rust-lang/crates.io-index 8a7852d02fc8
 serde 1.0.229 registry+https://github.com/rust-lang/crates.io-index 4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba
 serde_core 1.0.229 registry+https://github.com/rust-lang/crates.io-index 67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48
 serde_derive 1.0.229 registry+https://github.com/rust-lang/crates.io-index e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348
+serde_json 1.0.154 registry+https://github.com/rust-lang/crates.io-index e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6
 sha2 0.10.9 registry+https://github.com/rust-lang/crates.io-index a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283
 shlex 2.0.1 registry+https://github.com/rust-lang/crates.io-index f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba
 signature 2.2.0 registry+https://github.com/rust-lang/crates.io-index 77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de
@@ -85,3 +88,4 @@ wasm-bindgen-macro 0.2.129 registry+https://github.com/rust-lang/crates.io-index
 wasm-bindgen-macro-support 0.2.129 registry+https://github.com/rust-lang/crates.io-index 6f501a8bc3719dba86ef8ae4728879c08001bea749eb1333ac5b91e040e2a6b7
 wasm-bindgen-shared 0.2.129 registry+https://github.com/rust-lang/crates.io-index 23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6
 zeroize 1.9.0 registry+https://github.com/rust-lang/crates.io-index e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e
+zmij 1.0.23 registry+https://github.com/rust-lang/crates.io-index 29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b

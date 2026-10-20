@@ -26,6 +26,8 @@
     )
 )]
 
+pub mod hir;
+
 use std::collections::HashMap;
 
 use ostrel_core::{Code, Diagnostic, FileId, Span};

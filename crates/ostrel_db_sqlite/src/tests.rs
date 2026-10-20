@@ -227,3 +227,98 @@ fn equal_elements_of_different_variants_share_one_tag_and_keep_the_first_value()
     }]);
     assert_eq!(rows[0].collections, vec![(0, expected)]);
 }
+
+fn new_op(replica: u64, seq: u32) -> ostrel_db::api::NewOp {
+    ostrel_db::api::NewOp {
+        id: OpId {
+            replica: ReplicaId(replica),
+            seq,
+        },
+        hlc: ostrel_db::api::Hlc::new(u64::from(seq), 0, ReplicaId(replica)).unwrap(),
+        model: 1,
+        row: rid(1),
+        body: b"{}".to_vec(),
+    }
+}
+
+/// A file of layout 1 has no `last_seq`. On connect it gets the tables of layout 2, and every
+/// replica in its log gets the highest `seq` it logged, because layout 1 logged only accepted
+/// ops.
+#[test]
+fn a_layout_1_file_is_upgraded_with_last_seq_from_its_log() {
+    let path = std::env::temp_dir().join(format!("ostrel-sqlite-layout1-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let url = format!("{SCHEME}{}", path.display());
+    let mut c = SqliteDriver::new().open(&url).unwrap();
+    block_on(async {
+        let mut tx = c.begin().await.unwrap();
+        let ops = [new_op(1, 1), new_op(1, 2), new_op(2, 5)];
+        tx.append_ops(&ops).await.unwrap();
+        tx.commit().await.unwrap();
+    });
+    c.conn
+        .execute_batch(
+            "DROP TABLE ostrel_replicas; DROP TABLE ostrel_rejects; PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(c);
+
+    let mut c = SqliteDriver::new().open(&url).unwrap();
+    let version: i64 = c
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, super::store::LAYOUT_VERSION);
+    block_on(async {
+        let mut tx = c.begin().await.unwrap();
+        assert_eq!(tx.last_seq(ReplicaId(1)).await, Ok(2));
+        assert_eq!(tx.last_seq(ReplicaId(2)).await, Ok(5));
+        assert_eq!(tx.last_seq(ReplicaId(3)).await, Ok(0));
+        let seven = OpId {
+            replica: ReplicaId(1),
+            seq: 7,
+        };
+        tx.record_reject(seven, "Denied").await.unwrap();
+        tx.commit().await.unwrap();
+    });
+    drop(c);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A refused `record_reject` runs in a savepoint: it leaves neither a reject nor a raised
+/// `last_seq` behind, and the rest of the transaction is not committed either.
+#[test]
+fn a_refused_reject_changes_nothing() {
+    let mut c = open();
+    block_on(async {
+        let mut tx = c.begin().await.unwrap();
+        tx.append_ops(&[new_op(1, 1)]).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = c.begin().await.unwrap();
+        let one = OpId {
+            replica: ReplicaId(1),
+            seq: 1,
+        };
+        assert_eq!(
+            tx.record_reject(one, "Denied").await,
+            Err(DbError::Conflict)
+        );
+        tx.rollback().await.unwrap();
+        let mut tx = c.begin().await.unwrap();
+        let nine = OpId {
+            replica: ReplicaId(1),
+            seq: 9,
+        };
+        assert!(matches!(
+            tx.record_reject(nine, "bad reason").await,
+            Err(DbError::Invalid(_))
+        ));
+        tx.rollback().await.unwrap();
+    });
+    assert_eq!(count(&c, "ostrel_rejects"), 0);
+    let last: i64 = c
+        .conn
+        .query_row("SELECT last_seq FROM ostrel_replicas", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(last, 1);
+}

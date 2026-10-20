@@ -14,17 +14,39 @@ use std::rc::Rc;
 
 use ostrel_db::api::{
     AppliedSchema, CollectionChange, CollectionState, DbError, EnumColumn, FieldId, MapEntry,
-    MigrationPlan, ModelId, NewOp, RowId, SchemaHash, ServerSeq, SetChange, SetTag, StoredOp,
-    Value, Write,
+    MigrationPlan, ModelId, NewOp, OpId, ReplayOutcome, ReplicaId, RowId, SchemaHash, ServerSeq,
+    SetChange, SetTag, StoredOp, Value, Write, check_reject_reason,
 };
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
 
 use crate::codec::{self, Corrupt};
 use crate::eval::{self, Lookup, Stored};
 
-/// Value of `PRAGMA user_version` for this layout. A file with another non zero value was
-/// written by something else and is refused.
-pub const LAYOUT_VERSION: i64 = 1;
+/// Value of `PRAGMA user_version` for this layout. A file of layout 1 is brought to this
+/// layout on connect; a file with any other non zero value was written by something else and is
+/// refused.
+pub const LAYOUT_VERSION: i64 = 2;
+
+/// Tables added by layout 2 (D110): `last_seq` per replica and the ops rejected for good.
+const CREATE_V2: &str = "
+CREATE TABLE IF NOT EXISTS ostrel_replicas (
+  replica  BLOB    PRIMARY KEY CHECK (length(replica) = 8),
+  last_seq INTEGER NOT NULL CHECK (last_seq BETWEEN 0 AND 4294967295)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ostrel_rejects (
+  replica BLOB    NOT NULL CHECK (length(replica) = 8),
+  op_seq  INTEGER NOT NULL,
+  reason  TEXT    NOT NULL,
+  PRIMARY KEY (replica, op_seq)
+) STRICT, WITHOUT ROWID;
+";
+
+/// Layout 1 kept no `last_seq`; every op in its log was accepted, so the highest `seq` per
+/// replica in the log is its `last_seq`.
+const BACKFILL_V2: &str = "
+INSERT INTO ostrel_replicas (replica, last_seq)
+SELECT replica, max(op_seq) FROM ostrel_ops GROUP BY replica;
+";
 
 const CREATE: &str = "
 CREATE TABLE IF NOT EXISTS ostrel_rows (
@@ -123,6 +145,13 @@ pub fn prepare(conn: &Connection) -> Result<(), DbError> {
     match version {
         0 => {
             conn.execute_batch(CREATE).map_err(backend)?;
+            conn.execute_batch(CREATE_V2).map_err(backend)?;
+            conn.execute_batch(&format!("PRAGMA user_version = {LAYOUT_VERSION}"))
+                .map_err(backend)
+        }
+        1 => {
+            conn.execute_batch(CREATE_V2).map_err(backend)?;
+            conn.execute_batch(BACKFILL_V2).map_err(backend)?;
             conn.execute_batch(&format!("PRAGMA user_version = {LAYOUT_VERSION}"))
                 .map_err(backend)
         }
@@ -728,7 +757,7 @@ fn apply_set_change(
 // Op log and sequences
 // ---------------------------------------------------------------------------------------------
 
-fn last_seq(conn: &Connection) -> Result<ServerSeq, DbError> {
+fn last_position(conn: &Connection) -> Result<ServerSeq, DbError> {
     let last: i64 = conn
         .query_row("SELECT coalesce(max(seq), 0) FROM ostrel_ops", [], |r| {
             r.get(0)
@@ -742,7 +771,10 @@ fn last_seq(conn: &Connection) -> Result<ServerSeq, DbError> {
 pub fn append_ops(conn: &Connection, ops: &[NewOp]) -> Result<ServerSeq, DbError> {
     let mut seen = BTreeSet::new();
     let mut exists = conn
-        .prepare_cached("SELECT 1 FROM ostrel_ops WHERE replica = ?1 AND op_seq = ?2")
+        .prepare_cached(
+            "SELECT 1 FROM ostrel_ops WHERE replica = ?1 AND op_seq = ?2
+             UNION ALL SELECT 1 FROM ostrel_rejects WHERE replica = ?1 AND op_seq = ?2",
+        )
         .map_err(backend)?;
     for op in ops {
         let replica = codec::replica_bytes(op.id.replica);
@@ -771,7 +803,101 @@ pub fn append_ops(conn: &Connection, ops: &[NewOp]) -> Result<ServerSeq, DbError
             ])
             .map_err(backend)?;
     }
-    last_seq(conn)
+    for op in ops {
+        raise_last_seq(conn, op.id)?;
+    }
+    last_position(conn)
+}
+
+/// Whether `op` is in the log or was rejected.
+fn decided(conn: &Connection, op: OpId) -> Result<bool, DbError> {
+    let replica = codec::replica_bytes(op.replica);
+    conn.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM ostrel_ops WHERE replica = ?1 AND op_seq = ?2)
+             OR EXISTS (SELECT 1 FROM ostrel_rejects WHERE replica = ?1 AND op_seq = ?2)",
+    )
+    .and_then(|mut s| s.query_row(params![&replica[..], op.seq], |r| r.get(0)))
+    .map_err(backend)
+}
+
+/// Raises `last_seq` of the op's replica to the op's `seq`; never lowers it.
+fn raise_last_seq(conn: &Connection, op: OpId) -> Result<(), DbError> {
+    conn.prepare_cached(
+        "INSERT INTO ostrel_replicas (replica, last_seq) VALUES (?1, ?2)
+         ON CONFLICT (replica) DO UPDATE SET last_seq = max(last_seq, excluded.last_seq)",
+    )
+    .and_then(|mut s| s.execute(params![&codec::replica_bytes(op.replica)[..], op.seq]))
+    .map_err(backend)?;
+    Ok(())
+}
+
+/// Records `op` as rejected for good with `reason`.
+pub fn record_reject(conn: &Connection, op: OpId, reason: &str) -> Result<(), DbError> {
+    check_reject_reason(reason)?;
+    if decided(conn, op)? {
+        return Err(DbError::Conflict);
+    }
+    conn.prepare_cached("INSERT INTO ostrel_rejects (replica, op_seq, reason) VALUES (?1, ?2, ?3)")
+        .and_then(|mut s| {
+            s.execute(params![
+                &codec::replica_bytes(op.replica)[..],
+                op.seq,
+                reason
+            ])
+        })
+        .map_err(backend)?;
+    raise_last_seq(conn, op)
+}
+
+/// Highest `seq` of `replica` with a final outcome, 0 without one.
+pub fn last_seq(conn: &Connection, replica: ReplicaId) -> Result<u32, DbError> {
+    let last: Option<i64> = conn
+        .prepare_cached("SELECT last_seq FROM ostrel_replicas WHERE replica = ?1")
+        .and_then(|mut s| {
+            s.query_row([&codec::replica_bytes(replica)[..]], |r| r.get(0))
+                .optional()
+        })
+        .map_err(backend)?;
+    last.map_or(Ok(0), to_u32)
+}
+
+/// Final outcome of `op`, if it has one.
+pub fn replay_outcome(conn: &Connection, op: OpId) -> Result<Option<ReplayOutcome>, DbError> {
+    let replica = codec::replica_bytes(op.replica);
+    let reason: Option<String> = conn
+        .prepare_cached("SELECT reason FROM ostrel_rejects WHERE replica = ?1 AND op_seq = ?2")
+        .and_then(|mut s| {
+            s.query_row(params![&replica[..], op.seq], |r| r.get(0))
+                .optional()
+        })
+        .map_err(backend)?;
+    if let Some(reason) = reason {
+        return Ok(Some(ReplayOutcome::Rejected(reason)));
+    }
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT seq, replica, op_seq, hlc, model, row_id, body FROM ostrel_ops
+             WHERE replica = ?1 AND op_seq = ?2",
+        )
+        .map_err(backend)?;
+    let mut rows = stmt.query(params![&replica[..], op.seq]).map_err(backend)?;
+    match rows.next().map_err(backend)? {
+        Some(r) => Ok(Some(ReplayOutcome::Accepted(stored_op(r)?))),
+        None => Ok(None),
+    }
+}
+
+fn stored_op(r: &rusqlite::Row<'_>) -> Result<StoredOp, DbError> {
+    Ok(StoredOp {
+        seq: ServerSeq(to_u64(get(r, 0)?)?),
+        op: NewOp {
+            id: codec::op_id_from(&get::<Vec<u8>>(r, 1)?, get(r, 2)?).map_err(corrupt)?,
+            hlc: codec::hlc_from(&get::<Vec<u8>>(r, 3)?).map_err(corrupt)?,
+            model: to_u32(get(r, 4)?)?,
+            row: codec::row_id_from(&get::<Vec<u8>>(r, 5)?).map_err(corrupt)?,
+            body: get(r, 6)?,
+        },
+    })
 }
 
 /// At most `limit` ops after the position `after`, in position order.
@@ -793,16 +919,7 @@ pub fn ops_since(
     let mut rows = stmt.query(params![after, limit]).map_err(backend)?;
     let mut out = Vec::new();
     while let Some(r) = rows.next().map_err(backend)? {
-        out.push(StoredOp {
-            seq: ServerSeq(to_u64(get(r, 0)?)?),
-            op: NewOp {
-                id: codec::op_id_from(&get::<Vec<u8>>(r, 1)?, get(r, 2)?).map_err(corrupt)?,
-                hlc: codec::hlc_from(&get::<Vec<u8>>(r, 3)?).map_err(corrupt)?,
-                model: to_u32(get(r, 4)?)?,
-                row: codec::row_id_from(&get::<Vec<u8>>(r, 5)?).map_err(corrupt)?,
-                body: get(r, 6)?,
-            },
-        });
+        out.push(stored_op(r)?);
     }
     Ok(out)
 }

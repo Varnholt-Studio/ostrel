@@ -41,7 +41,7 @@ use ostrel_db::api::{
     BoxFuture, Connection, DbError, Driver, MigrationPlan, Row, SchemaHash, Value,
 };
 
-use cases::{Action, Case, Expect};
+use cases::{Action, Call, Case, Expect};
 
 /// Opens a connection to a new, empty database.
 pub type Fresh<'a> = dyn Fn() -> BoxFuture<'a, Result<Box<dyn Connection>, DbError>> + 'a;
@@ -201,7 +201,9 @@ async fn run_case(case: &Case, fresh: &Fresh<'_>) -> Vec<(usize, String)> {
     }
     for (i, step) in case.steps.iter().enumerate() {
         let result = match &step.action {
-            Action::Tx(writes) => run_tx(conn.as_mut(), writes, &step.expect).await,
+            Action::Tx(calls) => run_tx(conn.as_mut(), calls, &step.expect).await,
+            Action::LastSeq(replica) => run_last_seq(conn.as_mut(), *replica, &step.expect).await,
+            Action::Replay(op) => run_replay(conn.as_mut(), *op, &step.expect).await,
             Action::Query(q) => match (conn.query(q).await, &step.expect) {
                 (Ok(rows), Expect::Rows(want)) => Ok(compare_rows(&rows.0, want)),
                 (Err(e), _) => Ok(Some(format!("query failed with {e:?}"))),
@@ -220,10 +222,18 @@ async fn run_case(case: &Case, fresh: &Fresh<'_>) -> Vec<(usize, String)> {
     out
 }
 
+/// Same variant; the rule text of [`DbError::Invalid`] differs between drivers.
+fn same_error(got: &DbError, want: &DbError) -> bool {
+    match (got, want) {
+        (DbError::Invalid(_), DbError::Invalid(_)) => true,
+        _ => got == want,
+    }
+}
+
 /// Runs one transaction step. `Ok(Some)` is a wrong result, `Err` a failure that ends the case.
 async fn run_tx(
     conn: &mut dyn Connection,
-    writes: &[ostrel_db::api::Write],
+    calls: &[Call],
     expect: &Expect,
 ) -> Result<Option<String>, String> {
     let mut tx = conn
@@ -231,8 +241,13 @@ async fn run_tx(
         .await
         .map_err(|e| format!("begin failed with {e:?}"))?;
     let mut failed = None;
-    for (j, w) in writes.iter().enumerate() {
-        if let Err(e) = tx.apply(std::slice::from_ref(w)).await {
+    for (j, call) in calls.iter().enumerate() {
+        let result = match call {
+            Call::Write(w) => tx.apply(std::slice::from_ref(w)).await,
+            Call::AppendOps(ops) => tx.append_ops(ops).await.map(|_| ()),
+            Call::Reject(op, reason) => tx.record_reject(*op, reason).await,
+        };
+        if let Err(e) = result {
             failed = Some((j, e));
             break;
         }
@@ -245,12 +260,61 @@ async fn run_tx(
             return Ok(None);
         }
         (Expect::Ok, Some((j, e))) => Some(format!("write {j} failed with {e:?}")),
-        (Expect::Error(want), Some((_, e))) if e == want => None,
+        (Expect::Error(want), Some((_, e))) if same_error(e, want) => None,
         (Expect::Error(want), Some((j, e))) => {
             Some(format!("expected {want:?}, write {j} failed with {e:?}"))
         }
         (Expect::Error(want), None) => Some(format!("expected {want:?}, every write succeeded")),
-        (Expect::Rows(_), _) => Some("a transaction expects \"ok\" or an error".to_string()),
+        (_, _) => Some("a transaction expects \"ok\" or an error".to_string()),
+    };
+    tx.rollback()
+        .await
+        .map_err(|e| format!("rollback failed with {e:?}"))?;
+    Ok(verdict)
+}
+
+/// Reads `last_seq` in a transaction of its own and rolls it back.
+async fn run_last_seq(
+    conn: &mut dyn Connection,
+    replica: ostrel_db::api::ReplicaId,
+    expect: &Expect,
+) -> Result<Option<String>, String> {
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| format!("begin failed with {e:?}"))?;
+    let verdict = match (tx.last_seq(replica).await, expect) {
+        (Ok(got), Expect::LastSeq(want)) if got == *want => None,
+        (Ok(got), Expect::LastSeq(want)) => Some(format!("expected last_seq {want}, got {got}")),
+        (Err(e), _) => Some(format!("last_seq failed with {e:?}")),
+        (Ok(_), _) => Some("a last_seq step expects a number".to_string()),
+    };
+    tx.rollback()
+        .await
+        .map_err(|e| format!("rollback failed with {e:?}"))?;
+    Ok(verdict)
+}
+
+/// Runs `Transaction::replay_outcome` in a transaction that is rolled back, so it reads the
+/// committed outcomes.
+async fn run_replay(
+    conn: &mut dyn Connection,
+    op: ostrel_db::api::OpId,
+    expect: &Expect,
+) -> Result<Option<String>, String> {
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| format!("begin failed with {e:?}"))?;
+    let verdict = match (tx.replay_outcome(op).await, expect) {
+        (Ok(got), Expect::Outcome(want)) if got == *want => None,
+        (Ok(got), Expect::Outcome(want)) => Some(format!(
+            "expected outcome {}, got {}",
+            show(&format!("{want:?}")),
+            show(&format!("{got:?}"))
+        )),
+        (Err(e), _) => Some(format!("replay_outcome failed with {e:?}")),
+        (Ok(_), _) => Some("a replay expects an outcome".to_string()),
     };
     tx.rollback()
         .await

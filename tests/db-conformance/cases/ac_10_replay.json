@@ -1,0 +1,839 @@
+{
+ "format": 1,
+ "ac": "AC-10",
+ "schema": [
+  {
+   "model": 0,
+   "name": "Note",
+   "fields": [
+    {
+     "field": 0,
+     "name": "title",
+     "type": "Text"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "name": "ac_10_replay_after_lost_ack",
+   "doc": "D110: the ack of an accepted op was lost and the client sends it again. Its outcome is the logged op with its position and accepted stamp; logging it again is a Conflict and leaves last_seq unchanged.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "7",
+         "seq": 1,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":1}"
+        },
+        {
+         "replica": "7",
+         "seq": 2,
+         "wall": 11,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":2}"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "last_seq": "7",
+     "expect": 2
+    },
+    {
+     "replay": {
+      "replica": "7",
+      "seq": 1
+     },
+     "expect": {
+      "accepted": {
+       "position": 1,
+       "op": {
+        "replica": "7",
+        "seq": 1,
+        "wall": 10,
+        "model": 0,
+        "row": "1",
+        "body": "{\"set\":1}"
+       }
+      }
+     }
+    },
+    {
+     "replay": {
+      "replica": "7",
+      "seq": 2
+     },
+     "expect": {
+      "accepted": {
+       "position": 2,
+       "op": {
+        "replica": "7",
+        "seq": 2,
+        "wall": 11,
+        "model": 0,
+        "row": "1",
+        "body": "{\"set\":2}"
+       }
+      }
+     }
+    },
+    {
+     "replay": {
+      "replica": "7",
+      "seq": 3
+     },
+     "expect": null
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "7",
+         "seq": 2,
+         "wall": 12,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":2}"
+        }
+       ]
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "7",
+         "seq": 3,
+         "wall": 13,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":3}"
+        },
+        {
+         "replica": "7",
+         "seq": 2,
+         "wall": 11,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":2}"
+        }
+       ]
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "last_seq": "7",
+     "expect": 2
+    },
+    {
+     "replay": {
+      "replica": "7",
+      "seq": 3
+     },
+     "expect": null
+    }
+   ]
+  },
+  {
+   "name": "ac_10_replay_after_lost_reject",
+   "doc": "D110: a final reject was lost and the client sends the op again. Its outcome is the same reason; the op can neither be logged nor rejected a second time.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "7",
+         "seq": 1,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":1}"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "7",
+        "seq": 2,
+        "reason": "Denied"
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "last_seq": "7",
+     "expect": 2
+    },
+    {
+     "replay": {
+      "replica": "7",
+      "seq": 2
+     },
+     "expect": {
+      "rejected": "Denied"
+     }
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "7",
+         "seq": 2,
+         "wall": 11,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":2}"
+        }
+       ]
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "7",
+        "seq": 2,
+        "reason": "Limit"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "7",
+        "seq": 1,
+        "reason": "Denied"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "replay": {
+      "replica": "7",
+      "seq": 2
+     },
+     "expect": {
+      "rejected": "Denied"
+     }
+    },
+    {
+     "replay": {
+      "replica": "7",
+      "seq": 1
+     },
+     "expect": {
+      "accepted": {
+       "position": 1,
+       "op": {
+        "replica": "7",
+        "seq": 1,
+        "wall": 10,
+        "model": 0,
+        "row": "1",
+        "body": "{\"set\":1}"
+       }
+      }
+     }
+    },
+    {
+     "last_seq": "7",
+     "expect": 2
+    }
+   ]
+  },
+  {
+   "name": "ac_10_replay_outcomes_roll_back",
+   "doc": "Outcomes and last_seq are written in the transaction of the outcome: a rolled back transaction leaves no outcome and no raised last_seq.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "3",
+         "seq": 1,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":1}"
+        }
+       ]
+      },
+      {
+       "reject": {
+        "replica": "3",
+        "seq": 2,
+        "reason": "Invalid"
+       }
+      },
+      {
+       "reject": {
+        "replica": "3",
+        "seq": 1,
+        "reason": "Denied"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "last_seq": "3",
+     "expect": 0
+    },
+    {
+     "replay": {
+      "replica": "3",
+      "seq": 1
+     },
+     "expect": null
+    },
+    {
+     "replay": {
+      "replica": "3",
+      "seq": 2
+     },
+     "expect": null
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "3",
+        "seq": 1,
+        "reason": "Invalid"
+       }
+      },
+      {
+       "insert": {
+        "model": 0,
+        "row": "5",
+        "fields": {
+         "0": {
+          "text": "a"
+         }
+        }
+       }
+      },
+      {
+       "insert": {
+        "model": 0,
+        "row": "5",
+        "fields": {
+         "0": {
+          "text": "b"
+         }
+        }
+       }
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "last_seq": "3",
+     "expect": 0
+    },
+    {
+     "replay": {
+      "replica": "3",
+      "seq": 1
+     },
+     "expect": null
+    }
+   ]
+  },
+  {
+   "name": "ac_10_replay_last_seq_per_replica",
+   "doc": "last_seq is kept per replica, is 0 for a replica without outcomes, takes the largest seq of a call and never decreases; the largest replica id and seq round trip.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "1",
+         "seq": 5,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":5}"
+        },
+        {
+         "replica": "2",
+         "seq": 3,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":3}"
+        },
+        {
+         "replica": "1",
+         "seq": 4,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "x"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "last_seq": "1",
+     "expect": 5
+    },
+    {
+     "last_seq": "2",
+     "expect": 3
+    },
+    {
+     "last_seq": "4",
+     "expect": 0
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "Limit"
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "last_seq": "1",
+     "expect": 5
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "18446744073709551615",
+         "seq": 4294967295,
+         "wall": 281474976710655,
+         "model": 0,
+         "row": "340282366920938463463374607431768211455",
+         "body": "{\"set\":4294967295}"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "last_seq": "18446744073709551615",
+     "expect": 4294967295
+    },
+    {
+     "last_seq": "18446744073709551614",
+     "expect": 0
+    },
+    {
+     "replay": {
+      "replica": "18446744073709551615",
+      "seq": 4294967295
+     },
+     "expect": {
+      "accepted": {
+       "position": 4,
+       "op": {
+        "replica": "18446744073709551615",
+        "seq": 4294967295,
+        "wall": 281474976710655,
+        "model": 0,
+        "row": "340282366920938463463374607431768211455",
+        "body": "{\"set\":4294967295}"
+       }
+      }
+     }
+    },
+    {
+     "replay": {
+      "replica": "1",
+      "seq": 2
+     },
+     "expect": {
+      "rejected": "Limit"
+     }
+    },
+    {
+     "replay": {
+      "replica": "2",
+      "seq": 5
+     },
+     "expect": null
+    }
+   ]
+  },
+  {
+   "name": "ac_10_replay_reject_reason_rules",
+   "doc": "A reject reason is 1 to 64 bytes of ASCII letters, digits and '_', stored unchanged; any other reason, also one with punctuation, is Invalid and records nothing (D120).",
+   "steps": [
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 1,
+        "reason": ""
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 1,
+        "reason": "two words"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 1,
+        "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 1,
+        "reason": "nul\u0000"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 1,
+        "reason": "caf\u00e9"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "last_seq": "1",
+     "expect": 0
+    },
+    {
+     "replay": {
+      "replica": "1",
+      "seq": 1
+     },
+     "expect": null
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 1,
+        "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "'; DROP TABLE ostrel_ops; --"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "';DROP_TABLE_ostrel_ops;--"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a-b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a.b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a:b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a@b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a[b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a`b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a{b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a/b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "Limit_2"
+       }
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "replay": {
+      "replica": "1",
+      "seq": 1
+     },
+     "expect": {
+      "rejected": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+     }
+    },
+    {
+     "replay": {
+      "replica": "1",
+      "seq": 2
+     },
+     "expect": {
+      "rejected": "Limit_2"
+     }
+    },
+    {
+     "last_seq": "1",
+     "expect": 2
+    }
+   ]
+  },
+  {
+   "name": "ac_10_replay_duplicate_in_one_call",
+   "doc": "An op id twice in one append_ops call is a Conflict and nothing of the call is logged.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "1",
+         "seq": 1,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":1}"
+        },
+        {
+         "replica": "1",
+         "seq": 2,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":2}"
+        },
+        {
+         "replica": "1",
+         "seq": 1,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "{\"set\":1}"
+        }
+       ]
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "last_seq": "1",
+     "expect": 0
+    },
+    {
+     "replay": {
+      "replica": "1",
+      "seq": 2
+     },
+     "expect": null
+    }
+   ]
+  }
+ ]
+}
