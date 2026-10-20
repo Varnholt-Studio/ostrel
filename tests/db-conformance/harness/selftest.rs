@@ -300,12 +300,6 @@ impl Connection for RefConn {
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>> {
         Box::pin(async move { Ok(scan(&self.state.borrow().rows, q, self.faults)) })
     }
-    fn replay_outcome<'a>(
-        &'a mut self,
-        op: OpId,
-    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
-        Box::pin(async move { Ok(self.state.borrow().log.outcome(op)) })
-    }
     fn applied_schema<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<AppliedSchema>, DbError>> {
         Box::pin(async { Err(DbError::Unsupported("applied schema")) })
     }

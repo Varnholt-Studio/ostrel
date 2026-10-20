@@ -518,12 +518,6 @@ impl Connection for FixtureConn {
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>> {
         Box::pin(async move { scan(&self.state, q) })
     }
-    fn replay_outcome<'a>(
-        &'a mut self,
-        op: OpId,
-    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
-        Box::pin(async move { Ok(self.state.outcome(op)) })
-    }
     fn begin<'c>(&'c mut self) -> BoxFuture<'c, Result<Box<dyn Transaction<'c> + 'c>, DbError>> {
         Box::pin(async move {
             let work = self.state.clone();
@@ -1421,11 +1415,24 @@ fn op_log_positions_boundaries_and_duplicate_ids() {
 }
 
 #[test]
-fn reject_reasons_are_short_printable_ascii() {
+fn reject_reasons_are_short_wire_names() {
     assert_eq!(check_reject_reason("Denied"), Ok(()));
+    assert_eq!(check_reject_reason("Az09_"), Ok(()));
+    assert_eq!(check_reject_reason("_"), Ok(()));
     assert_eq!(check_reject_reason(&"x".repeat(MAX_REJECT_REASON)), Ok(()));
+    // D120: only ASCII letters, digits and '_'; every neighbour of those ranges is refused.
+    for b in (0u8..=0x7f).filter(|b| !b.is_ascii_alphanumeric() && *b != b'_') {
+        let bad = format!("a{}b", b as char);
+        assert!(
+            matches!(check_reject_reason(&bad), Err(DbError::Invalid(_))),
+            "{bad:?}"
+        );
+    }
     for bad in [
         String::new(),
+        "a-b".to_string(),
+        "a.b".to_string(),
+        "';DROP_TABLE_ostrel_ops;--".to_string(),
         "x".repeat(MAX_REJECT_REASON + 1),
         "two words".to_string(),
         "nul\0".to_string(),
@@ -1453,29 +1460,29 @@ fn final_outcomes_last_seq_and_replay() {
         tx.record_reject(tag(1, 2), "Denied").await.unwrap();
         assert_eq!(tx.last_seq(ReplicaId(1)).await, Ok(2));
         assert_eq!(tx.last_seq(ReplicaId(2)).await, Ok(7));
-        // The transaction sees its own outcomes, the connection does not see them yet.
+        // The transaction sees its own outcomes before the commit.
         assert_eq!(
             tx.replay_outcome(tag(1, 2)).await,
             Ok(Some(ReplayOutcome::Rejected("Denied".into())))
         );
         tx.commit().await.unwrap();
 
+        // A new transaction sees the committed outcomes.
+        let mut tx = conn.begin().await.unwrap();
         assert_eq!(
-            conn.replay_outcome(tag(1, 1)).await,
+            tx.replay_outcome(tag(1, 1)).await,
             Ok(Some(ReplayOutcome::Accepted(StoredOp {
                 seq: ServerSeq(1),
                 op: new_op(1, 1),
             })))
         );
         assert_eq!(
-            conn.replay_outcome(tag(1, 2)).await,
+            tx.replay_outcome(tag(1, 2)).await,
             Ok(Some(ReplayOutcome::Rejected("Denied".into())))
         );
-        assert_eq!(conn.replay_outcome(tag(1, 3)).await, Ok(None));
+        assert_eq!(tx.replay_outcome(tag(1, 3)).await, Ok(None));
         // Same replica, other seq; same seq, other replica.
-        assert_eq!(conn.replay_outcome(tag(3, 1)).await, Ok(None));
-
-        let mut tx = conn.begin().await.unwrap();
+        assert_eq!(tx.replay_outcome(tag(3, 1)).await, Ok(None));
         assert_eq!(tx.append_ops(&[new_op(1, 2)]).await, Err(DbError::Conflict));
         assert_eq!(
             tx.record_reject(tag(1, 1), "Denied").await,

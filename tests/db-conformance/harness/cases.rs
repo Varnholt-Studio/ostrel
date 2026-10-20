@@ -39,7 +39,7 @@ pub enum Action {
     Query(Query),
     /// `Transaction::last_seq` in a transaction that is rolled back.
     LastSeq(ReplicaId),
-    /// `Connection::replay_outcome` on committed state.
+    /// `Transaction::replay_outcome` in a transaction that is rolled back.
     Replay(OpId),
 }
 

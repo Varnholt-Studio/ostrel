@@ -512,7 +512,7 @@
   },
   {
    "name": "ac_10_replay_reject_reason_rules",
-   "doc": "A reject reason is 1 to 64 bytes of printable ASCII without space, stored unchanged; any other reason is Invalid and records nothing.",
+   "doc": "A reject reason is 1 to 64 bytes of ASCII letters, digits and '_', stored unchanged; any other reason, also one with punctuation, is Invalid and records nothing (D120).",
    "steps": [
     {
      "tx": [
@@ -631,6 +631,132 @@
        }
       }
      ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a-b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a.b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a:b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a@b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a[b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a`b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a{b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "a/b"
+       }
+      }
+     ],
+     "expect": {
+      "error": "Invalid"
+     }
+    },
+    {
+     "tx": [
+      {
+       "reject": {
+        "replica": "1",
+        "seq": 2,
+        "reason": "Limit_2"
+       }
+      }
+     ],
      "expect": "ok"
     },
     {
@@ -648,7 +774,7 @@
       "seq": 2
      },
      "expect": {
-      "rejected": "';DROP_TABLE_ostrel_ops;--"
+      "rejected": "Limit_2"
      }
     },
     {

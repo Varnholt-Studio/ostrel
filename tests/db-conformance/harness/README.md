@@ -44,7 +44,7 @@ fn ac_18_conformance_memory() {
 * `append_ops` and `reject` items of a `tx` step are one `append_ops` or `record_reject` call
   each, in order with the writes. An expected `Invalid` matches any rule text.
 * Each `last_seq` step runs begin, `last_seq`, rollback; each `replay` step runs
-  `Connection::replay_outcome` on committed state and compares the whole outcome, for an
+  begin, `Transaction::replay_outcome`, rollback and compares the whole outcome, for an
   accepted op the position and every field of the stored op.
 * Each `query` step runs `Connection::query` on committed state and compares the rows in order:
   id, version, the fields as a map by `FieldId`, and the collections (none in format 1). A returned row must have exactly the fields

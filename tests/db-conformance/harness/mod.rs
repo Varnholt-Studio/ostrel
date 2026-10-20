@@ -203,16 +203,7 @@ async fn run_case(case: &Case, fresh: &Fresh<'_>) -> Vec<(usize, String)> {
         let result = match &step.action {
             Action::Tx(calls) => run_tx(conn.as_mut(), calls, &step.expect).await,
             Action::LastSeq(replica) => run_last_seq(conn.as_mut(), *replica, &step.expect).await,
-            Action::Replay(op) => match (conn.replay_outcome(*op).await, &step.expect) {
-                (Ok(got), Expect::Outcome(want)) if got == *want => Ok(None),
-                (Ok(got), Expect::Outcome(want)) => Ok(Some(format!(
-                    "expected outcome {}, got {}",
-                    show(&format!("{want:?}")),
-                    show(&format!("{got:?}"))
-                ))),
-                (Err(e), _) => Ok(Some(format!("replay_outcome failed with {e:?}"))),
-                (Ok(_), _) => Ok(Some("a replay expects an outcome".to_string())),
-            },
+            Action::Replay(op) => run_replay(conn.as_mut(), *op, &step.expect).await,
             Action::Query(q) => match (conn.query(q).await, &step.expect) {
                 (Ok(rows), Expect::Rows(want)) => Ok(compare_rows(&rows.0, want)),
                 (Err(e), _) => Ok(Some(format!("query failed with {e:?}"))),
@@ -297,6 +288,33 @@ async fn run_last_seq(
         (Ok(got), Expect::LastSeq(want)) => Some(format!("expected last_seq {want}, got {got}")),
         (Err(e), _) => Some(format!("last_seq failed with {e:?}")),
         (Ok(_), _) => Some("a last_seq step expects a number".to_string()),
+    };
+    tx.rollback()
+        .await
+        .map_err(|e| format!("rollback failed with {e:?}"))?;
+    Ok(verdict)
+}
+
+/// Runs `Transaction::replay_outcome` in a transaction that is rolled back, so it reads the
+/// committed outcomes.
+async fn run_replay(
+    conn: &mut dyn Connection,
+    op: ostrel_db::api::OpId,
+    expect: &Expect,
+) -> Result<Option<String>, String> {
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| format!("begin failed with {e:?}"))?;
+    let verdict = match (tx.replay_outcome(op).await, expect) {
+        (Ok(got), Expect::Outcome(want)) if got == *want => None,
+        (Ok(got), Expect::Outcome(want)) => Some(format!(
+            "expected outcome {}, got {}",
+            show(&format!("{want:?}")),
+            show(&format!("{got:?}"))
+        )),
+        (Err(e), _) => Some(format!("replay_outcome failed with {e:?}")),
+        (Ok(_), _) => Some("a replay expects an outcome".to_string()),
     };
     tx.rollback()
         .await

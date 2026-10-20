@@ -108,9 +108,10 @@ function logOp(o, models, where) {
   return { key: opKey(o, where), wall: o.wall, model: o.model, row: rowId(o.row, where), body: o.body };
 }
 
-// Reject reasons (ostrel_db::api::check_reject_reason): 1 to 64 bytes of printable ASCII.
+// Reject reasons (ostrel_db::api::check_reject_reason): 1 to 64 bytes of ASCII letters, digits
+// and "_" (D120).
 function validReason(r) {
-  return typeof r === 'string' && /^[\x21-\x7e]{1,64}$/.test(r);
+  return typeof r === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(r);
 }
 
 // Reference model: live rows, the set of ids ever used, and the final outcomes of ops (D110).

@@ -29,8 +29,8 @@ every other character is written as a JSON escape.
     then roll back.
   * `{"last_seq": "<replica>", "expect": n}`: begin, `Transaction::last_seq` of that replica,
     roll back. The result must be `n`.
-  * `{"replay": {"replica", "seq"}, "expect": outcome}`: `Connection::replay_outcome` on committed
-    state. `outcome` is `null` (no final outcome), `{"rejected": "<reason>"}` or
+  * `{"replay": {"replica", "seq"}, "expect": outcome}`: begin, `Transaction::replay_outcome`,
+    roll back. `outcome` is `null` (no final outcome), `{"rejected": "<reason>"}` or
     `{"accepted": {"position": n, "op": op}}` with the log position and the stored op.
   * `{"query": {"model", "order", "limit"}, "expect": [row, ...]}`: `Connection::query` on
     committed state. `order` is a list of `[FieldId, "asc" | "desc"]`, `limit` a number or `null`.

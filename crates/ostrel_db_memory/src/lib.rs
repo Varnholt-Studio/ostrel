@@ -183,13 +183,6 @@ impl Connection for MemoryConnection {
         Box::pin(async move { run_query(&self.db.borrow().state, q) })
     }
 
-    fn replay_outcome<'a>(
-        &'a mut self,
-        op: OpId,
-    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
-        Box::pin(async move { Ok(self.db.borrow().state.replay_outcome(op)) })
-    }
-
     fn applied_schema<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<AppliedSchema>, DbError>> {
         Box::pin(async move { Ok(self.db.borrow().state.schema.clone()) })
     }

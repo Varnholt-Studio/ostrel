@@ -130,14 +130,19 @@ pub enum ReplayOutcome {
 }
 
 /// Checks a reason code for [`Transaction::record_reject`]: 1 to [`MAX_REJECT_REASON`] bytes of
-/// printable ASCII without space. The driver stores it unchanged and never interprets it; the
+/// ASCII letters, digits and `_`, the wire names of the reject reasons (D120). The driver stores it unchanged and never interprets it; the
 /// codes themselves belong to the sync protocol (ARCHITECTURE 5.4).
 pub fn check_reject_reason(reason: &str) -> Result<(), DbError> {
     if reason.is_empty() || reason.len() > MAX_REJECT_REASON {
         return Err(DbError::Invalid("reject reason must have 1 to 64 bytes"));
     }
-    if !reason.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(DbError::Invalid("reject reason must be printable ascii"));
+    if !reason
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(DbError::Invalid(
+            "reject reason must be ascii letters, digits or underscore",
+        ));
     }
     Ok(())
 }
@@ -286,12 +291,6 @@ pub trait Connection {
     fn migrate<'a>(&'a mut self, plan: &'a MigrationPlan) -> BoxFuture<'a, Result<(), DbError>>;
     /// Reads committed state.
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>>;
-    /// Committed final outcome of the op `op`, `None` if it has none. See
-    /// [`Transaction::replay_outcome`].
-    fn replay_outcome<'a>(
-        &'a mut self,
-        op: OpId,
-    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>>;
     /// Hash and canonical JSON stored by the last successful [`Connection::migrate`]; `None`
     /// if the database was never migrated. A refused plan leaves it unchanged. The planner
     /// computes the steps of the next plan from it (D79).

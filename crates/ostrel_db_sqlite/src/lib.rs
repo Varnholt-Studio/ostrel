@@ -223,13 +223,6 @@ impl Connection for SqliteConnection {
         })
     }
 
-    fn replay_outcome<'a>(
-        &'a mut self,
-        op: OpId,
-    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
-        Box::pin(async move { self.in_read(|conn| store::replay_outcome(conn, op)) })
-    }
-
     fn applied_schema<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<AppliedSchema>, DbError>> {
         Box::pin(async move { store::applied_schema(&self.conn) })
     }
