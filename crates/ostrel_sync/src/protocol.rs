@@ -177,7 +177,10 @@ pub enum OpBody {
     /// whole row (D106). Every element of an initial `Set` value gets the op id of the `make`
     /// as its add tag, as if added by its own op; initial `Map` entries carry the stamp of the
     /// `make`. The row id carries the op's replica, otherwise `Forged`; an id that exists or
-    /// existed in any model is `Conflict`.
+    /// existed in any model is `Conflict`. `fields` names every declared field of the model
+    /// exactly once, except the implicit fields (`id`, `made`, `changed`, `author`) and `serial`
+    /// fields; a missing, unknown or repeated field is `Invalid` before the `make` rule runs.
+    /// The server never evaluates a default for a client op; the generated client fills it (D116).
     Make { fields: Vec<(FieldId, Value)> },
     /// Delete the row.
     Drop,
