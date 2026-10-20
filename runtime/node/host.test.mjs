@@ -338,11 +338,25 @@ test("a call id that is still running is rejected", async () => {
 
 test("results with many shared references fail fast as TooLarge", async () => {
   // dag(30) has 2^31 paths: without the value budget the check would not end.
-  let dag = [];
-  for (let i = 0; i < 30; i++) dag = [dag, dag];
-  const started = Date.now();
+  // Fast is stated as work, not time (D74): every array of the dag counts the
+  // elements read from it, and the check may read at most one element per
+  // value of its budget. A check that ignores the budget hits the guard and
+  // fails at once instead of hanging the run.
+  let reads = 0;
+  const counted = (array) =>
+    new Proxy(array, {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/.test(key)) {
+          reads++;
+          if (reads > MAX_NODES) throw new Error(`more than ${MAX_NODES} element reads`);
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+  let dag = counted([]);
+  for (let i = 0; i < 30; i++) dag = counted([dag, dag]);
   assert.throws(() => checkWireValue(dag), new RegExp(`more than ${MAX_NODES} values`));
-  assert.ok(Date.now() - started < 2000);
+  assert.ok(reads > 0 && reads <= MAX_NODES, `element reads: ${reads}`);
   const host = await readyHost();
   assert.equal((await host.call(1, "bad", "dag", [30])).error.data.kind, "TooLarge");
   assert.deepEqual(await host.call(2, "math", "add", [1, 1]), { jsonrpc: "2.0", id: 2, result: 2 });

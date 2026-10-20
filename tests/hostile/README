@@ -157,10 +157,12 @@ well under the hang guard stays green, and that the hang guard reports a hanging
   `\u{...}` edge values, unterminated strings and interpolations.
 * `ostrel run` (A2-16, G15, D44): unbounded and mutual recursion (`CallDepth`), integer
   overflow on add, subtract, multiply and by recursion (`IntOverflow`), division and
-  modulo by zero (`DivisionByZero`), a long loop by recursion (`StepLimit`), a long run
-  of interpolations (`StepLimit`, CPU margin, D114), text growth
-  past the text limit (`TextLimit`), many live texts past the heap limit (`HeapLimit`,
-  D44), and many output lines.
+  modulo by zero (`DivisionByZero`), a long loop by recursion (`StepLimit`), the
+  comparison of two equal 16 MiB texts once per level of a deep recursion
+  (`run_text_compare_cost`, `StepLimit`, a step is weighted by the bytes read, D94), a long
+  run of interpolations of an `Int` (`run_interpolate_int`, `StepLimit` within the CPU
+  limit, allocation surcharge, D112, D114), text growth past the text limit (`TextLimit`),
+  many live texts past the heap limit (`HeapLimit`, D44), and many output lines.
 * Seeded cases `seed_bytes_*`, `seed_soup_*` (v0.1 token soup) and `seed_mutant_*`
   (mutations of valid programs).
 

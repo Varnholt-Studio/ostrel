@@ -21,12 +21,14 @@ use std::fmt;
 
 mod bytecode;
 mod exec;
+pub mod host;
 
 pub use bytecode::CompileError;
 pub use ostrel_ir::Span;
 
 /// Everything the VM needs from its embedder. The CLI writes to stdout; the
-/// server (ARCHITECTURE 4.1) adds database, RPC and clock access by addition.
+/// server (ARCHITECTURE 4.1) adds database, RPC and clock access by addition
+/// through [`host::ServerHost`] and [`host::ServerContext`].
 pub trait Host {
     /// Writes one line of program output; `text` carries no trailing newline.
     fn print(&mut self, text: &str);
