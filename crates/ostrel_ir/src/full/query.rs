@@ -47,7 +47,8 @@ pub struct Hop {
     /// The reference field: a declared `Ref` field or the implicit `author`,
     /// the only implicit field that is a reference.
     pub field: FieldRef,
-    /// The model the field points to.
+    /// The model the field points to: the model of its `Ref` or `Ref?` type,
+    /// for `author` the std `User` ([`super::Program::user_model`]).
     pub model: ModelId,
 }
 
@@ -167,6 +168,8 @@ pub struct QueryPlan {
     pub see: See,
     /// The sort field and `desc`. The tie break by id in the same direction is
     /// implied; without a sort the order is by id ascending (SPEC 12.10).
+    /// Never the implicit `id`: the database interface sorts by field ids
+    /// only (`ostrel_db::api::Query::order`).
     pub sort: Option<(super::FieldRef, bool)>,
     /// `limit n` or `last n` with `n` an `Int` local. A negative value at run
     /// time is the runtime error `NegativeCount` at [`QueryPlan::take_span`],

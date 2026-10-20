@@ -42,7 +42,9 @@ fn function(name: &str, placement: Placement, kind: FnKind, locals: Vec<Ty>) -> 
 }
 
 const ROOM: ModelId = ModelId(0);
+const USER: ModelId = ModelId(1);
 const NAME: FieldId = FieldId(0);
+const HANDLE: FieldId = FieldId(0);
 const MEMBERS: FieldId = FieldId(1);
 const NUMBER: FieldId = FieldId(2);
 
@@ -303,22 +305,36 @@ fn sample() -> Program {
             home: None,
         }),
         enums: Vec::new(),
-        models: vec![Model {
-            name: "Room".to_string(),
-            fields: vec![
-                field("name", Ty::Text, FieldMode::Plain),
-                field(
-                    "members",
-                    Ty::Set(Box::new(Ty::Ref(ROOM))),
-                    FieldMode::Plain,
-                ),
-                field("number", Ty::Int, FieldMode::Serial(None)),
-            ],
-            see: Some(members_filter()),
-            rules: vec![RuleId(2)],
-            checks: Vec::new(),
-            span: span(1),
-        }],
+        models: vec![
+            Model {
+                name: "Room".to_string(),
+                fields: vec![
+                    field("name", Ty::Text, FieldMode::Plain),
+                    field(
+                        "members",
+                        Ty::Set(Box::new(Ty::Ref(ROOM))),
+                        FieldMode::Plain,
+                    ),
+                    field("number", Ty::Int, FieldMode::Serial(None)),
+                ],
+                see: Some(members_filter()),
+                rules: vec![RuleId(2)],
+                checks: Vec::new(),
+                span: span(1),
+            },
+            // The std `User` of an app with `auth` (SYNTAX 4.1, D142).
+            Model {
+                name: "User".to_string(),
+                fields: vec![
+                    field("handle", Ty::Text, FieldMode::Fixed),
+                    field("name", Ty::Text, FieldMode::Plain),
+                ],
+                see: None,
+                rules: Vec::new(),
+                checks: Vec::new(),
+                span: span(5),
+            },
+        ],
         rules: vec![
             Rule {
                 op: RuleOp::Call,
@@ -629,10 +645,10 @@ fn filters_reach_the_implicit_fields() {
                 })),
             ),
             is_me(
-                FieldRef::Declared(NAME),
+                FieldRef::Declared(HANDLE),
                 vec![Hop {
                     field: AUTHOR,
-                    model: ROOM,
+                    model: USER,
                 }],
             ),
         ]));
@@ -685,6 +701,115 @@ fn filter_paths_keep_the_field_mapping() {
         ));
     });
     assert_eq!(in_client_query, Vec::new());
+}
+
+#[test]
+fn a_hop_reaches_the_model_of_its_reference() {
+    let hop = |field: FieldRef, model: ModelId, read: FieldId| {
+        problems_after(move |p| {
+            p.models[0].fields.push(Field {
+                name: "owner".to_string(),
+                ty: Ty::Optional(Box::new(Ty::Ref(USER))),
+                mode: FieldMode::Plain,
+                merge: Merge::Default,
+                default: None,
+                span: span(6),
+            });
+            p.models[0].see = Some(is_me(FieldRef::Declared(read), vec![Hop { field, model }]));
+        })
+    };
+    let owner = FieldRef::Declared(FieldId(3));
+    // `owner: User?` and `author` point to the std `User`.
+    assert_eq!(hop(owner, USER, HANDLE), Vec::new());
+    assert_eq!(hop(AUTHOR, USER, HANDLE), Vec::new());
+    // The hop names another model than the field points to.
+    assert_eq!(hop(owner, ROOM, NAME), vec![Problem::BadPath]);
+    assert_eq!(hop(AUTHOR, ROOM, NAME), vec![Problem::BadPath]);
+    // `name: Text` is no reference at all.
+    assert_eq!(
+        hop(FieldRef::Declared(NAME), USER, HANDLE),
+        vec![Problem::BadPath]
+    );
+    // A field the model does not have, before or after the hop.
+    assert_eq!(
+        hop(FieldRef::Declared(FieldId(9)), USER, HANDLE),
+        vec![Problem::UnknownId]
+    );
+    assert_eq!(hop(owner, USER, FieldId(9)), vec![Problem::UnknownId]);
+    // Without `auth` there is no `author` (G8) and no std `User`.
+    let without_auth = problems_after(|p| {
+        p.app.as_mut().unwrap().auth = None;
+        p.models[0].see = Some(Filter::And(vec![
+            is_me(AUTHOR, Vec::new()),
+            Filter::RowId(vec![Hop {
+                field: AUTHOR,
+                model: USER,
+            }]),
+        ]));
+    });
+    assert_eq!(without_auth, vec![Problem::BadPath, Problem::BadPath]);
+}
+
+#[test]
+fn a_sort_names_a_field_of_the_queried_model_never_the_id() {
+    let sort = |field: FieldRef| {
+        problems_after(move |p| {
+            if let InstKind::BulkDrop { plan, .. } = first_inst(p, CLOSE_ALL) {
+                plan.sort = Some((field, true));
+            }
+        })
+    };
+    assert_eq!(sort(FieldRef::Declared(NUMBER)), Vec::new());
+    assert_eq!(
+        sort(FieldRef::Implicit(ImplicitField::Id)),
+        vec![Problem::BadPath]
+    );
+    assert_eq!(
+        sort(FieldRef::Declared(FieldId(9))),
+        vec![Problem::UnknownId]
+    );
+    let unknown_model = problems_after(|p| {
+        if let InstKind::BulkDrop { plan, .. } = first_inst(p, CLOSE_ALL) {
+            plan.model = ModelId(9);
+        }
+    });
+    assert_eq!(unknown_model, vec![Problem::UnknownId]);
+}
+
+#[test]
+fn a_check_is_a_predicate() {
+    let checks = |make: fn(&mut Program) -> FuncId| {
+        problems_after(move |p| {
+            let check = make(p);
+            p.models[0].checks.push(check);
+        })
+    };
+    assert_eq!(checks(|_| EDIT_RULE), Vec::new());
+    // An elevated derived function would run its body as system on every
+    // write, without call rule and audit (D140 A3).
+    assert_eq!(
+        checks(add_elevated_derived),
+        vec![Problem::RuleWithoutPredicate]
+    );
+    assert_eq!(checks(|_| LABEL), vec![Problem::RuleWithoutPredicate]);
+    assert_eq!(checks(|_| FuncId(9999)), vec![Problem::UnknownId]);
+}
+
+#[test]
+fn main_is_a_source_function_without_parameters_of_a_script() {
+    let main = |app: bool, func: FuncId| {
+        problems_after(move |p| {
+            if !app {
+                p.app = None;
+            }
+            p.main = Some(func);
+        })
+    };
+    assert_eq!(main(false, LABEL), Vec::new());
+    assert_eq!(main(true, LABEL), vec![Problem::BadMain]);
+    assert_eq!(main(false, SEND), vec![Problem::BadMain]);
+    assert_eq!(main(false, ON_CLICK), vec![Problem::BadMain]);
+    assert_eq!(main(false, FuncId(99)), vec![Problem::UnknownId]);
 }
 
 /// Adds `closeAll.rows`, a function the lowering derives from the elevated

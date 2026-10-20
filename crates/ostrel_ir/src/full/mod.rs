@@ -190,7 +190,8 @@ pub struct Program {
     /// The `style` blocks; the CSS stays source text, the browser backend
     /// reads it at these positions.
     pub styles: Vec<Span>,
-    /// `fn main()` of a script program.
+    /// `fn main()` of a script program: a source function without
+    /// parameters; always `None` with an `app` (G15).
     pub main: Option<FuncId>,
 }
 
@@ -208,6 +209,19 @@ impl Program {
     /// A rule by id.
     pub fn rule(&self, id: RuleId) -> Option<&Rule> {
         self.rules.get(id.index())
+    }
+
+    /// The std `User` model, the type of `me` and of the implicit `author`:
+    /// the model named `User` in a program whose `app` has `auth`, `None`
+    /// otherwise (G8, D142). With `auth` the name is taken by the std model, a
+    /// declared `User` beside it is a compile error (E0201), so the name
+    /// identifies it.
+    pub fn user_model(&self) -> Option<ModelId> {
+        self.app.as_ref()?.auth?;
+        self.models
+            .iter()
+            .position(|m| m.name == "User")
+            .map(|i| ModelId(i as u32))
     }
 
     /// A declared field of a model.

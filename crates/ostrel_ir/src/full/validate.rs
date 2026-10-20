@@ -6,13 +6,13 @@
 //! stays inside elevated code, predicates stay pure, every server function has
 //! its prologue, and a `make` names its fields exactly as the wire op does.
 
-use ostrel_core::Span;
+use ostrel_core::{FileId, Span};
 
-use super::query::{Filter, Path, QueryPlan, See};
+use super::query::{Filter, Hop, Path, QueryPlan, See};
 use super::view::{ForSource, Thunk, ViewNode, ViewNodeKind};
 use super::{
-    Auth, FieldMode, FieldRef, FnKind, FuncId, Function, ImplicitField, InstKind, Placement,
-    Program, RuleOp, Ty,
+    Auth, FieldMode, FieldRef, FnKind, FuncId, Function, ImplicitField, InstKind, ModelId,
+    Placement, Program, RuleOp, Ty,
 };
 
 /// One broken rule of the contract.
@@ -71,11 +71,25 @@ pub enum Problem {
     /// a filter of a server query or in a `see` rule (ARCHITECTURE 5.1).
     ClientFieldOnServer,
     /// A filter [`Path`] that reads the implicit `id` (that is
-    /// [`Filter::RowId`]), or a hop through a field that is neither declared
-    /// nor the implicit `author`.
+    /// [`Filter::RowId`]), a sort on the implicit `id` (the database
+    /// interface sorts by field ids only and orders by id after the last key,
+    /// SPEC 12.10), or a hop that does not reach its [`Hop::model`]: a hop
+    /// through a declared field whose type is not `Ref` or `Ref?` of that
+    /// model, through the implicit `author` to another model than the std
+    /// `User` ([`Program::user_model`]), or through any other implicit field.
+    /// `author` in a program without `auth` is a bad path as well (G8).
     BadPath,
-    /// A rule whose predicate is not a [`FnKind::Predicate`] function.
+    /// A rule or a `check` invariant whose function is not a
+    /// [`FnKind::Predicate`] function. A `check` runs as part of every write
+    /// without prologue; a derived or elevated function there would run its
+    /// body, with [`Auth::System`] for elevated code, without the `call` rule
+    /// and the audit entry of an elevated entry (D140 A3).
     RuleWithoutPredicate,
+    /// `main` in a program with an `app`, or a `main` that is not a source
+    /// function without parameters (G15). An unknown `main` id is
+    /// [`Problem::UnknownId`] at the empty span at the start of file 0, the
+    /// only violation without a declaration to point at.
+    BadMain,
     /// A view thunk, handler, field default or `var` initialiser that does
     /// not run on the client.
     NotOnClient,
@@ -97,6 +111,7 @@ pub(super) fn validate(program: &Program) -> Vec<Violation> {
         program,
         out: Vec::new(),
     };
+    v.main();
     v.rules();
     v.models_and_vars();
     for view in &program.views {
@@ -132,6 +147,24 @@ impl Validator<'_> {
         }
     }
 
+    fn main(&mut self) {
+        let Some(main) = self.program.main else {
+            return;
+        };
+        match self.program.function(main) {
+            None => self.report(
+                Some(main),
+                Span::point(FileId::from_raw(0), 0),
+                Problem::UnknownId,
+            ),
+            Some(f) => {
+                if self.program.app.is_some() || f.kind != FnKind::Source || f.params != 0 {
+                    self.report(Some(main), f.span, Problem::BadMain);
+                }
+            }
+        }
+    }
+
     fn on_client(&mut self, func: FuncId, span: Span) {
         match self.program.function(func) {
             Some(f) if f.placement != Placement::Server => {}
@@ -142,10 +175,10 @@ impl Validator<'_> {
 
     fn models_and_vars(&mut self) {
         let program = self.program;
-        for model in &program.models {
+        for (index, model) in program.models.iter().enumerate() {
             if let Some(see) = &model.see {
                 let mut problems = Vec::new();
-                filter_problems(see, true, &mut problems);
+                filter_problems(program, ModelId(index as u32), see, true, &mut problems);
                 for problem in problems {
                     self.report(None, model.span, problem);
                 }
@@ -153,6 +186,13 @@ impl Validator<'_> {
             for rule in &model.rules {
                 if program.rule(*rule).is_none() {
                     self.report(None, model.span, Problem::UnknownId);
+                }
+            }
+            for check in &model.checks {
+                match program.function(*check) {
+                    Some(f) if f.kind == FnKind::Predicate => {}
+                    Some(_) => self.report(None, model.span, Problem::RuleWithoutPredicate),
+                    None => self.report(None, model.span, Problem::UnknownId),
                 }
             }
             for field in &model.fields {
@@ -209,7 +249,7 @@ impl Validator<'_> {
                                 self.report(None, node.span, Problem::ClientOnly);
                             }
                             let mut problems = Vec::new();
-                            plan_problems(plan, false, &mut problems);
+                            plan_problems(self.program, plan, false, &mut problems);
                             for problem in problems {
                                 self.report(None, node.span, problem);
                             }
@@ -394,7 +434,7 @@ impl Validator<'_> {
                     out.push(Problem::NotPure);
                 }
                 see(&plan.see, &mut out);
-                plan_problems(plan, !client, &mut out);
+                plan_problems(program, plan, !client, &mut out);
             }
             InstKind::BulkDrop { plan, auth: a } | InstKind::BulkEdit { plan, auth: a, .. } => {
                 if !server {
@@ -402,7 +442,7 @@ impl Validator<'_> {
                 }
                 auth(*a, true, &mut out);
                 see(&plan.see, &mut out);
-                plan_problems(plan, true, &mut out);
+                plan_problems(program, plan, true, &mut out);
                 let see_fits = match a {
                     Auth::System => plan.see == See::System,
                     Auth::Caller => matches!(plan.see, See::Rule(_) | See::DenyAll),
@@ -428,72 +468,133 @@ impl Validator<'_> {
     }
 }
 
-/// The path problems of a query plan: its `where` filter, its `see` filter
-/// and its sort field. `server` is true when the plan runs on the server.
-fn plan_problems(plan: &QueryPlan, server: bool, out: &mut Vec<Problem>) {
+/// The path problems of a query plan: its model, its `where` filter, its
+/// `see` filter and its sort field. `server` is true when the plan runs on the
+/// server.
+fn plan_problems(program: &Program, plan: &QueryPlan, server: bool, out: &mut Vec<Problem>) {
+    if program.model(plan.model).is_none() {
+        out.push(Problem::UnknownId);
+        return;
+    }
     if let Some(filter) = &plan.filter {
-        filter_problems(filter, server, out);
+        filter_problems(program, plan.model, filter, server, out);
     }
     if let See::Rule(filter) = &plan.see {
-        filter_problems(filter, server, out);
+        filter_problems(program, plan.model, filter, server, out);
     }
-    if let Some((FieldRef::Implicit(field), _)) = plan.sort
-        && server
-        && field.is_client_only()
-    {
-        out.push(Problem::ClientFieldOnServer);
+    if let Some((field, _)) = plan.sort {
+        field_problems(program, plan.model, field, server, out);
     }
 }
 
-/// The path problems of one filter, each at most once per node.
-fn filter_problems(filter: &Filter, server: bool, out: &mut Vec<Problem>) {
+/// The path problems of one filter over rows of `model`.
+fn filter_problems(
+    program: &Program,
+    model: ModelId,
+    filter: &Filter,
+    server: bool,
+    out: &mut Vec<Problem>,
+) {
     match filter {
         Filter::Value(_) => {}
-        Filter::Field(path) => path_problems(path, server, out),
+        Filter::Field(path) => path_problems(program, model, path, server, out),
         Filter::RowId(hops) => {
-            for hop in hops {
-                hop_problems(hop.field, out);
-            }
+            hops_end(program, model, hops, out);
         }
         Filter::Cmp(_, a, b) => {
-            filter_problems(a, server, out);
-            filter_problems(b, server, out);
+            filter_problems(program, model, a, server, out);
+            filter_problems(program, model, b, server, out);
         }
         Filter::And(items) | Filter::Or(items) => {
             for item in items {
-                filter_problems(item, server, out);
+                filter_problems(program, model, item, server, out);
             }
         }
-        Filter::Not(inner) | Filter::Coalesce(inner, _) => filter_problems(inner, server, out),
-        Filter::InSet { elem, set } => {
-            filter_problems(elem, server, out);
-            path_problems(set, server, out);
+        Filter::Not(inner) | Filter::Coalesce(inner, _) => {
+            filter_problems(program, model, inner, server, out);
         }
-        Filter::InMap { key, map } | Filter::MapGet { map, key } => {
-            filter_problems(key, server, out);
-            path_problems(map, server, out);
+        Filter::InSet { elem, set } => {
+            filter_problems(program, model, elem, server, out);
+            path_problems(program, model, set, server, out);
+        }
+        Filter::InMap { key, map } | Filter::MapGet { key, map } => {
+            filter_problems(program, model, key, server, out);
+            path_problems(program, model, map, server, out);
         }
     }
 }
 
-fn path_problems(path: &Path, server: bool, out: &mut Vec<Problem>) {
-    for hop in &path.hops {
-        hop_problems(hop.field, out);
+fn path_problems(
+    program: &Program,
+    model: ModelId,
+    path: &Path,
+    server: bool,
+    out: &mut Vec<Problem>,
+) {
+    if let Some(end) = hops_end(program, model, &path.hops, out) {
+        field_problems(program, end, path.field, server, out);
     }
-    match path.field {
+}
+
+/// The field read at the end of a path, or the sort field, on rows of
+/// `model`.
+fn field_problems(
+    program: &Program,
+    model: ModelId,
+    field: FieldRef,
+    server: bool,
+    out: &mut Vec<Problem>,
+) {
+    match field {
+        FieldRef::Declared(id) if program.field(model, id).is_none() => {
+            out.push(Problem::UnknownId);
+        }
+        FieldRef::Declared(_) => {}
         FieldRef::Implicit(ImplicitField::Id) => out.push(Problem::BadPath),
+        FieldRef::Implicit(ImplicitField::Author) if program.user_model().is_none() => {
+            out.push(Problem::BadPath);
+        }
         FieldRef::Implicit(field) if server && field.is_client_only() => {
             out.push(Problem::ClientFieldOnServer);
         }
-        _ => {}
+        FieldRef::Implicit(_) => {}
     }
 }
 
-fn hop_problems(field: FieldRef, out: &mut Vec<Problem>) {
-    if !matches!(
-        field,
-        FieldRef::Declared(_) | FieldRef::Implicit(ImplicitField::Author)
-    ) {
-        out.push(Problem::BadPath);
+/// Follows `hops` from rows of `model` and returns the model of the last
+/// one, or `None` after the first hop that does not reach its model, which is
+/// reported once; the rest of the path is not followed.
+fn hops_end(
+    program: &Program,
+    model: ModelId,
+    hops: &[Hop],
+    out: &mut Vec<Problem>,
+) -> Option<ModelId> {
+    let mut at = model;
+    for hop in hops {
+        let target = match hop.field {
+            FieldRef::Declared(id) => match program.field(at, id) {
+                None => {
+                    out.push(Problem::UnknownId);
+                    return None;
+                }
+                Some(field) => match &field.ty {
+                    Ty::Ref(target) => Some(*target),
+                    Ty::Optional(inner) => match **inner {
+                        Ty::Ref(target) => Some(target),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+            },
+            FieldRef::Implicit(ImplicitField::Author) => program.user_model(),
+            FieldRef::Implicit(_) => None,
+        };
+        if target != Some(hop.model) {
+            out.push(Problem::BadPath);
+            return None;
+        }
+        at = hop.model;
     }
+    Some(at)
 }
