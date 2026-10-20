@@ -206,6 +206,39 @@ else
   echo "   quick_scope_selftest ok"
 fi
 
+# glob_unsafe PATH: true when PATH contains a character that `node --test` reads as glob
+# syntax. Node 22 reads every argument of `node --test` as a glob pattern, so such a file
+# (for example x[1].test.mjs) would match other files or none and never run, while the gate
+# stayed green. The gate rejects those paths instead (same rule as the browser job in
+# .github/scripts/browser-tests.sh).
+glob_unsafe() {
+  case "$1" in
+    *[][*?{}\(\)!+@\\]*) return 0 ;;
+  esac
+  return 1
+}
+
+# glob_selftest: proves that glob_unsafe rejects every glob character and passes plain paths.
+glob_selftest() {
+  local c p bad=0
+  for c in '*' '?' '[' ']' '{' '}' '(' ')' '!' '+' '@' '\'; do
+    for p in "./a/x${c}1.test.mjs" "./a${c}/x.test.js"; do
+      glob_unsafe "$p" || { echo "   selftest: not rejected: $p"; bad=1; }
+    done
+  done
+  for p in './a/x1.test.mjs' './a b/x-1_2.test.js' './-a/x.y,z.test.mjs'; do
+    ! glob_unsafe "$p" || { echo "   selftest: rejected: $p"; bad=1; }
+  done
+  return $bad
+}
+
+if ! glob_selftest; then
+  echo "   node test paths: self test failed"
+  fail=1
+else
+  echo "   glob_selftest ok"
+fi
+
 # Rust
 list rs_code -name '*.rs'
 if [ -f Cargo.toml ] && [ "${GATE_SCOPE:-full}" = quick ]; then
@@ -225,6 +258,12 @@ fi
 # JavaScript
 list js_tests -name '*.test.js' -o -name '*.test.mjs'
 list js_code \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' -o -name '*.ts' \) -a ! -name '*.d.ts'
+for f in "${js_tests[@]}"; do
+  if glob_unsafe "$f"; then
+    echo "JavaScript test path contains a glob character, node --test would not run it: $f"
+    fail=1
+  fi
+done
 if [ ${#js_tests[@]} -gt 0 ]; then
   if command -v node >/dev/null 2>&1; then
     run node --test "${js_tests[@]}"
