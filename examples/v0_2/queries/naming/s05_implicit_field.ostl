@@ -1,0 +1,14 @@
+// Case S-05 (EXPECTED.md 4): a parameter named like the implicit field `made`.
+app Naming
+
+data Post
+  text: Text
+  pos: Int
+  see if true
+  drop if true
+
+fn dropBefore(made: Time)
+  drop Post where made < made
+
+view Main
+  text "Naming"

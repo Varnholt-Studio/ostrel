@@ -1,0 +1,1 @@
+tests/errors/lex_string_line_break_closed_next_line.ostl:2:9: error[E0003]: unterminated string literal

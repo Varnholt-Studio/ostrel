@@ -54,7 +54,11 @@ function startHost(modules = { math: "math.mjs", bad: "bad.mjs" }) {
   });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => (stderr += chunk));
-  const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+  // stdout and stderr are separate pipes, so a protocol message can arrive
+  // before stderr output the host wrote earlier. "close" is emitted only after
+  // the process exited and both pipes reached end of file, so once it fired
+  // every byte the host ever wrote has been read.
+  const exited = new Promise((resolve) => child.on("close", (code) => resolve(code)));
 
   async function nextMessage(timeoutMs = 5000) {
     const deadline = Date.now() + timeoutMs;
@@ -133,10 +137,11 @@ test("module output never reaches the protocol stream", async () => {
   const host = await readyHost();
   const res = await host.call(1, "math", "chatty", ["hi"]);
   assert.equal(res.result, "hi");
+  // Check both streams only after they are fully drained (see startHost).
+  assert.equal(await host.stop(), 0);
   assert.equal(host.rawLines.length, 0);
   assert.match(host.stderr(), /log line from module/);
   assert.match(host.stderr(), /raw stdout from module/);
-  await host.stop();
 });
 
 test("thrown errors and rejections become Threw", async () => {
@@ -333,11 +338,25 @@ test("a call id that is still running is rejected", async () => {
 
 test("results with many shared references fail fast as TooLarge", async () => {
   // dag(30) has 2^31 paths: without the value budget the check would not end.
-  let dag = [];
-  for (let i = 0; i < 30; i++) dag = [dag, dag];
-  const started = Date.now();
+  // Fast is stated as work, not time (D74): every array of the dag counts the
+  // elements read from it, and the check may read at most one element per
+  // value of its budget. A check that ignores the budget hits the guard and
+  // fails at once instead of hanging the run.
+  let reads = 0;
+  const counted = (array) =>
+    new Proxy(array, {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/.test(key)) {
+          reads++;
+          if (reads > MAX_NODES) throw new Error(`more than ${MAX_NODES} element reads`);
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+  let dag = counted([]);
+  for (let i = 0; i < 30; i++) dag = counted([dag, dag]);
   assert.throws(() => checkWireValue(dag), new RegExp(`more than ${MAX_NODES} values`));
-  assert.ok(Date.now() - started < 2000);
+  assert.ok(reads > 0 && reads <= MAX_NODES, `element reads: ${reads}`);
   const host = await readyHost();
   assert.equal((await host.call(1, "bad", "dag", [30])).error.data.kind, "TooLarge");
   assert.deepEqual(await host.call(2, "math", "add", [1, 1]), { jsonrpc: "2.0", id: 2, result: 2 });

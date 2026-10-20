@@ -1,0 +1,34 @@
+app Notes
+
+data Note
+  title: Text
+  body: Text = ""
+  pinned: Bool = false
+  check title.len in 1..200
+  check body.len in 0..2000
+  see if true
+  make if true
+  edit if true
+  edit title if not pinned
+  drop if not pinned
+
+fn deleteNote(n: Note)
+  drop n
+
+view Main
+  col
+    entry hint: "New note" submit: "Add"
+      on submit make Note { title: it }
+    for n in Note sort title
+      col
+        text n.title look: strong
+        text n.body
+        entry hint: "Text of {n.title}" submit: "Save"
+          on submit n.body = it
+        if n.pinned
+          button "Unpin" on click n.pinned = false
+        else
+          entry hint: "Rename {n.title}" submit: "Rename"
+            on submit n.title = it
+          button "Pin" on click n.pinned = true
+          button "Delete" on click deleteNote(n)

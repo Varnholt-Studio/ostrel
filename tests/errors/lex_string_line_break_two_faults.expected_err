@@ -1,0 +1,2 @@
+tests/errors/lex_string_line_break_two_faults.ostl:2:11: error[E0003]: unterminated string literal
+tests/errors/lex_string_line_break_two_faults.ostl:3:11: error[E0003]: unterminated string literal

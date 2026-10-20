@@ -1,0 +1,14 @@
+{
+  "strategy": "set",
+  "description": "A make tags both initial elements with its own id (D106, D107); a remove of e1 that names this tag removes e1 only, e2 stays with the make tag.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "make": ["e1", "e2"] } },
+    { "id": "000000000000000c00000001", "hlc": "018bcfe568010000000000000000000c",
+      "op": { "remove": "e1", "tags": ["000000000000000a00000001"] } }
+  ],
+  "deliveries": [[0, 1], [0, 0, 1], [0, 1, 1]],
+  "expect": {
+    "value": ["e2"],
+    "state": [["e2", ["000000000000000a00000001"]]]
+  }
+}

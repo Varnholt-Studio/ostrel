@@ -57,7 +57,7 @@ A runner creates a fresh replica per delivery, applies the ops in that order and
 | Strategy | Op body | `value` | `state` |
 |---|---|---|---|
 | `lww` | `{"set": v}` | `v` of the highest `Hlc` | `{"hlc": h, "value": v}` |
-| `set` | `{"add": e}` or `{"remove": e, "tags": [OpId, ...]}` | live elements | `[[e, [tag, ...]], ...]` for live elements, tags sorted |
+| `set` | `{"add": e}`, `{"make": [e, ...]}` or `{"remove": e, "tags": [OpId, ...]}` | live elements | `[[e, [tag, ...]], ...]` for live elements, tags sorted |
 | `map` | `{"put": [k, v]}` or `{"remove": k}` | `[[k, v], ...]` for live keys | `[[k, {"hlc": h, "value": v}], ...]` or `{"hlc": h, "removed": true}` for a tombstone |
 | `rank` | `{"set": [row, key]}` | row ids in list order | `[[row, {"hlc": h, "rank": key}], ...]` in list order |
 
@@ -84,7 +84,18 @@ or the end of the list.
 The server log delivers a remove only after the adds it names, and there are no tag tombstones
 (ARCHITECTURE 6.2). The validator therefore refuses a delivery in which a named add comes after
 the remove, including a replay of that add. A remove names between 1 and 64 tags (ARCHITECTURE
-5.9); a tag the replica never received is ignored.
+5.9); a tag the replica never received is ignored, and so is a tag that adds another element
+(D96), so the delivery rule above does not apply to it. A tag is the id of an add or a make;
+a tag that names a remove (also the remove's own id) is an authoring error and is refused.
+
+A `make` (D106, D107) stands for the initial elements of the row: it tags each listed element
+with its own `OpId`, exactly as one add per element would. A vector holds at most one make (it
+is one row), its elements are pairwise different by wire value (`compareKey`, D61), and an
+empty list is allowed. A remove that names the make tag deletes it only from the element it
+removes; the other initial elements keep it. For the delivery rule a make counts as an add of
+each listed element: it may not come after a remove of one of them that names its tag. The
+runners apply a make as one add per element with the make's `OpId`; the set modules themselves
+know no make.
 
 ## Canonical encoding cases
 

@@ -524,6 +524,263 @@ fn unterminated_string_ends_an_open_paren() {
     assert_eq!(k, vec![Ident, LParen, Error, Nl, Ident, Nl, Eof]);
 }
 
+// A line end inside a string is one fault (SPEC 12.1, red #1071): the quote
+// meant to close the string on the next line adds no second E0003.
+
+/// Codes and byte offsets of all diagnostics of `src`.
+fn codes_at(src: &str) -> Vec<(Code, u32)> {
+    lex(src).1.iter().map(|d| (d.code, d.span.start)).collect()
+}
+
+#[test]
+fn quote_on_the_next_line_closes_the_cut_string() {
+    let src = "f(\"abc\n\")\n";
+    let (tokens, diags) = lex(src);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(first(&diags), Some((codes::UNTERMINATED_STRING, 2)));
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    // The `(` stays open across the cut string, so `)` closes it.
+    assert_eq!(k, vec![Ident, LParen, Error, RParen, Nl, Eof]);
+    assert_eq!(texts(src, &tokens).get(2).copied(), Some("\"abc\n\""));
+}
+
+#[test]
+fn a_quote_after_blanks_on_the_next_line_closes_the_cut_string() {
+    for src in [
+        "f(\"abc\r\n\")\r\n",
+        "f(\"a {b} c\n\")\n",
+        "f(\"abc\n  \")\n",
+        "f(\"abc\n\" + x)\n",
+        "f(\"abc\n\"\t+\tx)\n",
+        "f(\"abc\n\"",
+    ] {
+        assert_eq!(
+            codes_at(src),
+            vec![(codes::UNTERMINATED_STRING, 2)],
+            "{src:?}"
+        );
+    }
+}
+
+// SPEC 12.6 "Recovery after a line end in a string": each line that ends
+// inside a string is its own fault; recovery never hides a second real fault.
+
+/// The examples of SPEC 12.6, lines after `fn main()`, as line:column.
+fn spec_positions(body: &str) -> Vec<(Code, usize, usize)> {
+    let src = format!("fn main()\n{body}");
+    lex(&src)
+        .1
+        .iter()
+        .map(|d| {
+            let at = d.span.start as usize;
+            let line = src[..at].matches('\n').count() + 1;
+            let col = at - src[..at].rfind('\n').map_or(0, |i| i + 1) + 1;
+            (d.code, line, col)
+        })
+        .collect()
+}
+
+#[test]
+fn spec_example_one_fault_over_two_lines() {
+    assert_eq!(
+        spec_positions("  print(\"abc\n\")\n"),
+        vec![(codes::UNTERMINATED_STRING, 2, 9)]
+    );
+}
+
+#[test]
+fn spec_example_two_cut_strings_on_consecutive_lines() {
+    assert_eq!(
+        spec_positions("  let a = \"x\n  let b = \"y\n"),
+        vec![
+            (codes::UNTERMINATED_STRING, 2, 11),
+            (codes::UNTERMINATED_STRING, 3, 11)
+        ]
+    );
+}
+
+#[test]
+fn spec_example_only_the_next_line_is_looked_at() {
+    assert_eq!(
+        spec_positions("  print(\"a\n  b\n  c\")\n"),
+        vec![
+            (codes::UNTERMINATED_STRING, 2, 9),
+            (codes::UNTERMINATED_STRING, 4, 4)
+        ]
+    );
+}
+
+#[test]
+fn spec_example_text_before_the_quote_never_closes() {
+    assert_eq!(
+        spec_positions("  print(\"a\n  b\")\n"),
+        vec![
+            (codes::UNTERMINATED_STRING, 2, 9),
+            (codes::UNTERMINATED_STRING, 3, 4)
+        ]
+    );
+}
+
+#[test]
+fn spec_example_a_complete_string_on_the_next_line_is_not_consumed() {
+    let body = "  let a = \"x\n  \"y\"\n";
+    assert_eq!(
+        spec_positions(body),
+        vec![(codes::UNTERMINATED_STRING, 2, 11)]
+    );
+    let src = format!("fn main()\n{body}");
+    let (tokens, _) = lex(&src);
+    assert!(
+        tokens.iter().any(|t| t.kind == Str),
+        "line 3 must stay a string: {tokens:?}"
+    );
+}
+
+#[test]
+fn spec_example_rest_after_the_quote_continues_the_line() {
+    // SPEC v1.9 12.6 (c), selma #1121: blanks after the quote are separators,
+    // never indentation, so no E0001, E0002 or E0013 can arise there.
+    assert_eq!(
+        spec_positions("  print(\"abc\n\" + x)\n"),
+        vec![(codes::UNTERMINATED_STRING, 2, 9)]
+    );
+    assert_eq!(
+        spec_positions("  print(\"abc\n\"\t\t + x)\n"),
+        vec![(codes::UNTERMINATED_STRING, 2, 9)]
+    );
+}
+
+#[test]
+fn spec_example_a_tab_before_the_quote_keeps_its_e0001() {
+    // SPEC v1.9 12.6 (a), selma #1122: only spaces may stand before the
+    // closing quote; a tab breaks (a) and line 3 is lexed as usual.
+    assert_eq!(
+        spec_positions("  print(\"abc\n\t\")\n"),
+        vec![
+            (codes::UNTERMINATED_STRING, 2, 9),
+            (codes::TAB_INDENT, 3, 1),
+            (codes::UNTERMINATED_STRING, 3, 2)
+        ]
+    );
+}
+
+#[test]
+fn only_spaces_before_the_quote_satisfy_a() {
+    // A tab anywhere in the blanks, or any other blank like character,
+    // breaks (a): the next line keeps its own diagnostics.
+    for body in [
+        "  print(\"abc\n \t\")\n",
+        "  print(\"abc\n\t \")\n",
+        "  print(\"abc\n\u{A0}\")\n",
+        "  print(\"abc\n\u{3000}\")\n",
+        "  print(\"abc\n\u{FEFF}\")\n",
+        "  print(\"abc\n\u{0B}\")\n",
+        "  print(\"abc\n\u{0C}\")\n",
+        "  print(\"abc\n\r\")\n",
+    ] {
+        let found = spec_positions(body);
+        assert!(found.len() >= 2, "{body:?}: {found:?}");
+        assert_eq!(
+            found.first(),
+            Some(&(codes::UNTERMINATED_STRING, 2, 9)),
+            "{body:?}"
+        );
+    }
+}
+
+#[test]
+fn a_byte_order_mark_after_the_quote_prevents_closing() {
+    // (c): the rest is the middle of a line, where U+FEFF is E0008 (D68).
+    // Lexed as a source of its own it would be a skipped byte order mark
+    // and would hide that fault.
+    for body in [
+        "  print(\"abc\n\"\u{FEFF})\n",
+        "  print(\"abc\n\" \u{FEFF})\n",
+        "  print(\"abc\n\"\t\u{FEFF})\n",
+    ] {
+        let found = spec_positions(body);
+        assert_eq!(
+            found.first(),
+            Some(&(codes::UNTERMINATED_STRING, 2, 9)),
+            "{body:?}"
+        );
+        assert_eq!(
+            found
+                .iter()
+                .filter(|d| d.0 == codes::UNTERMINATED_STRING)
+                .count(),
+            2,
+            "line 3 must not close the string: {body:?}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn a_fault_after_the_quote_on_the_next_line_prevents_closing() {
+    // (c): the rest after the quote must lex without any diagnostic. A bidi
+    // control is E0011 anywhere in the source (D53).
+    let src = "f(\"abc\n\")\u{202E}\n";
+    let (_, diags) = crate::lex::lex(src, F);
+    let found: Vec<(Code, u32)> = diags.iter().map(|d| (d.code, d.span.start)).collect();
+    assert_eq!(
+        found,
+        vec![
+            (codes::UNTERMINATED_STRING, 2),
+            (codes::BIDI_CONTROL, 9),
+            (codes::UNTERMINATED_STRING, 7)
+        ]
+    );
+}
+
+#[test]
+fn a_quote_that_is_not_the_cut_one_on_the_next_line_is_not_taken() {
+    // (b): on its own the line `" ""` is cut at its third quote, not its
+    // first, so it does not close the string of the line above.
+    assert_eq!(
+        codes_at("s = \"a\n\" \"\"\n"),
+        vec![
+            (codes::UNTERMINATED_STRING, 4),
+            (codes::UNTERMINATED_STRING, 10)
+        ]
+    );
+}
+
+#[test]
+fn a_complete_string_on_the_next_line_is_not_taken() {
+    // The next line is valid on its own: it is lexed normally.
+    let src = "s = \"abc\nf(\"x\")\n";
+    let (tokens, diags) = lex(src);
+    assert_eq!(diags.len(), 1);
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert_eq!(
+        k,
+        vec![Ident, Eq, Error, Nl, Ident, LParen, Str, RParen, Nl, Eof]
+    );
+}
+
+#[test]
+fn a_quote_in_a_comment_on_the_next_line_is_not_taken() {
+    let src = "s = \"abc\nx // \"\n";
+    let (tokens, diags) = lex(src);
+    assert_eq!(diags.len(), 1);
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert_eq!(k, vec![Ident, Eq, Error, Nl, Ident, Comment, Nl, Eof]);
+}
+
+#[test]
+fn cut_strings_on_every_line_stay_linear() {
+    // Pairs of lines close each other; a line with text before its quote is
+    // its own fault and the line after it closes that one.
+    for (src, n) in [
+        ("\"\n".repeat(200_000), 100_000),
+        ("\"a\nb\"\n".repeat(100_000), 100_001),
+    ] {
+        let (tokens, diags) = lex(&src);
+        assert_eq!(tokens.last().map(|t| t.kind), Some(Eof));
+        assert_eq!(diags.len(), n);
+    }
+}
+
 #[test]
 fn unbalanced_paren_inside_interpolation_does_not_leak() {
     // The `(` inside the string must not join the following lines.
@@ -779,6 +1036,8 @@ macro_rules! golden {
 golden!(lex_tab_indent);
 golden!(lex_odd_indent);
 golden!(lex_unterminated_string);
+golden!(lex_string_line_break_closed_next_line);
+golden!(lex_string_line_break_two_faults);
 golden!(lex_string_in_interpolation);
 golden!(lex_interpolation_too_deep);
 golden!(lex_unexpected_char);

@@ -1,0 +1,17 @@
+// AC-33 (c): a set field rule that mentions only additions.
+// The author may add anyone, everybody may add themselves. Removals are not mentioned,
+// so every removal is denied, also one made by the author, for whom `author == me` is true.
+
+app Tracker
+  auth paseto open
+
+data Project
+  name: Text
+  watchers: Set[User] = {me}
+  check name.len in 1..80
+  see if signed
+  make if watchers == {me}
+  edit watchers if author == me or added == {me}
+
+view Main
+  text "Projects"

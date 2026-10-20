@@ -25,6 +25,59 @@ const FRAME_OVERHEAD: u64 = size_of::<Frame>() as u64;
 /// Heap bytes charged per register.
 const VALUE_BYTES: u64 = size_of::<Value>() as u64;
 
+/// Bytes of work that cost one extra step. An instruction costs one step plus one
+/// step for every started `WORK_BYTES` bytes it reads, writes or copies (text
+/// compared, concatenated or printed, registers initialised by a call), so
+/// the step limit bounds the running time of a program and not only its number of
+/// instructions. Measured on the gate machine (release), 64 bytes of such work take
+/// less time than one plain instruction. Loading a text constant is not weighted:
+/// it copies at most once per constant, so its work is bounded by the source size.
+const WORK_BYTES: u64 = 64;
+
+/// Steps charged for each heap allocation an instruction makes (a text, a frame, an
+/// argument vector), on top of its bytes of work (ARCHITECTURE 3.4, D112, D114). An
+/// allocation takes several times as long as a plain instruction, so without this
+/// surcharge a program made of interpolations ran about four times as long per step
+/// as one made of plain calls.
+const ALLOC_STEPS: u64 = 2;
+
+/// Heap allocations charged to `ToText`: the real allocations of turning a value
+/// into text (ARCHITECTURE 3.4 v1.15, D114).
+const TO_TEXT_ALLOCS: u64 = 3;
+
+/// Heap allocations charged to `Concat`: the real allocations of collecting its
+/// parts and building the text (ARCHITECTURE 3.4 v1.15, D114).
+const CONCAT_ALLOCS: u64 = 3;
+
+/// Heap allocations charged to `Call`: none. A call is the calibration instruction
+/// (the default step limit is measured with a program of calls), so a surcharge on
+/// it would scale the reference as well (ARCHITECTURE 3.4 v1.15, D114). Its bytes of
+/// work and the heap check before a new frame still apply.
+const CALL_ALLOCS: u64 = 0;
+
+/// Work of one instruction beyond a plain instruction, computed before it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Work {
+    /// Bytes read, written or copied.
+    bytes: u64,
+    /// Heap allocations made.
+    allocs: u64,
+}
+
+/// Steps charged for an instruction that does `work`.
+fn step_cost(work: Work) -> u64 {
+    1u64.saturating_add(work.bytes.div_ceil(WORK_BYTES))
+        .saturating_add(work.allocs.saturating_mul(ALLOC_STEPS))
+}
+
+/// UTF 8 bytes of `value` if it is a `Text`, else 0.
+fn text_len(value: &Value) -> u64 {
+    match value {
+        Value::Text(t) => t.text.len() as u64,
+        _ => 0,
+    }
+}
+
 /// Live heap bytes of one run, shared by every value that holds a charge.
 #[derive(Clone)]
 struct Meter(Rc<Cell<u64>>);
@@ -113,6 +166,10 @@ impl Frame {
 
     fn int(&self, index: u32) -> i64 {
         self.regs.get(index as usize).map_or(0, Value::int)
+    }
+
+    fn text_len(&self, index: u32) -> u64 {
+        self.regs.get(index as usize).map_or(0, text_len)
     }
 
     fn boolean(&self, index: u32) -> bool {
@@ -296,6 +353,88 @@ impl<H: Host + ?Sized> Vm<'_, H> {
             .copied()
     }
 
+    /// Heap bytes that are left before `HeapLimit`.
+    fn heap_left(&self) -> u64 {
+        self.limits
+            .max_heap_bytes
+            .saturating_sub(self.meter.0.get())
+    }
+
+    /// Work `op` does beyond a plain instruction when it runs in `cur`, computed
+    /// before it runs. Work that a limit refuses is not counted: an instruction whose
+    /// result would exceed `TextLimit` or the heap that is left is charged only its
+    /// register references, so it fails with `TextLimit` or `HeapLimit` and is not
+    /// reported as `StepLimit` (ARCHITECTURE 3.4, D112).
+    fn work(&self, cur: &Frame, op: &Op) -> Work {
+        let refs = |n: usize| Work {
+            bytes: (n as u64).saturating_mul(VALUE_BYTES),
+            allocs: 0,
+        };
+        match op {
+            // Texts of different length compare without reading their bytes.
+            Op::Equal { lhs, rhs, .. } => {
+                let (la, lb) = (cur.text_len(*lhs), cur.text_len(*rhs));
+                Work {
+                    bytes: if la == lb { la } else { 0 },
+                    allocs: 0,
+                }
+            }
+            Op::ToText { src, .. } => {
+                let len = match cur.regs.get(*src as usize) {
+                    Some(Value::Int(v)) => int_text_len(*v),
+                    Some(Value::Bool(true)) => 4,
+                    Some(Value::Bool(false)) => 5,
+                    _ => 0,
+                };
+                if len.saturating_add(TEXT_OVERHEAD) <= self.heap_left() {
+                    Work {
+                        bytes: 0,
+                        allocs: TO_TEXT_ALLOCS,
+                    }
+                } else {
+                    Work::default()
+                }
+            }
+            Op::Concat { parts, .. } => {
+                let len = parts
+                    .iter()
+                    .fold(0u64, |sum, p| sum.saturating_add(cur.text_len(*p)));
+                let refs = refs(parts.len());
+                if len <= self.limits.max_text_bytes
+                    && len.saturating_add(TEXT_OVERHEAD) <= self.heap_left()
+                {
+                    Work {
+                        bytes: len.saturating_add(refs.bytes),
+                        allocs: CONCAT_ALLOCS,
+                    }
+                } else {
+                    refs
+                }
+            }
+            Op::Print { arg } => Work {
+                bytes: cur.text_len(*arg),
+                allocs: 0,
+            },
+            Op::Call { func, args, .. } => {
+                let locals = self
+                    .code
+                    .funcs
+                    .get(*func as usize)
+                    .map_or(0, |f| f.locals.len() as u64);
+                let regs = locals.saturating_mul(VALUE_BYTES);
+                if regs.saturating_add(FRAME_OVERHEAD) <= self.heap_left() {
+                    Work {
+                        bytes: regs,
+                        allocs: CALL_ALLOCS,
+                    }
+                } else {
+                    refs(args.len())
+                }
+            }
+            _ => Work::default(),
+        }
+    }
+
     /// Runs until `main` returns.
     fn execute(&mut self, mut cur: Frame) -> Result<(), RuntimeError> {
         let code = self.code;
@@ -307,13 +446,16 @@ impl<H: Host + ?Sized> Vm<'_, H> {
             let (Some(op), Some(&span)) = (func.ops.get(pc), func.spans.get(pc)) else {
                 return Ok(());
             };
-            if self.steps >= self.limits.max_steps {
-                return Err(RuntimeError {
-                    kind: RuntimeErrorKind::StepLimit,
-                    span: self.main_call_span().unwrap_or(span),
-                });
+            let cost = step_cost(self.work(&cur, op));
+            match self.steps.checked_add(cost) {
+                Some(total) if total <= self.limits.max_steps => self.steps = total,
+                _ => {
+                    return Err(RuntimeError {
+                        kind: RuntimeErrorKind::StepLimit,
+                        span: self.main_call_span().unwrap_or(span),
+                    });
+                }
             }
-            self.steps += 1;
             cur.pc = cur.pc.wrapping_add(1);
             let error = |kind| RuntimeError { kind, span };
             match op {
@@ -664,11 +806,247 @@ mod tests {
         let image = image(vec![main, a, b, spinner("c", 300)]);
         assert!(image.is_some(), "program compiles");
         let Some(image) = image else { return };
-        // Steps: call a, return in a, call b, then b and c.
+        // Steps: call a, return in a, call b, then b and c. A call has no allocation
+        // surcharge (D114).
         assert_eq!(step_limit_at(&image, 1), Some(20));
-        assert_eq!(step_limit_at(&image, 2), Some(30));
-        for max_steps in [3, 4, 5, 6, 50, 51] {
+        for max_steps in [2, 3, 4, 5, 6, 50, 51] {
             assert_eq!(step_limit_at(&image, max_steps), Some(30), "{max_steps}");
+        }
+    }
+
+    fn bytes(bytes: u64) -> Work {
+        Work { bytes, allocs: 0 }
+    }
+
+    #[test]
+    fn step_cost_charges_each_started_block_of_work() {
+        assert_eq!(step_cost(bytes(0)), 1);
+        assert_eq!(step_cost(bytes(1)), 2);
+        assert_eq!(step_cost(bytes(WORK_BYTES)), 2);
+        assert_eq!(step_cost(bytes(WORK_BYTES + 1)), 3);
+        assert_eq!(step_cost(bytes(16 * 1024 * 1024)), 1 + 262_144);
+        assert_eq!(
+            step_cost(bytes(u64::MAX)),
+            1 + u64::MAX.div_ceil(WORK_BYTES)
+        );
+    }
+
+    #[test]
+    fn step_cost_adds_two_steps_per_allocation() {
+        assert_eq!(ALLOC_STEPS, 2);
+        let work = |bytes, allocs| Work { bytes, allocs };
+        assert_eq!(step_cost(work(0, 1)), 3);
+        assert_eq!(step_cost(work(0, 2)), 5);
+        assert_eq!(step_cost(work(WORK_BYTES + 1, 2)), 7);
+        assert_eq!(step_cost(work(u64::MAX, u64::MAX)), u64::MAX);
+    }
+
+    fn text(dst: u32, value: &str) -> InstKind {
+        InstKind::Const {
+            dst: Local(dst),
+            value: Const::Text(value.to_string()),
+        }
+    }
+
+    fn run_kind(image: &Image, limits: Limits) -> Result<(), RuntimeErrorKind> {
+        let mut host = Capture(Vec::new());
+        crate::run(image, &mut host, limits).map_err(|e| e.kind)
+    }
+
+    #[test]
+    fn interpolation_charges_its_allocations() {
+        // `fn main() { let m = 7; let t = "{m}" }`: the constant costs 1 step, `ToText`
+        // 1 + 6 (three allocations), the one part `Concat` 1 + ceil((1 + 16) / 64) + 6
+        // (three allocations), the return 1: 17 steps in all (D114).
+        let main = func(
+            "main",
+            0,
+            &[Ty::Int, Ty::Text, Ty::Text],
+            0,
+            vec![Block {
+                insts: vec![
+                    at(1, int(0, 7)),
+                    at(
+                        2,
+                        InstKind::ToText {
+                            dst: Local(1),
+                            src: Local(0),
+                        },
+                    ),
+                    at(
+                        3,
+                        InstKind::Concat {
+                            dst: Local(2),
+                            parts: vec![Local(1)],
+                        },
+                    ),
+                ],
+                term: Terminator::Return(None),
+            }],
+        );
+        assert_eq!(VALUE_BYTES, 16, "the count below assumes 16 byte registers");
+        let image = image(vec![main]);
+        assert!(image.is_some(), "program compiles");
+        let Some(image) = image else { return };
+        assert_eq!(step_limit_at(&image, 1), Some(2));
+        assert_eq!(step_limit_at(&image, 7), Some(2));
+        assert_eq!(step_limit_at(&image, 8), Some(3));
+        assert_eq!(step_limit_at(&image, 15), Some(3));
+        // The return carries the span of the last instruction of its block.
+        assert_eq!(step_limit_at(&image, 16), Some(3));
+        let limits = Limits {
+            max_steps: 17,
+            ..Limits::default()
+        };
+        assert_eq!(run_kind(&image, limits), Ok(()));
+    }
+
+    #[test]
+    fn call_has_no_allocation_surcharge() {
+        // `fn main() { a() }`, `fn a() { }`: the call is the calibration instruction
+        // and costs 1 (no registers, no surcharge, D114), return in `a` 1, return in
+        // `main` 1: 3 steps in all.
+        let main = func(
+            "main",
+            0,
+            &[],
+            0,
+            vec![Block {
+                insts: vec![at(5, call(1, &[]))],
+                term: Terminator::Return(None),
+            }],
+        );
+        let a = func(
+            "a",
+            0,
+            &[],
+            100,
+            vec![Block {
+                insts: vec![],
+                term: Terminator::Return(None),
+            }],
+        );
+        let image = image(vec![main, a]);
+        assert!(image.is_some(), "program compiles");
+        let Some(image) = image else { return };
+        assert_eq!(step_limit_at(&image, 1), Some(5));
+        assert_eq!(step_limit_at(&image, 2), Some(5));
+        let limits = Limits {
+            max_steps: 3,
+            ..Limits::default()
+        };
+        assert_eq!(run_kind(&image, limits), Ok(()));
+    }
+
+    #[test]
+    fn concat_refused_by_the_heap_reports_heap_limit() {
+        // `fn main() { let s = "<64 bytes>"; let t = "{s}{s}" }` with a heap that holds
+        // `s` but not `t`. Charged in full, the `Concat` would cost 1 + 3 + 6 steps; it
+        // is charged only its two references (1 + 1), so every step limit that lets it
+        // start reports `HeapLimit` (red #1419 F3).
+        let s = "a".repeat(64);
+        let main = func(
+            "main",
+            0,
+            &[Ty::Text, Ty::Text],
+            0,
+            vec![Block {
+                insts: vec![
+                    at(1, text(0, &s)),
+                    at(
+                        2,
+                        InstKind::Concat {
+                            dst: Local(1),
+                            parts: vec![Local(0), Local(0)],
+                        },
+                    ),
+                ],
+                term: Terminator::Return(None),
+            }],
+        );
+        let image = image(vec![main]);
+        assert!(image.is_some(), "program compiles");
+        let Some(image) = image else { return };
+        let frame = 2 * VALUE_BYTES + FRAME_OVERHEAD;
+        let held = frame + 64 + TEXT_OVERHEAD;
+        let limits = |max_steps| Limits {
+            max_steps,
+            max_heap_bytes: held + 128 + TEXT_OVERHEAD - 1,
+            ..Limits::default()
+        };
+        assert_eq!(
+            run_kind(&image, limits(2)),
+            Err(RuntimeErrorKind::StepLimit)
+        );
+        for max_steps in [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1000] {
+            assert_eq!(
+                run_kind(&image, limits(max_steps)),
+                Err(RuntimeErrorKind::HeapLimit),
+                "{max_steps}"
+            );
+        }
+        // With one byte more the text fits and the full cost applies: 1 + 10 + 1 steps.
+        let fits = Limits {
+            max_heap_bytes: held + 128 + TEXT_OVERHEAD,
+            ..limits(1 + 10 + 1)
+        };
+        assert_eq!(run_kind(&image, fits), Ok(()));
+        assert_eq!(
+            run_kind(
+                &image,
+                Limits {
+                    max_steps: 11,
+                    ..fits
+                }
+            ),
+            Err(RuntimeErrorKind::StepLimit)
+        );
+    }
+
+    #[test]
+    fn call_refused_by_the_heap_reports_heap_limit() {
+        // `fn main() { big() }` where the frame of `big` (200 registers) does not fit
+        // the heap. Charged in full, the call would cost 1 + 50 steps (its registers,
+        // no allocation surcharge, D114); it is charged only its references (none),
+        // so every step limit that lets it start reports `HeapLimit`.
+        let main = func(
+            "main",
+            0,
+            &[],
+            0,
+            vec![Block {
+                insts: vec![at(5, call(1, &[]))],
+                term: Terminator::Return(None),
+            }],
+        );
+        let big = func(
+            "big",
+            0,
+            &[Ty::Int; 200],
+            100,
+            vec![Block {
+                insts: vec![],
+                term: Terminator::Return(None),
+            }],
+        );
+        let image = image(vec![main, big]);
+        assert!(image.is_some(), "program compiles");
+        let Some(image) = image else { return };
+        let limits = |max_steps| Limits {
+            max_steps,
+            max_heap_bytes: FRAME_OVERHEAD + 200 * VALUE_BYTES + FRAME_OVERHEAD - 1,
+            ..Limits::default()
+        };
+        assert_eq!(
+            run_kind(&image, limits(0)),
+            Err(RuntimeErrorKind::StepLimit)
+        );
+        for max_steps in [1, 2, 5, 49, 50, 51, 52, 1000] {
+            assert_eq!(
+                run_kind(&image, limits(max_steps)),
+                Err(RuntimeErrorKind::HeapLimit),
+                "{max_steps}"
+            );
         }
     }
 

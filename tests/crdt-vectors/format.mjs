@@ -5,7 +5,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { encode } from '../../runtime/js/crdt/canon/canon.mjs';
+import { compareKey } from '../../runtime/js/crdt/canon/canon.mjs';
 
 export const VECTOR_ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -113,11 +113,20 @@ function checkExpect(expect) {
 
 // The server log delivers a set remove only after the adds it names (ARCHITECTURE 6.2), and
 // there are no tag tombstones, so a vector may not deliver a named add after its remove.
+// A make (D107) tags each of its initial elements with its own id, like one add per element.
 function checkSetCausality(ops, deliveries) {
   const indexById = new Map(ops.map((entry, index) => [entry.id, index]));
+  let makeIndex;
   ops.forEach(({ op }, index) => {
-    if (!('add' in op) && !('remove' in op)) {
-      throw new Error(`ops[${index}] is neither add nor remove`);
+    const shape = Object.keys(op).sort().join();
+    if (shape !== 'add' && shape !== 'make' && shape !== 'remove,tags') {
+      const shapes = '{ "add": e } or { "make": [e, ...] } or { "remove": e, "tags": [...] }';
+      throw new Error(`ops[${index}] must be ${shapes}`);
+    }
+    if ('make' in op) {
+      checkMake(op.make, index, makeIndex);
+      makeIndex = index;
+      return;
     }
     if (!('remove' in op)) return;
     if (!Array.isArray(op.tags) || op.tags.length === 0) {
@@ -129,9 +138,17 @@ function checkSetCausality(ops, deliveries) {
     for (const tag of op.tags) {
       const added = indexById.get(tag);
       if (added === undefined) continue; // a tag the replica never saw is ignored
-      if (encode(ops[added].op.add) !== encode(op.remove)) {
-        throw new Error(`ops[${index}] names tag ${tag}, which does not add the removed element`);
+      // A tag is the OpId of an add or a make. Naming a remove (or the remove itself) is an
+      // authoring error in the vector, not a tag a replica could hold, so it is refused.
+      const named = ops[added].op;
+      if (!('add' in named) && !('make' in named)) {
+        const which = `which is the id of the remove ops[${added}]`;
+        throw new Error(`ops[${index}] names tag ${tag}, ${which}`);
       }
+      // A tag counts only for the element it was created for (D96): a tag of another element,
+      // also a make tag of another initial element, is ignored like an unknown one, so its op
+      // may also come later or again.
+      if (!tagsElement(named, op.remove)) continue;
       deliveries.forEach((order, number) => {
         if (order.lastIndexOf(added) > order.indexOf(index)) {
           const late = `ops[${added}] after its remove ops[${index}]`;
@@ -140,6 +157,27 @@ function checkSetCausality(ops, deliveries) {
       });
     }
   });
+}
+
+// One make per vector (the vector is one row), its elements pairwise different by wire value
+// (compareKey, D61); an empty list is allowed (D107).
+function checkMake(elements, index, earlier) {
+  if (earlier !== undefined) {
+    throw new Error(`ops[${index}] is a second make after ops[${earlier}], a vector has one`);
+  }
+  if (!Array.isArray(elements)) throw new Error(`ops[${index}]: make takes an array of elements`);
+  elements.forEach((element, position) => {
+    const same = elements.findIndex((other) => compareKey(other, element) === 0);
+    if (same !== position) {
+      throw new Error(`ops[${index}]: make lists element ${position} twice (also at ${same})`);
+    }
+  });
+}
+
+// Whether the add or make `op` created a tag for `element`.
+function tagsElement(op, element) {
+  if ('add' in op) return compareKey(op.add, element) === 0;
+  return op.make.some((initial) => compareKey(initial, element) === 0);
 }
 
 // A rank op writes the key of one row: `{ "set": [row, key] }` with a RowId and a valid key.

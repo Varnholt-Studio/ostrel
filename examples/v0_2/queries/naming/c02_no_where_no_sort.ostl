@@ -1,0 +1,17 @@
+// Case C-02 (EXPECTED.md 4): a local named like a field, but the query has no where and no sort.
+app Naming
+
+data Slot
+  at: Int
+  see if true
+
+data Post
+  text: Text
+  pos: Int
+  see if true
+
+view Main
+  col
+    for pos in Slot sort at
+      for p in Post
+        text p.text

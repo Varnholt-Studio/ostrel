@@ -457,7 +457,10 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         self.pos = end;
         match stop {
             TextStop::Quote => return self.push(TokenKind::Str, quote, end),
-            TextStop::LineEnd => return self.unterminated(quote, first_token),
+            TextStop::LineEnd => {
+                let open = self.open;
+                return self.cut_text(quote, first_token, open);
+            }
             TextStop::Brace => self.push(TokenKind::StrHead, quote, end),
         }
         let mut depth: u32 = 1;
@@ -506,7 +509,7 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
                         }
                         TextStop::Brace => self.push(TokenKind::StrMid, piece, end),
                         TextStop::LineEnd => {
-                            return self.unterminated_in(quote, first_token, open_before);
+                            return self.cut_text(quote, first_token, open_before);
                         }
                     }
                 }
@@ -538,11 +541,83 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         }
     }
 
-    /// E0003 for a string whose text ran into a line end before any
-    /// interpolation.
-    fn unterminated(&mut self, quote: usize, first_token: usize) {
-        let open = self.open;
-        self.unterminated_in(quote, first_token, open);
+    /// E0003 for a string whose text (not the code of an interpolation) ran
+    /// into a line end or the end of the input.
+    ///
+    /// A string cut by a line end is often meant to span two lines, and the
+    /// quote that was meant to close it then opens a new string on the next
+    /// line. Both are one fault (SPEC 12.1), so under SPEC 12.6 ("Recovery
+    /// after a line end in a string") the next physical line closes the cut
+    /// string only when all of these hold:
+    ///
+    /// * (a) its first character after leading spaces (U+0020 only) is `"`;
+    ///   a tab or any other character before it breaks (a), so a tab in the
+    ///   indentation keeps its E0001,
+    /// * (b) lexed on its own, the line reports E0003 at exactly that quote,
+    /// * (c) the text after that quote, lexed as the continuation of a line
+    ///   (after a token, never as a line start), gives no diagnostic.
+    ///
+    /// Then the string is one `Error` token from its opening quote through that
+    /// closing quote, the line end inside it does not end the logical line,
+    /// and lexing goes on after the quote with the brackets that were open
+    /// before the string. Only the directly following line is looked at. In
+    /// every other case only the line that holds the opening quote belongs to
+    /// the string, and the next line is lexed as usual, so a second real fault
+    /// there keeps its own E0003.
+    fn cut_text(&mut self, quote: usize, first_token: usize, open_before: u32) {
+        let Some(close) = self.closing_quote_on_next_line() else {
+            return self.unterminated_in(quote, first_token, open_before);
+        };
+        self.error(
+            codes::UNTERMINATED_STRING,
+            quote,
+            quote + 1,
+            codes::MSG_UNTERMINATED_STRING,
+        );
+        self.pos = close;
+        self.collapse(quote, first_token, open_before);
+    }
+
+    /// The offset just after the quote that closes a string cut at the line
+    /// end at `self.pos`, if the next line qualifies under [`Self::cut_text`].
+    fn closing_quote_on_next_line(&self) -> Option<usize> {
+        let rest = self.src.get(self.pos..)?;
+        let start = self.pos
+            + if rest.starts_with('\n') {
+                1
+            } else if rest.starts_with("\r\n") {
+                2
+            } else {
+                return None;
+            };
+        let line_end = self.line_end_from(start);
+        let line = self.src.get(start..line_end)?;
+        // (a) Nothing but spaces before the quote. A tab there is a real fault
+        // (E0001) that recovery must not hide.
+        let blank = line.len() - line.trim_start_matches(' ').len();
+        if line.as_bytes().get(blank) != Some(&b'"') {
+            return None;
+        }
+        // (b) On its own the line is cut at exactly this quote.
+        let at = u32::try_from(blank).ok()?;
+        let (_, line_diags) = lex_with(line, self.file, self.literals);
+        let cut_here = line_diags
+            .iter()
+            .any(|d| d.code == codes::UNTERMINATED_STRING && d.span.start == at);
+        if !cut_here {
+            return None;
+        }
+        // (c) The rest of the line is clean as the continuation of a line. It
+        // is lexed after a placeholder token, so it is never a line start:
+        // its blanks are separators, not indentation, and a U+FEFF at its
+        // start is E0008 as anywhere in code, not a skipped byte order mark.
+        let after = line.get(blank + 1..)?;
+        let continued = format!("x {after}");
+        let (_, rest_diags) = lex_with(&continued, self.file, self.literals);
+        if !rest_diags.is_empty() {
+            return None;
+        }
+        Some(start + blank + 1)
     }
 
     /// E0003: replaces every token of the string with one `Error` token from

@@ -1,0 +1,21 @@
+case: b_rule_runtime_error
+ac: AC-33 (b)
+kind: ops
+compile: ostrel check exits 0 with no diagnostic
+principals: alice (development identity, debug build, AC-12)
+given: no Event rows
+steps:
+  1. alice sends make Event { name: "Fifty", seats: 50 }
+     rule: not (1000 / 50 < 10) = not (20 < 10) = true
+     expect: Ack; one Event row "Fifty" exists
+  2. alice sends make Event { name: "Zero", seats: 0 }
+     rule: 1000 / 0 raises DivisionByZero
+     expect: Reject Denied (not Invalid: no `check` covers seats, ARCHITECTURE 5.5 step 8)
+     db: identical to the state after step 1; no row "Zero", no op log entry for it
+  3. alice sends make Event { name: "Huge", seats: 200 }
+     rule: not (1000 / 200 < 10) = not (5 < 10) = false
+     expect: Reject Denied
+     db: identical to the state after step 1
+final db: exactly one Event row, "Fifty" with seats 50
+must not: step 2 accepted, which is what an evaluator that reads the failed division as
+  `false` would do; a server error, a closed connection or any other reason code than Denied
