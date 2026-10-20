@@ -22,6 +22,8 @@ to this directory says otherwise. `examples/v0_1/` holds only programs that exit
    least one case. `HeapLimit` is covered by the hostile corpus, not here (SPEC 5.0 AC-52).
 5. No case depends on the exact `StepLimit` boundary (SPEC 12.4): one case is far beyond the
    default limit, one uses a small `--max-steps` value.
+6. `OutputLimit` has no case here: its expected stdout would hold 256 MiB. It is covered by the
+   test `ac_52_output_limit` in `crates/ostrel_cli/tests/output_limit.rs` (SPEC 12.4, D113).
 
 ## Cases
 
@@ -48,6 +50,7 @@ to this directory says otherwise. `examples/v0_1/` holds only programs that exit
 | StepLimit | `` program exceeded its step limit; raise it with `--max-steps` `` |
 | TextLimit | `` `Text` value would be longer than 16777216 bytes `` |
 | HeapLimit | `VM heap would grow beyond 268435456 bytes` (no golden, see rule 4) |
+| OutputLimit | `program output would exceed 268435456 bytes` (no golden, see rule 6) |
 
 ## Binding rules (D83, ARCHITECTURE v1.8 3.4)
 
@@ -60,7 +63,8 @@ The message texts and positions above are fixed by D83 (answer to #821, Refs #16
   fails: for a binary operator the start of its left operand. `TextLimit` is reported at the
   start of the expression that would produce the text, for an interpolated string its opening
   quote. `CallDepth` is reported at the start of the call expression that would create frame
-  10 001 (SPEC 12.4).
+  10 001 (SPEC 12.4). `OutputLimit` is reported at the start of the `print` call that would
+  exceed the limit (D113).
 * `StepLimit` is reported at the start of the call expression in `fn main` that is running when
   the limit is reached (at the failing instruction only when `main` itself is the running
   frame). This position does not depend on the exact boundary, as SPEC 12.4 requires.

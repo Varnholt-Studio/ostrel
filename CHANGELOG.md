@@ -4,6 +4,16 @@ All notable changes are documented here.
 
 ## Unreleased
 
+### Added
+
+- `ostrel run` bounds the output of a program: `print` writes at most 268 435 456 bytes (256 MiB)
+  in one run, the newline of each line included. A `print` that would go beyond this writes
+  nothing, not even part of its line, and the program stops with the new runtime error kind
+  `OutputLimit` (`program output would exceed 268435456 bytes`), reported at the `print` call.
+  Output printed before stays on stdout and the exit code is 1. The limit is fixed and has no
+  flag. The step check comes first: a `print` refused by `OutputLimit` costs one step, and
+  reports `StepLimit` instead if that step already exceeds the step limit.
+
 ### Changed
 
 - The step limit of `ostrel run` now counts weighted work instead of executed instructions. An
