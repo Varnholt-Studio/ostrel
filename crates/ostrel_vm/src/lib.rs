@@ -36,7 +36,10 @@ pub trait Host {
 /// allocation it guards, so exceeding one is a [`RuntimeError`], never an abort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// Maximum number of executed instructions (`StepLimit`, flag `--max-steps`).
+    /// Maximum number of steps (`StepLimit`, flag `--max-steps`). An instruction
+    /// costs one step plus one step for every started 64 bytes of text or registers
+    /// it handles, so the limit bounds the running time, not only the instruction
+    /// count.
     pub max_steps: u64,
     /// Maximum number of frames held at once; `main` is frame 1 (`CallDepth`).
     pub max_frames: u32,
@@ -67,7 +70,7 @@ pub enum RuntimeErrorKind {
     DivisionByZero,
     /// A call would create more frames than [`Limits::max_frames`].
     CallDepth,
-    /// More instructions than [`Limits::max_steps`].
+    /// More steps than [`Limits::max_steps`].
     StepLimit,
     /// An allocation would grow the heap beyond [`Limits::max_heap_bytes`].
     HeapLimit,

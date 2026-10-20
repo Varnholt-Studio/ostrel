@@ -1,0 +1,24 @@
+// AC-33 (e): `limit n` and `last n` count only rows the principal may read.
+// The `see` rule is applied before the limit, never as a filter after it.
+
+app Notes
+  auth paseto open
+
+data Note
+  pos: Int
+  body: Text
+  shared: Bool
+  check body.len in 1..200
+  see if shared or author == me
+  make if signed
+
+view Main
+  row
+    col
+      text "first"
+      for n in Note sort pos limit 3
+        text n.body
+    col
+      text "last"
+      for n in Note sort pos last 3
+        text n.body

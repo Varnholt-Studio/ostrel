@@ -116,8 +116,9 @@ function checkExpect(expect) {
 function checkSetCausality(ops, deliveries) {
   const indexById = new Map(ops.map((entry, index) => [entry.id, index]));
   ops.forEach(({ op }, index) => {
-    if (!('add' in op) && !('remove' in op)) {
-      throw new Error(`ops[${index}] is neither add nor remove`);
+    const shape = Object.keys(op).sort().join();
+    if (shape !== 'add' && shape !== 'remove,tags') {
+      throw new Error(`ops[${index}] must be { "add": e } or { "remove": e, "tags": [...] }`);
     }
     if (!('remove' in op)) return;
     if (!Array.isArray(op.tags) || op.tags.length === 0) {
@@ -129,9 +130,15 @@ function checkSetCausality(ops, deliveries) {
     for (const tag of op.tags) {
       const added = indexById.get(tag);
       if (added === undefined) continue; // a tag the replica never saw is ignored
-      if (encode(ops[added].op.add) !== encode(op.remove)) {
-        throw new Error(`ops[${index}] names tag ${tag}, which does not add the removed element`);
+      // A tag is the OpId of an add. Naming a remove (or the remove itself) is an authoring
+      // error in the vector, not a tag a replica could hold, so it is refused, not ignored.
+      if (!('add' in ops[added].op)) {
+        const named = `which is the id of the remove ops[${added}]`;
+        throw new Error(`ops[${index}] names tag ${tag}, ${named}`);
       }
+      // A tag that adds another element is ignored like an unknown one (D96), so its add may
+      // also come later or again.
+      if (encode(ops[added].op.add) !== encode(op.remove)) continue;
       deliveries.forEach((order, number) => {
         if (order.lastIndexOf(added) > order.indexOf(index)) {
           const late = `ops[${added}] after its remove ops[${index}]`;
