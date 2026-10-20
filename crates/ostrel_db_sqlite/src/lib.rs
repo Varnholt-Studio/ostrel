@@ -21,15 +21,14 @@
 //! are stored schema free in adapter tables (`store` module), every value in an exact stored
 //! form and every `Set` element and `Map` key also as an order key whose byte order is
 //! [`ostrel_db::api::compare_key`] (D61). Filters, sort and cursor are evaluated by the driver in
-//! Rust over the live rows of the queried model (`eval` module), with the same rules as the in
-//! memory driver; the translation to SQL comes with the per model tables. Ids, stamps and the op
+//! Rust over the live rows of the queried model by [`ostrel_db::eval`], shared with the in
+//! memory driver (D129); the translation to SQL comes with the per model tables. Ids, stamps and the op
 //! log follow docs/db-mapping.md 2.3 and 4.
 //!
 //! The driver is blocking: every future is ready when first polled. ARCHITECTURE 4.1 runs
 //! blocking drivers on the blocking pool of the server.
 
 mod codec;
-mod eval;
 mod store;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -324,7 +323,7 @@ impl<'c> Transaction<'c> for SqliteTransaction<'c> {
             self.atomic(|conn, enums| {
                 // All checks run before the first write.
                 check_writes(w)?;
-                store::check_enums(enums, w)?;
+                ostrel_db::eval::check_enums(enums, w)?;
                 store::check_storable(w)?;
                 w.iter().try_for_each(|w| store::apply_write(conn, w))
             })

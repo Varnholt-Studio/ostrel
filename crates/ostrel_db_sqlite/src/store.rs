@@ -20,7 +20,7 @@ use ostrel_db::api::{
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
 
 use crate::codec::{self, Corrupt};
-use crate::eval::{self, Lookup, Stored};
+use ostrel_db::eval::{self, LiveRow, Lookup};
 
 /// Value of `PRAGMA user_version` for this layout. A file of layout 1 is brought to this
 /// layout on connect; a file with any other non zero value was written by something else and is
@@ -295,14 +295,14 @@ fn each_row(
     Ok(())
 }
 
-fn row_of(rows: &mut BTreeMap<RowId, Stored>, id: RowId) -> Result<&mut Stored, DbError> {
+fn row_of(rows: &mut BTreeMap<RowId, LiveRow>, id: RowId) -> Result<&mut LiveRow, DbError> {
     rows.get_mut(&id).ok_or(corrupt(Corrupt))
 }
 
 /// Live rows with their fields and collections, in id order.
-fn load(conn: &Connection, which: Which) -> Result<BTreeMap<RowId, Stored>, DbError> {
+fn load(conn: &Connection, which: Which) -> Result<BTreeMap<RowId, LiveRow>, DbError> {
     let cond = which.clause();
-    let mut out: BTreeMap<RowId, Stored> = BTreeMap::new();
+    let mut out: BTreeMap<RowId, LiveRow> = BTreeMap::new();
     let id_at = |r: &rusqlite::Row<'_>| -> Result<RowId, DbError> {
         codec::row_id_from(&get::<Vec<u8>>(r, 0)?).map_err(corrupt)
     };
@@ -315,7 +315,7 @@ fn load(conn: &Connection, which: Which) -> Result<BTreeMap<RowId, Stored>, DbEr
         |r| {
             out.insert(
                 id_at(r)?,
-                Stored {
+                LiveRow {
                     model: to_u32(get(r, 1)?)?,
                     version: to_u64(get(r, 2)?)?,
                     fields: BTreeMap::new(),
@@ -410,11 +410,11 @@ fn load(conn: &Connection, which: Which) -> Result<BTreeMap<RowId, Stored>, DbEr
 /// Rows read through hops, each loaded at most once per query.
 struct Rows<'c> {
     conn: &'c Connection,
-    cache: RefCell<HashMap<RowId, Option<Rc<Stored>>>>,
+    cache: RefCell<HashMap<RowId, Option<Rc<LiveRow>>>>,
 }
 
 impl Lookup for Rows<'_> {
-    fn live(&self, id: RowId) -> Result<Option<Rc<Stored>>, DbError> {
+    fn live(&self, id: RowId) -> Result<Option<Rc<LiveRow>>, DbError> {
         if let Some(hit) = self.cache.borrow().get(&id) {
             return Ok(hit.clone());
         }
@@ -424,14 +424,15 @@ impl Lookup for Rows<'_> {
     }
 }
 
-/// Runs a query on what `conn` sees. [`ostrel_db::api::Query::check`] runs first.
+/// Runs a query on what `conn` sees. [`ostrel_db::api::Query::check`] runs first, before any
+/// row is loaded.
 pub fn query(
     conn: &Connection,
     enums: &[EnumColumn],
     q: &ostrel_db::api::Query,
 ) -> Result<ostrel_db::api::Rows, DbError> {
     q.check(enums)?;
-    let rows: Vec<(RowId, Rc<Stored>)> = load(conn, Which::Model(q.model))?
+    let rows: Vec<(RowId, Rc<LiveRow>)> = load(conn, Which::Model(q.model))?
         .into_iter()
         .map(|(id, r)| (id, Rc::new(r)))
         .collect();
@@ -457,45 +458,6 @@ fn stored(v: &Value) -> Result<Vec<u8>, DbError> {
 
 fn key(v: &Value) -> Result<Vec<u8>, DbError> {
     codec::order_key(v).ok_or(DbError::Invalid("value nested too deeply"))
-}
-
-/// Refuses values of enum columns, and of `Map` fields whose values are enums, that are not
-/// declared variants (contract rules in `ostrel_db::api`). `Set` elements and `Map` keys are
-/// not checked (D87).
-pub fn check_enums(enums: &[EnumColumn], writes: &[Write]) -> Result<(), DbError> {
-    let declared = |model: ModelId, f: FieldId, v: &Value| match eval::variants(enums, model, f) {
-        Some(vs) if *v != Value::Null => eval::ordinal(vs, v).is_some(),
-        _ => true,
-    };
-    for w in writes {
-        let (Write::Insert {
-            model,
-            fields,
-            collections,
-            ..
-        }
-        | Write::Update {
-            model,
-            fields,
-            collections,
-            ..
-        }) = w
-        else {
-            continue;
-        };
-        let bad_field = fields.iter().any(|(f, v)| !declared(*model, *f, v));
-        let bad_value = collections.iter().any(|(f, c)| match c {
-            CollectionChange::Map(entries) => entries
-                .iter()
-                .filter_map(|e| e.value.as_ref())
-                .any(|v| !declared(*model, *f, v)),
-            CollectionChange::Set(_) => false,
-        });
-        if bad_field || bad_value {
-            return Err(DbError::Invalid("enum value is not a declared variant"));
-        }
-    }
-    Ok(())
 }
 
 /// Refuses values this driver cannot store (nesting beyond [`codec::MAX_DEPTH`]) before the
@@ -543,7 +505,7 @@ pub fn check_storable(writes: &[Write]) -> Result<(), DbError> {
 }
 
 /// Applies one write. The caller runs it inside a savepoint and has run `check_writes`,
-/// [`check_enums`] and [`check_storable`] on the batch.
+/// [`eval::check_enums`] and [`check_storable`] on the batch.
 pub fn apply_write(conn: &Connection, w: &Write) -> Result<(), DbError> {
     match w {
         Write::Insert {
