@@ -10,11 +10,17 @@
 //!   inside one top level call of `main`, neither does the position.
 //! * Exit codes are 0, 1 or 2 only; 70 and 101 are always defects (D84).
 //!
-//! Assumption (open spec question, see the task): a value that is not a
-//! decimal whole number of at least 1 (zero, negative, signed, non numeric,
-//! above `u64::MAX`) or a missing value is a usage error with exit code 2, and
-//! the program is not run. No test depends on the exact step boundary
-//! (SPEC 12.4): every limit used is far below or far above the steps needed.
+//! * Accepted values (SPEC 12.4): one or more ASCII digits with a value from 1
+//!   to `u64::MAX`, leading zeros allowed. Every other value (zero, negative,
+//!   signed, non numeric, above `u64::MAX`) and a missing value is a usage
+//!   error with exit code 2, and the program is not run. Given more than once,
+//!   the last occurrence counts.
+//!
+//! The usage error checks below pin the stderr of the CLI as it is (one
+//! `ostrel: ` line, then the usage text). SPEC 12.4 says "one line on stderr";
+//! whether the usage text is part of that line is an open spec question.
+//! No test depends on the exact step boundary (SPEC 12.4): every limit used is
+//! far below or far above the steps needed.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -285,4 +291,123 @@ fn ac_52_max_steps_non_utf8_value_is_a_usage_error() {
         OsStr::new(&file),
     ]);
     assert_usage_error(&out, "non UTF-8 value");
+}
+
+#[test]
+fn ac_52_max_steps_leading_zeros_are_allowed() {
+    let file = source_file("leading_zeros", PRINT_ONLY);
+    // `0001` is 1: the first print is stopped.
+    for args in [
+        &["run", "--max-steps", "0001", &file][..],
+        &["run", "--max-steps=0001", &file][..],
+    ] {
+        let out = ostrel(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: nothing may be printed");
+        let err = text(&out.stderr);
+        assert!(
+            err.ends_with(&format!(": {STEP_LIMIT_MESSAGE}\n")),
+            "{args:?}: {err}"
+        );
+    }
+    // `u64::MAX` written with leading zeros is still in range.
+    let padded = format!("000000000000000000000{}", u64::MAX);
+    for args in [
+        vec![
+            "run".to_string(),
+            "--max-steps".to_string(),
+            padded.clone(),
+            file.clone(),
+        ],
+        vec![
+            "run".to_string(),
+            format!("--max-steps={padded}"),
+            file.clone(),
+        ],
+    ] {
+        let out = ostrel(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(text(&out.stdout), "a\n", "{args:?}");
+        assert!(out.stderr.is_empty(), "{args:?}: {}", text(&out.stderr));
+    }
+}
+
+#[test]
+fn ac_52_max_steps_given_twice_the_last_counts() {
+    let file = source_file("repeated", PRINT_ONLY);
+    let max = u64::MAX.to_string();
+    // Last value `u64::MAX`: the program runs to the end.
+    for args in [
+        vec![
+            "run".to_string(),
+            "--max-steps".to_string(),
+            "1".to_string(),
+            "--max-steps".to_string(),
+            max.clone(),
+            file.clone(),
+        ],
+        vec![
+            "run".to_string(),
+            "--max-steps=1".to_string(),
+            format!("--max-steps={max}"),
+            file.clone(),
+        ],
+        vec![
+            "run".to_string(),
+            "--max-steps=1".to_string(),
+            file.clone(),
+            "--max-steps".to_string(),
+            max.clone(),
+        ],
+    ] {
+        let out = ostrel(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(text(&out.stdout), "a\n", "{args:?}");
+        assert!(out.stderr.is_empty(), "{args:?}: {}", text(&out.stderr));
+    }
+    // Last value 1: the first print is stopped.
+    for args in [
+        vec![
+            "run".to_string(),
+            "--max-steps".to_string(),
+            max.clone(),
+            "--max-steps".to_string(),
+            "1".to_string(),
+            file.clone(),
+        ],
+        vec![
+            "run".to_string(),
+            format!("--max-steps={max}"),
+            "--max-steps=1".to_string(),
+            file.clone(),
+        ],
+        vec![
+            "run".to_string(),
+            "--max-steps".to_string(),
+            max.clone(),
+            file.clone(),
+            "--max-steps=1".to_string(),
+        ],
+    ] {
+        let out = ostrel(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: nothing may be printed");
+        let err = text(&out.stderr);
+        assert!(err.starts_with(&format!("{file}:2:")), "{args:?}: {err}");
+        assert!(
+            err.ends_with(&format!(": {STEP_LIMIT_MESSAGE}\n")),
+            "{args:?}: {err}"
+        );
+        assert_eq!(err.lines().count(), 1, "{args:?}: {err}");
+    }
 }
