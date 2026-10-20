@@ -28,45 +28,13 @@
 //! here.
 
 use ostrel_core::canon::{encode, encode_object, encode_str};
-use ostrel_core::ids::{Hlc, OpId, RowId};
+use ostrel_core::ids::OpId;
 
 use super::frame::{Fields, array, hex, hlc, op_id, row_id, string};
 use super::json::Json;
-use super::value::{ValueFault, WireTy, read_value};
+use super::value::{WireTy, read_value};
 use super::{WireError, WireSchema, clip};
-use crate::protocol::{FieldId, LIMITS, ModelId, Op, OpBody};
-
-/// An op read from a frame.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DecodedOp {
-    Valid(Op),
-    /// Well formed but not valid for the schema; the server answers `Reject Invalid`.
-    Invalid {
-        id: OpId,
-        hlc: Hlc,
-        row: RowId,
-        fault: OpFault,
-    },
-}
-
-/// Why a well formed op is [`DecodedOp::Invalid`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OpFault {
-    /// The schema has no model of this name (cut to [`super::MAX_ECHO_BYTES`]).
-    UnknownModel(String),
-    /// The model has no field of this name (cut to [`super::MAX_ECHO_BYTES`]).
-    UnknownField(String),
-    /// A value of this field does not fit its type.
-    Value { field: FieldId, fault: ValueFault },
-    /// The body does not suit the type of the field, for example `add` on a `Text` field or
-    /// `set` on a `Set` field.
-    WrongBody { field: FieldId },
-    /// A `remove` names no tag, more than [`LIMITS`]`.tags_per_remove` tags, or a tag that is
-    /// not an op id.
-    Tags { field: FieldId },
-    /// The canonical encoding of the op is over [`LIMITS`]`.op_bytes` (D109).
-    TooLarge { bytes: usize },
-}
+use crate::protocol::{DecodedOp, FieldId, LIMITS, ModelId, Op, OpBody, OpFault};
 
 /// Reads one element of an `ops` array.
 pub fn decode_op(json: Json, schema: &dyn WireSchema) -> Result<DecodedOp, WireError> {

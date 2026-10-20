@@ -3,7 +3,8 @@
 //! [`decode_client`] and [`decode_server`] turn one received WebSocket frame into a message of
 //! [`crate::protocol`]; [`encode_client`] and [`encode_server`] write one. Both sides use the
 //! same functions: the server decodes client frames and encodes server frames, the client the
-//! other way round.
+//! other way round. All four take the same [`WireSchema`], because models and fields travel by
+//! name while the messages in memory hold [`ModelId`] and [`FieldId`] (D135).
 //!
 //! # Frame form
 //!
@@ -38,14 +39,16 @@
 //! [`encode_op`] read and write one op in the form of ARCHITECTURE 5.4, and [`op_bytes`] measures
 //! it for the limit of D109.
 //!
+//! A client `ops` frame is `{"ops": [op, ...]}`. An op that is well formed but does not fit the
+//! schema becomes a [`DecodedOp::Invalid`] of [`crate::protocol`] and leaves the rest of the
+//! batch alone; `evict` names its model. The fault types live in [`crate::protocol`], because
+//! the server reads them in step 6 of ARCHITECTURE 5.5; this module only builds them (D135).
+//!
 //! # Not yet covered
 //!
-//! The messages that carry values, queries or rows (`subscribe`, `ops` in both directions,
-//! `call`, `snapshot`, `return`) still give [`WireError::Unsupported`] at the frame level, and
-//! `evict` still carries its model as a number. They need changes of
-//! [`crate::protocol`] that are not part of this codec: a client `ops` message must be able to
-//! hold a [`DecodedOp::Invalid`], and `evict` names its model. Queries, rows and function
-//! signatures follow with those messages.
+//! The messages that carry queries, rows, server ops or call values (`subscribe`, `ops` from
+//! the server, `call`, `snapshot`, `return`) still give [`WireError::Unsupported`] at the frame
+//! level. Queries, rows and function signatures follow with those messages.
 
 pub mod json;
 
@@ -57,15 +60,15 @@ use std::fmt;
 
 use ostrel_core::ids::InvalidId;
 
-use crate::protocol::{ErrorCode, FieldId, ModelId};
+use crate::protocol::{ErrorCode, FieldId, ModelId, OpId};
 
 pub use frame::{decode_client, decode_server, encode_client, encode_server};
 pub use json::MAX_DEPTH;
-pub use op::{DecodedOp, OpFault, decode_op, encode_op, op_bytes};
-pub use value::{ValueFault, WireTy, read_value};
+pub use op::{decode_op, encode_op, op_bytes};
+pub use value::{WireTy, read_value};
 
 #[cfg(doc)]
-use crate::protocol::PROTOCOL_VERSION;
+use crate::protocol::{DecodedOp, PROTOCOL_VERSION};
 
 /// The names and wire types of the compiled schema, as the codec needs them (D132).
 ///
@@ -123,9 +126,16 @@ pub enum WireError {
     InvalidId(&'static str, InvalidId),
     /// A known message this codec cannot read or write yet (module documentation).
     Unsupported(&'static str),
+    /// A server message names a model the receiver's schema does not have (cut to
+    /// [`MAX_ECHO_BYTES`]). Client and server share one compiled schema, so this is a fatal
+    /// mismatch; an unknown model in a client op only makes that op invalid.
+    UnknownModel(String),
     /// Writing: the schema does not know this kind of id (`"model"` or `"field"`). A defect
     /// of the caller, never caused by a peer.
     NotInSchema(&'static str),
+    /// Writing: a [`DecodedOp::Invalid`] with this op id. Such an op exists only on the
+    /// receiving side and is never sent (D135). A defect of the caller.
+    InvalidOp(OpId),
 }
 
 impl WireError {
@@ -159,7 +169,11 @@ impl fmt::Display for WireError {
             WireError::Unsupported(name) => {
                 write!(f, "message {name:?} is not supported by this codec yet")
             }
+            WireError::UnknownModel(name) => write!(f, "unknown model {name:?}"),
             WireError::NotInSchema(kind) => write!(f, "{kind} id is not in the schema"),
+            WireError::InvalidOp(id) => {
+                write!(f, "op {} is invalid and cannot be sent", id.to_hex())
+            }
         }
     }
 }

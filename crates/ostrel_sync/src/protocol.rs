@@ -69,8 +69,10 @@ pub enum ClientMsg {
     },
     /// A batch of local ops in `seq` order of the replica. A batch over [`Limits::ops_per_batch`]
     /// gets one `Reject Limit` per op, in batch order (D106). The client packs batches so that
-    /// the frame stays within [`Limits::frame_bytes`] (D109).
-    Ops(Vec<Op>),
+    /// the frame stays within [`Limits::frame_bytes`] (D109). An op that was well formed but
+    /// did not fit the schema arrives as [`DecodedOp::Invalid`], so step 6 of ARCHITECTURE 5.5
+    /// still knows its head (D135). A client only ever sends [`DecodedOp::Valid`] ops.
+    Ops(Vec<DecodedOp>),
     Call {
         call: CallId,
         function: FnId,
@@ -200,6 +202,85 @@ pub struct Op {
     pub model: ModelId,
     pub row: RowId,
     pub body: OpBody,
+}
+
+/// An op of a received [`ClientMsg::Ops`] batch (D132, D135).
+///
+/// The codec reads the head of every op (`id`, `hlc`, `row`) strictly; a malformed head is a
+/// fatal protocol error. The rest is read against the schema, and an op whose rest does not fit
+/// is kept as `Invalid` with its head: the server rejects it in step 6 of ARCHITECTURE 5.5,
+/// after the order check, so a replay still gets its original outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecodedOp {
+    Valid(Op),
+    /// Well formed but not valid for the schema; the server answers `Reject Invalid`. It
+    /// exists only on the receiving side: encoding it is an error, never a frame.
+    Invalid {
+        id: OpId,
+        hlc: Hlc,
+        row: RowId,
+        fault: OpFault,
+    },
+}
+
+/// Why a well formed op is [`DecodedOp::Invalid`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpFault {
+    /// The schema has no model of this name (cut to the codec's echo limit).
+    UnknownModel(String),
+    /// The model has no field of this name (cut to the codec's echo limit).
+    UnknownField(String),
+    /// A value of this field does not fit its type.
+    Value { field: FieldId, fault: ValueFault },
+    /// The body does not suit the type of the field, for example `add` on a `Text` field or
+    /// `set` on a `Set` field.
+    WrongBody { field: FieldId },
+    /// A `remove` names no tag, more than [`Limits::tags_per_remove`] tags, or a tag that is
+    /// not an op id.
+    Tags { field: FieldId },
+    /// The canonical encoding of the op is over [`Limits::op_bytes`] (D109).
+    TooLarge { bytes: usize },
+}
+
+/// Why a received value does not fit the type of its place (D132).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueFault {
+    /// The JSON kind does not match the type, for example a string for an `Int`.
+    WrongType,
+    /// An `Int`, `Serial` or `Time` outside the safe range (D24).
+    IntRange,
+    /// Collections nested deeper than [`Limits::nesting_depth`].
+    TooDeep,
+    /// A `Text` of more than [`Limits::text_bytes`] UTF-8 bytes (D109).
+    TextTooLong,
+    /// A name that is not a variant of the enum.
+    UnknownVariant,
+    /// A reference that is not a 32 digit lowercase row id.
+    InvalidRef,
+    /// `Bytes` that are not unpadded base64url.
+    InvalidBytes,
+    /// A `Rank` key that is not 1 to [`Limits::rank_digits`] base 62 digits without a
+    /// trailing `0` (D88).
+    InvalidRank,
+    /// A `Set` that holds an element twice, or a `Map` that holds a key twice.
+    Repeated,
+}
+
+impl std::fmt::Display for ValueFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let why = match self {
+            ValueFault::WrongType => "value has the wrong JSON form for its type",
+            ValueFault::IntRange => "integer outside the safe range",
+            ValueFault::TooDeep => "value nested too deeply",
+            ValueFault::TextTooLong => "text over the text limit",
+            ValueFault::UnknownVariant => "unknown enum variant",
+            ValueFault::InvalidRef => "reference is not a row id",
+            ValueFault::InvalidBytes => "bytes are not unpadded base64url",
+            ValueFault::InvalidRank => "invalid rank key",
+            ValueFault::Repeated => "set element or map key repeated",
+        };
+        f.write_str(why)
+    }
 }
 
 /// An op as the server log holds and broadcasts it, with its accepted stamp.
