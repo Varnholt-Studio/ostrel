@@ -23,6 +23,10 @@
 //! * After a transaction method returned an error, the caller rolls the transaction back. A
 //!   driver may refuse every further call except [`Transaction::rollback`].
 //! * Dropping a transaction without commit has the effect of a rollback.
+//! * An op id has at most one final outcome (D110): it is either in the op log
+//!   ([`Transaction::append_ops`]) or recorded as rejected ([`Transaction::record_reject`]),
+//!   never both and never twice. Both calls raise the [`Transaction::last_seq`] of the op's
+//!   replica in the same transaction; a rollback undoes that together with the outcome.
 //!
 //! Ids and values are the shared types of `ostrel_core` (F1b), re-exported here so that a
 //! driver crate needs only this crate.
@@ -55,8 +59,9 @@ pub type FieldId = u32;
 /// Errors a driver reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DbError {
-    /// [`Write::Insert`] of an id that exists or existed in any model, or
-    /// [`Transaction::append_ops`] of an op id that is already in the log or twice in the call.
+    /// [`Write::Insert`] of an id that exists or existed in any model,
+    /// [`Transaction::append_ops`] of an op id that already has a final outcome or is twice in
+    /// the call, or [`Transaction::record_reject`] of an op id that already has one.
     Conflict,
     /// [`Write::Update`] or [`Write::Delete`] whose `expect_version` is not the stored version.
     VersionMismatch,
@@ -109,6 +114,32 @@ pub struct NewOp {
 pub struct StoredOp {
     pub seq: ServerSeq,
     pub op: NewOp,
+}
+
+/// Longest reason code [`Transaction::record_reject`] accepts, in bytes.
+pub const MAX_REJECT_REASON: usize = 64;
+
+/// The final outcome of an op as it was first decided, for the answer to a replay (D110,
+/// ARCHITECTURE 5.5 step 2).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReplayOutcome {
+    /// The op is in the log: its position and the op with the stamp the server accepted.
+    Accepted(StoredOp),
+    /// The op was rejected for good with this reason code.
+    Rejected(String),
+}
+
+/// Checks a reason code for [`Transaction::record_reject`]: 1 to [`MAX_REJECT_REASON`] bytes of
+/// printable ASCII without space. The driver stores it unchanged and never interprets it; the
+/// codes themselves belong to the sync protocol (ARCHITECTURE 5.4).
+pub fn check_reject_reason(reason: &str) -> Result<(), DbError> {
+    if reason.is_empty() || reason.len() > MAX_REJECT_REASON {
+        return Err(DbError::Invalid("reject reason must have 1 to 64 bytes"));
+    }
+    if !reason.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(DbError::Invalid("reject reason must be printable ascii"));
+    }
+    Ok(())
 }
 
 /// One live tag of a `Set` field: the element and the id of the op that added it (D49).
@@ -255,6 +286,12 @@ pub trait Connection {
     fn migrate<'a>(&'a mut self, plan: &'a MigrationPlan) -> BoxFuture<'a, Result<(), DbError>>;
     /// Reads committed state.
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>>;
+    /// Committed final outcome of the op `op`, `None` if it has none. See
+    /// [`Transaction::replay_outcome`].
+    fn replay_outcome<'a>(
+        &'a mut self,
+        op: OpId,
+    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>>;
     /// Hash and canonical JSON stored by the last successful [`Connection::migrate`]; `None`
     /// if the database was never migrated. A refused plan leaves it unchanged. The planner
     /// computes the steps of the next plan from it (D79).
@@ -271,8 +308,9 @@ pub trait Transaction<'c> {
     fn apply<'a>(&'a mut self, w: &'a [Write]) -> BoxFuture<'a, Result<(), DbError>>;
     /// Appends the ops in order and returns the position of the last one. With no ops it
     /// returns the current last position, `ServerSeq(0)` for an empty log. An op id that is
-    /// already in the log or appears twice in `ops` gives [`DbError::Conflict`], and no op of
-    /// the call is appended.
+    /// already in the log, was recorded as rejected or appears twice in `ops` gives
+    /// [`DbError::Conflict`], and no op of the call is appended. For every replica in `ops`,
+    /// [`Self::last_seq`] becomes the larger of its old value and the largest `seq` appended.
     fn append_ops<'a>(&'a mut self, ops: &'a [NewOp]) -> BoxFuture<'a, Result<ServerSeq, DbError>>;
     /// Returns at most `limit` ops with a position greater than `after`, in position order.
     fn ops_since<'a>(
@@ -280,6 +318,27 @@ pub trait Transaction<'c> {
         after: ServerSeq,
         limit: u32,
     ) -> BoxFuture<'a, Result<Vec<StoredOp>, DbError>>;
+    /// Records that the op `op` was rejected for good with the reason code `reason` (D110). A
+    /// reason that fails [`check_reject_reason`] gives [`DbError::Invalid`]; an op id that is in
+    /// the log or was already rejected gives [`DbError::Conflict`]. Either way nothing changes.
+    /// [`Self::last_seq`] of the op's replica becomes the larger of its old value and
+    /// `op.seq`. A rejected op is not part of the log.
+    fn record_reject<'a>(
+        &'a mut self,
+        op: OpId,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<(), DbError>>;
+    /// Highest `seq` of `replica` with a final outcome, `0` when it has none (D110). The driver
+    /// only keeps the maximum; whether `seq` values are contiguous is checked by the caller
+    /// (ARCHITECTURE 5.5 step 2).
+    fn last_seq<'a>(&'a mut self, replica: ReplicaId) -> BoxFuture<'a, Result<u32, DbError>>;
+    /// Final outcome of the op `op`, including the outcomes recorded by this transaction:
+    /// [`ReplayOutcome::Accepted`] with the stored op if it is in the log,
+    /// [`ReplayOutcome::Rejected`] with the reason if it was rejected, `None` otherwise.
+    fn replay_outcome<'a>(
+        &'a mut self,
+        op: OpId,
+    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>>;
     /// Next number of the sequence `key`, starting at 1. A number handed out by a transaction
     /// that is rolled back may be handed out again.
     fn next_in_sequence<'a>(&'a mut self, key: &'a str) -> BoxFuture<'a, Result<u64, DbError>>;

@@ -11,8 +11,8 @@ use std::rc::Rc;
 
 use ostrel_db::api::{
     AppliedSchema, BoxFuture, Capabilities, Connection, DbError, Dir, Driver, FieldId,
-    MigrationPlan, ModelId, NewOp, Query, Row, RowId, Rows, ServerSeq, StoredOp, Transaction,
-    Value, Write, compare_key,
+    MigrationPlan, ModelId, NewOp, OpId, Query, ReplayOutcome, ReplicaId, Row, RowId, Rows,
+    ServerSeq, StoredOp, Transaction, Value, Write, check_reject_reason, compare_key,
 };
 
 use super::cases::{self, Expect};
@@ -39,6 +39,10 @@ struct Faults {
     rollback_commits: bool,
     /// Query ignores the limit.
     ignore_limit: bool,
+    /// `append_ops` does not raise `last_seq`.
+    forget_last_seq: bool,
+    /// `record_reject` of an op that already has an outcome replaces it.
+    overwrite_outcome: bool,
 }
 
 #[derive(Clone)]
@@ -49,7 +53,72 @@ struct Stored {
     fields: BTreeMap<FieldId, Value>,
 }
 
-type State = BTreeMap<RowId, Stored>;
+type Table = BTreeMap<RowId, Stored>;
+
+/// Final outcomes of ops (D110).
+#[derive(Clone, Default)]
+struct Log {
+    ops: Vec<StoredOp>,
+    rejects: BTreeMap<OpId, String>,
+    last: BTreeMap<ReplicaId, u32>,
+}
+
+impl Log {
+    fn raise(&mut self, op: OpId) {
+        let last = self.last.entry(op.replica).or_insert(0);
+        *last = (*last).max(op.seq);
+    }
+
+    fn in_log(&self, op: OpId) -> bool {
+        self.ops.iter().any(|o| o.op.id == op)
+    }
+
+    fn outcome(&self, op: OpId) -> Option<ReplayOutcome> {
+        if let Some(r) = self.rejects.get(&op) {
+            return Some(ReplayOutcome::Rejected(r.clone()));
+        }
+        let found = self.ops.iter().find(|o| o.op.id == op);
+        found.map(|o| ReplayOutcome::Accepted(o.clone()))
+    }
+
+    fn append(&mut self, ops: &[NewOp], faults: Faults) -> Result<ServerSeq, DbError> {
+        for (i, op) in ops.iter().enumerate() {
+            let decided = self.in_log(op.id) || self.rejects.contains_key(&op.id);
+            if decided || ops[..i].iter().any(|o| o.id == op.id) {
+                return Err(DbError::Conflict);
+            }
+        }
+        for op in ops {
+            let seq = ServerSeq(self.ops.len() as u64 + 1);
+            self.ops.push(StoredOp {
+                seq,
+                op: op.clone(),
+            });
+            if !faults.forget_last_seq {
+                self.raise(op.id);
+            }
+        }
+        Ok(ServerSeq(self.ops.len() as u64))
+    }
+
+    fn reject(&mut self, op: OpId, reason: &str, faults: Faults) -> Result<(), DbError> {
+        check_reject_reason(reason)?;
+        if faults.overwrite_outcome {
+            self.ops.retain(|o| o.op.id != op);
+        } else if self.in_log(op) || self.rejects.contains_key(&op) {
+            return Err(DbError::Conflict);
+        }
+        self.rejects.insert(op, reason.to_string());
+        self.raise(op);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct State {
+    rows: Table,
+    log: Log,
+}
 
 /// A connection. Connections opened by one [`RefDriver`] share its state, as the connections of
 /// a real driver share one database.
@@ -113,7 +182,7 @@ fn cmp_value(a: &Value, b: &Value, utf16: bool) -> std::cmp::Ordering {
     }
 }
 
-fn scan(state: &State, q: &Query, faults: Faults) -> Rows {
+fn scan(state: &Table, q: &Query, faults: Faults) -> Rows {
     let mut rows: Vec<Row> = state
         .iter()
         .filter(|(_, r)| r.model == q.model && !r.deleted)
@@ -158,7 +227,7 @@ fn store(v: &Value, faults: Faults) -> Value {
     }
 }
 
-fn apply_one(state: &mut State, w: &Write, faults: Faults) -> Result<(), DbError> {
+fn apply_one(state: &mut Table, w: &Write, faults: Faults) -> Result<(), DbError> {
     match w {
         Write::Insert {
             model, row, fields, ..
@@ -217,7 +286,7 @@ fn apply_one(state: &mut State, w: &Write, faults: Faults) -> Result<(), DbError
     Ok(())
 }
 
-fn live(state: &mut State, model: ModelId, row: RowId) -> Result<&mut Stored, DbError> {
+fn live(state: &mut Table, model: ModelId, row: RowId) -> Result<&mut Stored, DbError> {
     state
         .get_mut(&row)
         .filter(|r| r.model == model && !r.deleted)
@@ -229,7 +298,13 @@ impl Connection for RefConn {
         Box::pin(async { Ok(()) })
     }
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>> {
-        Box::pin(async move { Ok(scan(&self.state.borrow(), q, self.faults)) })
+        Box::pin(async move { Ok(scan(&self.state.borrow().rows, q, self.faults)) })
+    }
+    fn replay_outcome<'a>(
+        &'a mut self,
+        op: OpId,
+    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
+        Box::pin(async move { Ok(self.state.borrow().log.outcome(op)) })
     }
     fn applied_schema<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<AppliedSchema>, DbError>> {
         Box::pin(async { Err(DbError::Unsupported("applied schema")) })
@@ -244,20 +319,35 @@ impl Connection for RefConn {
 
 impl<'c> Transaction<'c> for RefTx<'c> {
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>> {
-        Box::pin(async move { Ok(scan(&self.work, q, self.conn.faults)) })
+        Box::pin(async move { Ok(scan(&self.work.rows, q, self.conn.faults)) })
     }
     fn apply<'a>(&'a mut self, ws: &'a [Write]) -> BoxFuture<'a, Result<(), DbError>> {
         let faults = self.conn.faults;
         Box::pin(async move {
             ws.iter()
-                .try_for_each(|w| apply_one(&mut self.work, w, faults))
+                .try_for_each(|w| apply_one(&mut self.work.rows, w, faults))
         })
     }
-    fn append_ops<'a>(
+    fn append_ops<'a>(&'a mut self, ops: &'a [NewOp]) -> BoxFuture<'a, Result<ServerSeq, DbError>> {
+        let faults = self.conn.faults;
+        Box::pin(async move { self.work.log.append(ops, faults) })
+    }
+    fn record_reject<'a>(
         &'a mut self,
-        _ops: &'a [NewOp],
-    ) -> BoxFuture<'a, Result<ServerSeq, DbError>> {
-        Box::pin(async { Err(DbError::Unsupported("op log")) })
+        op: OpId,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<(), DbError>> {
+        let faults = self.conn.faults;
+        Box::pin(async move { self.work.log.reject(op, reason, faults) })
+    }
+    fn last_seq<'a>(&'a mut self, replica: ReplicaId) -> BoxFuture<'a, Result<u32, DbError>> {
+        Box::pin(async move { Ok(self.work.log.last.get(&replica).copied().unwrap_or(0)) })
+    }
+    fn replay_outcome<'a>(
+        &'a mut self,
+        op: OpId,
+    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
+        Box::pin(async move { Ok(self.work.log.outcome(op)) })
     }
     fn ops_since<'a>(
         &'a mut self,
@@ -499,7 +589,7 @@ fn decode_reads_the_example_suite() {
     let cases::Action::Tx(writes) = &big.steps[0].action else {
         panic!("not a tx")
     };
-    let Write::Insert { fields, .. } = &writes[0] else {
+    let cases::Call::Write(Write::Insert { fields, .. }) = &writes[0] else {
         panic!("not an insert")
     };
     assert_eq!(fields[0].1, Value::Text("ab".repeat(524_288)));
@@ -583,12 +673,19 @@ fn decode_accepts_int_bounds() {
           {"insert": {"model": 0, "row": "0", "fields": {"0": {"int": "9007199254740991"}}}}],
          "expect": "ok"}]}]}"#;
     let suite = cases::decode(&json::parse(text).unwrap()).unwrap();
-    let cases::Action::Tx(writes) = &suite.cases[0].steps[0].action else {
+    let cases::Action::Tx(calls) = &suite.cases[0].steps[0].action else {
         panic!("not a tx")
     };
+    let writes: Vec<&Write> = calls
+        .iter()
+        .map(|c| match c {
+            cases::Call::Write(w) => w,
+            _ => panic!("not a write"),
+        })
+        .collect();
     let max_id = RowId::from_hex(&format!("{:032x}", u128::MAX)).unwrap();
     assert_eq!(
-        writes[0],
+        *writes[0],
         Write::Insert {
             model: 0,
             row: max_id,
@@ -597,7 +694,7 @@ fn decode_accepts_int_bounds() {
         }
     );
     assert!(
-        matches!(&writes[1], Write::Insert { fields, .. } if fields[0].1 == Value::int(INT_MAX).unwrap())
+        matches!(writes[1], Write::Insert { fields, .. } if fields[0].1 == Value::int(INT_MAX).unwrap())
     );
     // One past the range on either side makes the file invalid, as do the i64 bounds.
     for n in [
@@ -817,6 +914,107 @@ fn assert_passed_panics_on_failure() {
 #[should_panic(expected = "waited")]
 fn block_on_refuses_a_waiting_future() {
     block_on(std::future::pending::<()>());
+}
+
+/// The op log faults of the reference driver break exactly the replay cases that state the
+/// broken rule (D110).
+#[test]
+fn replay_faults_fail_their_cases() {
+    let text = std::fs::read_to_string(super::cases_dir().join("ac_10_replay.json")).unwrap();
+    let table: [(&str, Faults, &[&str]); 2] = [
+        (
+            "forget_last_seq",
+            Faults {
+                forget_last_seq: true,
+                ..Faults::default()
+            },
+            &[
+                "ac_10_replay_after_lost_ack",
+                "ac_10_replay_last_seq_per_replica",
+            ],
+        ),
+        (
+            "overwrite_outcome",
+            Faults {
+                overwrite_outcome: true,
+                ..Faults::default()
+            },
+            &[
+                "ac_10_replay_after_lost_reject",
+                "ac_10_replay_outcomes_roll_back",
+            ],
+        ),
+    ];
+    assert!(run_ref(&text, Faults::default()).is_ok());
+    for (label, faults, expected) in table {
+        let report = run_ref(&text, faults);
+        assert_eq!(failed(&report), expected, "fault {label}: {report}");
+    }
+}
+
+#[test]
+fn decode_rejects_invalid_op_log_steps() {
+    let op = r#"{"replica": "1", "seq": 1, "wall": 0, "model": 0, "row": "1", "body": ""}"#;
+    let ok = with_case(&format!(
+        r#"{{"tx": [{{"append_ops": [{op}]}}, {{"reject": {{"replica": "1", "seq": 2, "reason": "Denied"}}}}], "expect": "ok"}},
+           {{"last_seq": "1", "expect": 2}},
+           {{"replay": {{"replica": "1", "seq": 1}}, "expect": {{"accepted": {{"position": 1, "op": {op}}}}}}},
+           {{"replay": {{"replica": "1", "seq": 2}}, "expect": {{"rejected": "Denied"}}}},
+           {{"replay": {{"replica": "1", "seq": 3}}, "expect": null}}"#
+    ));
+    assert!(run_ref(&ok, Faults::default()).is_ok());
+    for (bad, needle) in [
+        (
+            op.replace(r#""seq": 1"#, r#""seq": 4294967296"#),
+            "not a u32",
+        ),
+        (
+            op.replace(r#""replica": "1""#, r#""replica": "01""#),
+            "not a u64",
+        ),
+        (
+            op.replace(r#""replica": "1""#, r#""replica": "18446744073709551616""#),
+            "not a u64",
+        ),
+        (
+            op.replace(r#""wall": 0"#, r#""wall": 281474976710656"#),
+            "op.wall",
+        ),
+        (
+            op.replace(r#""model": 0"#, r#""model": 1"#),
+            "unknown model",
+        ),
+        (op.replace(r#", "body": """#, ""), "missing key"),
+    ] {
+        let text = with_case(&format!(
+            r#"{{"tx": [{{"append_ops": [{bad}]}}], "expect": "ok"}}"#
+        ));
+        let err = decode_err(&text);
+        assert!(err.contains(needle), "{bad}: {err}");
+    }
+    for (step, needle) in [
+        (r#"{"last_seq": "1", "expect": 4294967296}"#, "u32"),
+        (r#"{"last_seq": 1, "expect": 0}"#, "expected a string"),
+        (
+            r#"{"replay": {"replica": "1"}, "expect": null}"#,
+            "missing key",
+        ),
+        (
+            r#"{"replay": {"replica": "1", "seq": 1}, "expect": {"other": 1}}"#,
+            "unknown key",
+        ),
+        (
+            r#"{"tx": [{"reject": {"replica": "1", "seq": 1}}], "expect": "ok"}"#,
+            "missing key",
+        ),
+        (
+            r#"{"tx": [{"append_ops": {}}], "expect": "ok"}"#,
+            "expected an array",
+        ),
+    ] {
+        let err = decode_err(&with_case(step));
+        assert!(err.contains(needle), "{step}: {err}");
+    }
 }
 
 /// The shared case files pass on the reference driver. This keeps the harness and the cases of

@@ -9,11 +9,15 @@ import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const files = readdirSync(here).filter((f) => f.endsWith('.json')).sort();
-const ERRORS = new Set(['Conflict', 'VersionMismatch', 'NotFound']);
+const ERRORS = new Set(['Conflict', 'VersionMismatch', 'NotFound', 'Invalid']);
 const TYPES = new Set(['Text', 'Int', 'Bool']);
 // Int range of ARCHITECTURE 7.4: the safe JavaScript integers.
 const INT = [-(2n ** 53n - 1n), 2n ** 53n - 1n];
 const U128 = 2n ** 128n - 1n;
+const U64 = 2n ** 64n - 1n;
+const U32 = 2 ** 32 - 1;
+// Largest wall time of an Hlc (48 bits).
+const WALL = 2 ** 48 - 1;
 
 function keys(o, allowed, where) {
   for (const k of Object.keys(o)) assert.ok(allowed.includes(k), `${where}: unknown key ${k}`);
@@ -83,18 +87,86 @@ function cmp(a, b) {
   return a < b ? -1 : 1;
 }
 
-// Reference model: live rows and the set of ids ever used.
+function replicaId(s, where) {
+  assert.match(s, /^(0|[1-9][0-9]*)$/, where);
+  assert.ok(BigInt(s) <= U64, where);
+  return BigInt(s);
+}
+
+// An op id {replica, seq} as a map key.
+function opKey(o, where) {
+  assert.ok(Number.isInteger(o.seq) && o.seq >= 0 && o.seq <= U32, `${where}: seq`);
+  return `${replicaId(o.replica, where)}/${o.seq}`;
+}
+
+// An op of the log; checked and returned in a canonical form for comparison.
+function logOp(o, models, where) {
+  keys(o, ['replica', 'seq', 'wall', 'model', 'row', 'body'], where);
+  assert.ok(Number.isInteger(o.wall) && o.wall >= 0 && o.wall <= WALL, `${where}: wall`);
+  assert.ok(models.has(o.model), `${where}: unknown model`);
+  assert.equal(typeof o.body, 'string', where);
+  return { key: opKey(o, where), wall: o.wall, model: o.model, row: rowId(o.row, where), body: o.body };
+}
+
+// Reject reasons (ostrel_db::api::check_reject_reason): 1 to 64 bytes of printable ASCII.
+function validReason(r) {
+  return typeof r === 'string' && /^[\x21-\x7e]{1,64}$/.test(r);
+}
+
+// Reference model: live rows, the set of ids ever used, and the final outcomes of ops (D110).
 function newDb() {
-  return { rows: new Map(), taken: new Set() };
+  return { rows: new Map(), taken: new Set(), log: [], rejects: new Map(), last: new Map() };
 }
 function clone(db) {
   const rows = new Map();
   for (const [id, r] of db.rows) rows.set(id, { ...r, fields: new Map(r.fields) });
-  return { rows, taken: new Set(db.taken) };
+  return {
+    rows,
+    taken: new Set(db.taken),
+    log: [...db.log],
+    rejects: new Map(db.rejects),
+    last: new Map(db.last),
+  };
+}
+function raise(db, key) {
+  const [replica, seq] = key.split('/');
+  db.last.set(replica, Math.max(db.last.get(replica) ?? 0, Number(seq)));
+}
+function decided(db, key) {
+  return db.rejects.has(key) || db.log.some((o) => o.key === key);
+}
+function outcome(db, key) {
+  if (db.rejects.has(key)) return { rejected: db.rejects.get(key) };
+  const i = db.log.findIndex((o) => o.key === key);
+  return i < 0 ? null : { position: i + 1, op: db.log[i] };
 }
 function apply(db, w, models, where) {
   const [op] = Object.keys(w);
   assert.equal(Object.keys(w).length, 1, where);
+  if (op === 'append_ops') {
+    assert.ok(Array.isArray(w.append_ops), where);
+    const ops = w.append_ops.map((o) => logOp(o, models, where));
+    const seen = new Set();
+    for (const o of ops) {
+      if (decided(db, o.key) || seen.has(o.key)) return 'Conflict';
+      seen.add(o.key);
+    }
+    for (const o of ops) {
+      db.log.push(o);
+      raise(db, o.key);
+    }
+    return null;
+  }
+  if (op === 'reject') {
+    keys(w.reject, ['replica', 'seq', 'reason'], where);
+    const key = opKey(w.reject, where);
+    assert.equal(typeof w.reject.reason, 'string', where);
+    if (!validReason(w.reject.reason)) return 'Invalid';
+    if (decided(db, key)) return 'Conflict';
+    db.rejects.set(key, w.reject.reason);
+    raise(db, key);
+    return null;
+  }
   assert.ok(['insert', 'update', 'delete'].includes(op), `${where}: unknown write ${op}`);
   const a = w[op];
   keys(a, ['model', 'row', 'fields', 'expect_version'], where);
@@ -149,7 +221,27 @@ function runCase(c, models) {
   let db = newDb();
   c.steps.forEach((s, i) => {
     const where = `${c.name} step ${i}`;
-    keys(s, ['tx', 'query', 'expect'], where);
+    keys(s, ['tx', 'query', 'last_seq', 'replay', 'expect'], where);
+    if ('last_seq' in s) {
+      const replica = replicaId(s.last_seq, where);
+      assert.equal(s.expect, db.last.get(String(replica)) ?? 0, `${where}: last_seq`);
+      return;
+    }
+    if ('replay' in s) {
+      keys(s.replay, ['replica', 'seq'], where);
+      const got = outcome(db, opKey(s.replay, where));
+      const e = s.expect;
+      if (e === null || 'rejected' in e) {
+        assert.deepEqual(e, got, `${where}: replay`);
+        return;
+      }
+      keys(e, ['accepted'], where);
+      keys(e.accepted, ['position', 'op'], where);
+      assert.ok(got && 'position' in got, `${where}: replay expects an accepted op`);
+      assert.equal(e.accepted.position, got.position, `${where}: position`);
+      assert.deepEqual(logOp(e.accepted.op, models, where), got.op, `${where}: op`);
+      return;
+    }
     if ('tx' in s) {
       assert.ok(Array.isArray(s.tx) && s.tx.length > 0, where);
       const work = clone(db);

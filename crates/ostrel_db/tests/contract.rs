@@ -12,9 +12,10 @@ use std::task::{Context, Poll, Waker};
 
 use ostrel_db::api::{
     AppliedSchema, BoxFuture, Capabilities, CmpOp, CollectionChange, CollectionState, Connection,
-    Cursor, DbError, Dir, Driver, EnumColumn, Expr, FieldId, Hlc, Hop, MAX_FILTER_NODES, MapEntry,
-    MigrationPlan, ModelId, NewOp, OpId, Path, Query, ReplicaId, Row, RowId, Rows, SchemaHash,
-    ServerSeq, SetChange, SetTag, StoredOp, Transaction, Value, Write, check_writes, compare_key,
+    Cursor, DbError, Dir, Driver, EnumColumn, Expr, FieldId, Hlc, Hop, MAX_FILTER_NODES,
+    MAX_REJECT_REASON, MapEntry, MigrationPlan, ModelId, NewOp, OpId, Path, Query, ReplayOutcome,
+    ReplicaId, Row, RowId, Rows, SchemaHash, ServerSeq, SetChange, SetTag, StoredOp, Transaction,
+    Value, Write, check_reject_reason, check_writes, compare_key,
 };
 
 #[derive(Clone)]
@@ -30,6 +31,8 @@ struct Stored {
 struct State {
     rows: BTreeMap<RowId, Stored>,
     ops: Vec<StoredOp>,
+    rejects: BTreeMap<OpId, String>,
+    last_seqs: BTreeMap<ReplicaId, u32>,
     seqs: BTreeMap<String, u64>,
     schema: Option<AppliedSchema>,
     /// Enum columns with their declaration order, from the applied plan.
@@ -37,6 +40,23 @@ struct State {
 }
 
 impl State {
+    fn decided(&self, op: OpId) -> bool {
+        self.rejects.contains_key(&op) || self.ops.iter().any(|o| o.op.id == op)
+    }
+
+    fn raise(&mut self, op: OpId) {
+        let last = self.last_seqs.entry(op.replica).or_insert(0);
+        *last = (*last).max(op.seq);
+    }
+
+    fn outcome(&self, op: OpId) -> Option<ReplayOutcome> {
+        if let Some(r) = self.rejects.get(&op) {
+            return Some(ReplayOutcome::Rejected(r.clone()));
+        }
+        let found = self.ops.iter().find(|o| o.op.id == op);
+        found.map(|o| ReplayOutcome::Accepted(o.clone()))
+    }
+
     fn variants(&self, model: ModelId, field: FieldId) -> Option<&[String]> {
         self.enums
             .iter()
@@ -498,6 +518,12 @@ impl Connection for FixtureConn {
     fn query<'a>(&'a mut self, q: &'a Query) -> BoxFuture<'a, Result<Rows, DbError>> {
         Box::pin(async move { scan(&self.state, q) })
     }
+    fn replay_outcome<'a>(
+        &'a mut self,
+        op: OpId,
+    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
+        Box::pin(async move { Ok(self.state.outcome(op)) })
+    }
     fn begin<'c>(&'c mut self) -> BoxFuture<'c, Result<Box<dyn Transaction<'c> + 'c>, DbError>> {
         Box::pin(async move {
             let work = self.state.clone();
@@ -520,8 +546,7 @@ impl<'c> Transaction<'c> for FixtureTx<'c> {
     fn append_ops<'a>(&'a mut self, ops: &'a [NewOp]) -> BoxFuture<'a, Result<ServerSeq, DbError>> {
         Box::pin(async move {
             for (i, op) in ops.iter().enumerate() {
-                let in_log = self.work.ops.iter().any(|o| o.op.id == op.id);
-                if in_log || ops[..i].iter().any(|o| o.id == op.id) {
+                if self.work.decided(op.id) || ops[..i].iter().any(|o| o.id == op.id) {
                     return Err(DbError::Conflict);
                 }
             }
@@ -531,6 +556,7 @@ impl<'c> Transaction<'c> for FixtureTx<'c> {
                     seq,
                     op: op.clone(),
                 });
+                self.work.raise(op.id);
             }
             Ok(ServerSeq(self.work.ops.len() as u64))
         })
@@ -544,6 +570,30 @@ impl<'c> Transaction<'c> for FixtureTx<'c> {
             let ops = self.work.ops.iter().filter(|o| o.seq > after);
             Ok(ops.take(limit as usize).cloned().collect())
         })
+    }
+    fn record_reject<'a>(
+        &'a mut self,
+        op: OpId,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<(), DbError>> {
+        Box::pin(async move {
+            check_reject_reason(reason)?;
+            if self.work.decided(op) {
+                return Err(DbError::Conflict);
+            }
+            self.work.rejects.insert(op, reason.to_string());
+            self.work.raise(op);
+            Ok(())
+        })
+    }
+    fn last_seq<'a>(&'a mut self, replica: ReplicaId) -> BoxFuture<'a, Result<u32, DbError>> {
+        Box::pin(async move { Ok(self.work.last_seqs.get(&replica).copied().unwrap_or(0)) })
+    }
+    fn replay_outcome<'a>(
+        &'a mut self,
+        op: OpId,
+    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
+        Box::pin(async move { Ok(self.work.outcome(op)) })
     }
     fn next_in_sequence<'a>(&'a mut self, key: &'a str) -> BoxFuture<'a, Result<u64, DbError>> {
         Box::pin(async move {
@@ -1367,6 +1417,91 @@ fn op_log_positions_boundaries_and_duplicate_ids() {
         let third = tx.ops_since(ServerSeq(2), 10).await.unwrap();
         assert_eq!(third[0].op, new_op(2, 1));
         tx.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn reject_reasons_are_short_printable_ascii() {
+    assert_eq!(check_reject_reason("Denied"), Ok(()));
+    assert_eq!(check_reject_reason(&"x".repeat(MAX_REJECT_REASON)), Ok(()));
+    for bad in [
+        String::new(),
+        "x".repeat(MAX_REJECT_REASON + 1),
+        "two words".to_string(),
+        "nul\0".to_string(),
+        "tab\t".to_string(),
+        "\u{e9}".to_string(),
+        "\u{7f}".to_string(),
+    ] {
+        assert!(
+            matches!(check_reject_reason(&bad), Err(DbError::Invalid(_))),
+            "{bad:?}"
+        );
+    }
+}
+
+/// D110: an op id has exactly one final outcome, `last_seq` only grows, and a rollback undoes
+/// both together.
+#[test]
+fn final_outcomes_last_seq_and_replay() {
+    let mut conn = connect();
+    block_on(async {
+        let mut tx = conn.begin().await.unwrap();
+        assert_eq!(tx.last_seq(ReplicaId(1)).await, Ok(0));
+        assert_eq!(tx.replay_outcome(tag(1, 1)).await, Ok(None));
+        tx.append_ops(&[new_op(1, 1), new_op(2, 7)]).await.unwrap();
+        tx.record_reject(tag(1, 2), "Denied").await.unwrap();
+        assert_eq!(tx.last_seq(ReplicaId(1)).await, Ok(2));
+        assert_eq!(tx.last_seq(ReplicaId(2)).await, Ok(7));
+        // The transaction sees its own outcomes, the connection does not see them yet.
+        assert_eq!(
+            tx.replay_outcome(tag(1, 2)).await,
+            Ok(Some(ReplayOutcome::Rejected("Denied".into())))
+        );
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            conn.replay_outcome(tag(1, 1)).await,
+            Ok(Some(ReplayOutcome::Accepted(StoredOp {
+                seq: ServerSeq(1),
+                op: new_op(1, 1),
+            })))
+        );
+        assert_eq!(
+            conn.replay_outcome(tag(1, 2)).await,
+            Ok(Some(ReplayOutcome::Rejected("Denied".into())))
+        );
+        assert_eq!(conn.replay_outcome(tag(1, 3)).await, Ok(None));
+        // Same replica, other seq; same seq, other replica.
+        assert_eq!(conn.replay_outcome(tag(3, 1)).await, Ok(None));
+
+        let mut tx = conn.begin().await.unwrap();
+        assert_eq!(tx.append_ops(&[new_op(1, 2)]).await, Err(DbError::Conflict));
+        assert_eq!(
+            tx.record_reject(tag(1, 1), "Denied").await,
+            Err(DbError::Conflict)
+        );
+        assert_eq!(
+            tx.record_reject(tag(1, 2), "Limit").await,
+            Err(DbError::Conflict)
+        );
+        assert!(matches!(
+            tx.record_reject(tag(1, 9), "").await,
+            Err(DbError::Invalid(_))
+        ));
+        tx.rollback().await.unwrap();
+
+        // An older seq never lowers last_seq; a rollback undoes the raise.
+        let mut tx = conn.begin().await.unwrap();
+        tx.record_reject(tag(2, 3), "Invalid").await.unwrap();
+        assert_eq!(tx.last_seq(ReplicaId(2)).await, Ok(7));
+        tx.append_ops(&[new_op(1, u32::MAX)]).await.unwrap();
+        assert_eq!(tx.last_seq(ReplicaId(1)).await, Ok(u32::MAX));
+        tx.rollback().await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        assert_eq!(tx.last_seq(ReplicaId(1)).await, Ok(2));
+        assert_eq!(tx.replay_outcome(tag(2, 3)).await, Ok(None));
+        tx.rollback().await.unwrap();
     });
 }
 
