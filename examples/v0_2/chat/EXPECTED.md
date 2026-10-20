@@ -24,7 +24,9 @@ Three users exist as std `User` rows with the handles `alice`, `bob` and `carol`
 means the principal of the client or of the crafted op is alice (A1). Unless a case says
 otherwise, one room exists: `general`, made by alice, so `members == {alice}` and the add tag
 of alice is the `OpId` of that `make` (D106). "Add tag of X" is the tag of the live add of
-element X in `members`.
+element X in `members`. Every crafted `make` carries all declared fields, as the generated
+client sends them (ARCHITECTURE 5.4, D106); a crafted `make` that leaves out a field with a
+default is undecided (QUESTION #1471) and no case here expects anything of it.
 
 ## 3. Behaviour through the generated client
 
@@ -44,9 +46,12 @@ code point order (SPEC 12.5).
 
 | Id | Input | Expected |
 |---|---|---|
-| K-01 | Room name of 1 character, and of 40 characters | Accepted |
-| K-02 | "New room": the textbox accepts at most 40 characters (`maxlength` from the `check` of `name`) | A 41st character cannot be typed |
-| K-03 | Crafted make with a name of 0 or 41 characters | `Invalid`; nothing is stored |
+| K-01 | ASCII room name of 1 character, and of 40 characters | Accepted |
+| K-02 | "New room", ASCII input only: the textbox accepts at most 40 characters (`maxlength` from the `check` of `name`) | A 41st ASCII character cannot be typed |
+| K-03 | As bob: crafted make `Room { name: n, members: {bob} }` with an ASCII name `n` of 0 or 41 characters | `Invalid`; nothing is stored |
+
+K-01 to K-03 use ASCII input only, where one character is one Unicode scalar value and one
+UTF-16 code unit. For other input the unit of `maxlength` is undecided (A5).
 
 ## 5. Membership cases (AC-55)
 
@@ -62,11 +67,12 @@ ops of the case.
 | M-03 add other | `{alice}` | as alice: add `carol` | `Denied` (`added == {carol}`, not `{me}`; `removed` is empty, so the second clause is false) | `{alice}` |
 | M-04 hijack, several ops | `{alice, bob}` | as carol, in this order: add `carol`; remove `alice` naming the add tag of alice; remove `bob` naming the add tag of bob | add `carol`: `Accepted` (a join); each removal: `Denied` | `{alice, bob, carol}` |
 | M-05 hijack, one op | `{alice, bob}` | as carol: one op that adds `carol` and removes `alice` and `bob` | `Invalid` (more than one element and both directions); carol is not added either | `{alice, bob}` |
-| M-06 hijack, removals only | `{alice, bob}` | as carol (not a member): remove `alice`; remove `bob` | each `Denied` | `{alice, bob}` |
+| M-06 hijack, removals only | `{alice, bob}` | as carol (not a member): remove `alice` naming the add tag of alice; remove `bob` naming the add tag of bob | each `Denied` | `{alice, bob}` |
 | M-07 remove other as member | `{alice, bob}` | as bob: remove `alice` naming the add tag of alice | `Denied` (`removed == {alice}`) | `{alice, bob}` |
 | M-08 foreign tag | `{alice, bob}` | as bob: remove `bob`, naming only the add tag of alice | `Accepted` by the rule (`removed == {me}`), but the tag does not belong to element `bob` and is ignored like an unknown tag; nothing is removed | `{alice, bob}` |
-| M-09 join twice | `{alice, bob}` | as bob: add `bob` | `Accepted`; the set keeps one element `bob` | `{alice, bob}` |
-| M-10 no principal | `{alice}` | without a signed principal: add any user | `Denied` (`me` has no value, every rule that mentions `me` is false) | `{alice}` |
+| M-09 join twice | `{alice, bob}`, bob added from replica B1 | as bob from B1: add `bob` | `Accepted`; the set keeps one element `bob`, whose only live tag from B1 is now the `OpId` of this op (one live tag per element and replica, ARCHITECTURE 6.2) | `{alice, bob}` |
+| M-10 no principal | `{alice}` | without a signed principal: add any user | `Denied` (ARCHITECTURE 5.5 step 1: without a verified session every op is `Denied`) | `{alice}` |
+| M-11 leave from one of two replicas | `{alice, bob}`, bob added once from replica B1 (tag t1) and once from replica B2 (tag t2), two devices of bob | as bob from B1: remove `bob` naming only t1 | `Accepted` by the rule; t2 stays live, so bob stays a member (add wins, ARCHITECTURE 6.2). A remove naming t1 and t2 leaves `{alice}` | `{alice, bob}` |
 
 M-04 and M-05 together are the hijack case of AC-55: whether sent as one or as several ops,
 no other member is removed. M-08 is the element binding of remove tags (D96): a remove of `me`
@@ -85,11 +91,11 @@ can never take away another member.
 
 | Id | Crafted op | Expected |
 |---|---|---|
-| R-01 | as bob: make `Room { name: "x" }` | `Accepted`; `members == {bob}` from the default `{me}` |
+| R-01 | as bob, through the generated client: create the room `x` (N-02) | The client sends a `make` with all fields, `members: {bob}` from the default `{me}`; `Accepted`. A crafted `make` without `members` is not a case here (QUESTION #1471) |
 | R-02 | as bob: make `Room { name: "x", members: {bob} }` | `Accepted` |
 | R-03 | as bob: make `Room { name: "x", members: {alice, bob} }` | `Denied` (`make if members == {me}`) |
 | R-04 | as bob: make `Room { name: "x", members: {} }` | `Denied` |
-| R-05 | as bob: make `Room { name: "x" }` without a signed principal | `Denied` |
+| R-05 | make `Room { name: "x", members: {bob} }` without a signed principal | `Denied` (ARCHITECTURE 5.5 step 1) |
 | R-06 | as alice: edit `name` of `general` | `Denied` (no record `edit` rule and no `edit name` rule, default deny D8) |
 | R-07 | as alice: drop `general` | `Denied` (no `drop` rule, D8) |
 | R-08 | as bob (not a member): read all rooms | `general` is returned with its member list (`see if signed`) |
@@ -117,3 +123,5 @@ The warning text and code are not fixed here; the spec names neither (A4).
   op; the generated client sends one element per op (G12).
 * ASSUMPTION A4: AC-55 requires a warning for an unmentioned direction but fixes neither its
   code nor its text; W-01 and W-02 check only that exactly one warning is emitted at the rule.
+* ASSUMPTION A5: whether `maxlength` counts UTF-16 code units or scalar values is open
+  (QUESTION esra #1247). K-01 to K-03 use ASCII input only, as `examples/v0_2/notes/` does.
