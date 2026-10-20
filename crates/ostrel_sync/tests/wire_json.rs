@@ -1,11 +1,14 @@
 //! JSON frames of the sync protocol: round trips per message, the frame limit in both
 //! directions, and hostile JSON (depth, repeated keys, numbers outside the safe range).
 
+use ostrel_core::canon::encode;
 use ostrel_core::ids::{Hlc, InvalidId, OpId, ReplicaId, RowId, ServerSeq};
+use ostrel_core::value::Value;
 use ostrel_sync::protocol::{
     Ack, CallError, ClientMsg, ErrorCode, Hello, LIMITS, ProtocolError, Query, RejectReason,
     ServerMsg, Welcome,
 };
+use ostrel_sync::wire::json::{self, Json};
 use ostrel_sync::wire::{
     MAX_DEPTH, MAX_ECHO_BYTES, WireError, decode_client, decode_server, encode_client,
     encode_server,
@@ -308,20 +311,83 @@ fn an_object_with_many_distinct_keys_is_read() {
 
 #[test]
 fn integers_outside_the_safe_range_are_refused() {
+    // Whatever the form: beyond u64 (serde_json hands those over as floats) and with an
+    // exponent count the same as a plain integer token.
     for number in [
         "9007199254740992",
         "-9007199254740992",
         "18446744073709551615",
+        "18446744073709551616",
+        "-18446744073709551617",
         "-9223372036854775808",
+        "100000000000000000000000000000",
+        "1e20",
+        "-1e20",
+        "9007199254740992.0",
+        "1.5e300",
     ] {
         let frame = format!(r#"{{"sub":{number},"t":"reset","v":0}}"#);
         assert_eq!(server(&frame), Err(WireError::NumberOutOfRange), "{number}");
+        let frame = format!(r#"{{"sub":1,"t":"reset","v":{number}}}"#);
+        assert_eq!(
+            server(&frame),
+            Err(WireError::NumberOutOfRange),
+            "v {number}"
+        );
     }
-    // Anywhere in the frame, also in a key the message does not have.
-    assert_eq!(
-        server(r#"{"sub":1,"t":"reset","v":0,"x":[9007199254740992]}"#),
-        Err(WireError::NumberOutOfRange)
-    );
+}
+
+#[test]
+fn numbers_are_checked_by_the_type_of_their_place() {
+    // A number is range checked where its type is known (dora #1738 F2): the canonical
+    // encoding writes some floats as integer tokens, so a bare token outside the safe range
+    // is not an error by itself. In a key the message does not have, the key is the fault.
+    for number in ["9007199254740992", "18446744073709551616", "1e20"] {
+        let frame = format!(r#"{{"sub":1,"t":"reset","v":0,"x":[{number}]}}"#);
+        assert_eq!(
+            server(&frame),
+            Err(WireError::UnknownKey("x".into())),
+            "{number}"
+        );
+    }
+}
+
+#[test]
+fn every_canonical_float_reads_back_exactly() {
+    // canon::encode -> json::parse is the identity on every finite float (dora #1738 F2),
+    // also where the encoding is an integer token beyond the safe range or beyond u64.
+    let mut edge = vec![
+        0.0,
+        -0.0,
+        2f64.powi(53),
+        -(2f64.powi(53)),
+        2f64.powi(64),
+        1e20,
+        1e21,
+        f64::MAX,
+        f64::MIN,
+        f64::MIN_POSITIVE,
+        5e-324,
+        0.1 + 0.2,
+        123_456_789_012_345_680.0,
+    ];
+    // Plus a fixed pseudo random sample over all bit patterns (xorshift, seed fixed).
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for _ in 0..20_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        edge.push(f64::from_bits(x));
+    }
+    for v in edge.into_iter().filter(|v| v.is_finite()) {
+        let text = encode(&Value::float(v).unwrap());
+        let Ok(Json::Num(n)) = json::parse(text.as_bytes()) else {
+            panic!("{text} did not parse as a number");
+        };
+        // -0 is written as 0 (ARCHITECTURE 5.3).
+        let want = if v == 0.0 { 0.0 } else { v };
+        assert_eq!(n.value().to_bits(), want.to_bits(), "{text}");
+    }
 }
 
 #[test]

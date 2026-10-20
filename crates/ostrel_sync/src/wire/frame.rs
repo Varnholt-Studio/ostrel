@@ -4,7 +4,7 @@ use ostrel_core::canon::{encode_object, encode_str};
 use ostrel_core::ids::{Hlc, InvalidId, OpId, ReplicaId, RowId, ServerSeq};
 use ostrel_core::value::INT_MAX;
 
-use super::json::{self, Json};
+use super::json::{self, Json, NotSafeInt};
 use super::{WireError, clip};
 use crate::protocol::{
     Ack, ClientMsg, ErrorCode, Hello, LIMITS, Limits, PROTOCOL_VERSION, ProtocolError,
@@ -160,27 +160,31 @@ pub fn encode_server(msg: &ServerMsg) -> Result<String, WireError> {
     close(msg.name(), fields)
 }
 
-/// Wire name of an error code: its variant name, like [`RejectReason::name`].
-fn error_code_name(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::Protocol => "Protocol",
-        ErrorCode::FrameTooLarge => "FrameTooLarge",
-        ErrorCode::Unauthorized => "Unauthorized",
-        ErrorCode::ReplicaExpired => "ReplicaExpired",
-        ErrorCode::TooManySubscriptions => "TooManySubscriptions",
-        ErrorCode::FilterTooLarge => "FilterTooLarge",
-        ErrorCode::FilterNotReadable => "FilterNotReadable",
-    }
+/// Defines [`error_code_name`] and [`ERROR_CODES`] from one list, so the two cannot drift
+/// apart: the `match` is exhaustive, so a new [`ErrorCode`] variant does not compile until it
+/// is in the list, and then it is also in the array the reader searches.
+macro_rules! error_codes {
+    ($($code:ident),* $(,)?) => {
+        /// Wire name of an error code: its variant name, like [`RejectReason::name`].
+        fn error_code_name(code: ErrorCode) -> &'static str {
+            match code {
+                $(ErrorCode::$code => stringify!($code),)*
+            }
+        }
+
+        /// Every error code, for the reader.
+        const ERROR_CODES: &[ErrorCode] = &[$(ErrorCode::$code),*];
+    };
 }
 
-const ERROR_CODES: [ErrorCode; 7] = [
-    ErrorCode::Protocol,
-    ErrorCode::FrameTooLarge,
-    ErrorCode::Unauthorized,
-    ErrorCode::ReplicaExpired,
-    ErrorCode::TooManySubscriptions,
-    ErrorCode::FilterTooLarge,
-    ErrorCode::FilterNotReadable,
+error_codes![
+    Protocol,
+    FrameTooLarge,
+    Unauthorized,
+    ReplicaExpired,
+    TooManySubscriptions,
+    FilterTooLarge,
+    FilterNotReadable,
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -197,10 +201,7 @@ fn open(frame: &[u8]) -> Result<(String, Fields), WireError> {
     };
     let mut fields = Fields { entries };
     // The version comes first: a frame of another version may name messages we do not know.
-    let version = fields.req("v", |k, j| match j {
-        Json::Int(v) => Ok(v),
-        _ => Err(WireError::WrongType(k)),
-    })?;
+    let version = fields.req("v", safe_int)?;
     if version != i64::from(PROTOCOL_VERSION) {
         return Err(WireError::UnsupportedVersion);
     }
@@ -223,13 +224,13 @@ fn close(name: &str, mut fields: Vec<(&str, String)>) -> Result<String, WireErro
 }
 
 /// The keys of one received object that have not been read yet.
-struct Fields {
-    entries: Vec<(String, Json)>,
+pub(super) struct Fields {
+    pub(super) entries: Vec<(String, Json)>,
 }
 
 impl Fields {
     /// Takes a required key and reads it with `read`.
-    fn req<T>(
+    pub(super) fn req<T>(
         &mut self,
         key: &'static str,
         read: impl FnOnce(&'static str, Json) -> Result<T, WireError>,
@@ -244,7 +245,7 @@ impl Fields {
     }
 
     /// Takes a required key whose value may be `null`.
-    fn opt<T>(
+    pub(super) fn opt<T>(
         &mut self,
         key: &'static str,
         read: impl FnOnce(&'static str, Json) -> Result<T, WireError>,
@@ -256,7 +257,7 @@ impl Fields {
     }
 
     /// Fails on the first key no field has read.
-    fn finish(self) -> Result<(), WireError> {
+    pub(super) fn finish(self) -> Result<(), WireError> {
         match self.entries.first() {
             Some((key, _)) => Err(WireError::UnknownKey(clip(key))),
             None => Ok(()),
@@ -267,7 +268,7 @@ impl Fields {
 // ---------------------------------------------------------------------------------------------
 // Readers: one per field form. Each gets the key for its error and the JSON node.
 
-fn string(key: &'static str, j: Json) -> Result<String, WireError> {
+pub(super) fn string(key: &'static str, j: Json) -> Result<String, WireError> {
     match j {
         Json::Str(s) => Ok(s),
         _ => Err(WireError::WrongType(key)),
@@ -281,21 +282,28 @@ fn boolean(key: &'static str, j: Json) -> Result<bool, WireError> {
     }
 }
 
-fn uint32(key: &'static str, j: Json) -> Result<u32, WireError> {
+/// An integer of a message field. A number outside the safe range is
+/// [`WireError::NumberOutOfRange`] whatever its form (D24); one in range with a fraction or an
+/// exponent has the wrong form.
+pub(super) fn safe_int(key: &'static str, j: Json) -> Result<i64, WireError> {
     match j {
-        Json::Int(v) => u32::try_from(v).map_err(|_| WireError::FieldRange(key)),
+        Json::Num(n) => n.safe_int().map_err(|why| match why {
+            NotSafeInt::OutOfRange => WireError::NumberOutOfRange,
+            NotSafeInt::NotAnInteger => WireError::WrongType(key),
+        }),
         _ => Err(WireError::WrongType(key)),
     }
+}
+
+pub(super) fn uint32(key: &'static str, j: Json) -> Result<u32, WireError> {
+    u32::try_from(safe_int(key, j)?).map_err(|_| WireError::FieldRange(key))
 }
 
 fn uint64(key: &'static str, j: Json) -> Result<u64, WireError> {
-    match j {
-        Json::Int(v) => u64::try_from(v).map_err(|_| WireError::FieldRange(key)),
-        _ => Err(WireError::WrongType(key)),
-    }
+    u64::try_from(safe_int(key, j)?).map_err(|_| WireError::FieldRange(key))
 }
 
-fn list<T>(
+pub(super) fn list<T>(
     key: &'static str,
     j: Json,
     item: impl Fn(&'static str, Json) -> Result<T, WireError>,
@@ -324,15 +332,15 @@ fn server_seq(key: &'static str, j: Json) -> Result<ServerSeq, WireError> {
     hex_id(key, j, ServerSeq::from_hex)
 }
 
-fn op_id(key: &'static str, j: Json) -> Result<OpId, WireError> {
+pub(super) fn op_id(key: &'static str, j: Json) -> Result<OpId, WireError> {
     hex_id(key, j, OpId::from_hex)
 }
 
-fn row_id(key: &'static str, j: Json) -> Result<RowId, WireError> {
+pub(super) fn row_id(key: &'static str, j: Json) -> Result<RowId, WireError> {
     hex_id(key, j, RowId::from_hex)
 }
 
-fn hlc(key: &'static str, j: Json) -> Result<Hlc, WireError> {
+pub(super) fn hlc(key: &'static str, j: Json) -> Result<Hlc, WireError> {
     hex_id(key, j, Hlc::from_hex)
 }
 
@@ -358,7 +366,8 @@ fn reject_reason(key: &'static str, j: Json) -> Result<RejectReason, WireError> 
 fn error_code(key: &'static str, j: Json) -> Result<ErrorCode, WireError> {
     let name = string(key, j)?;
     ERROR_CODES
-        .into_iter()
+        .iter()
+        .copied()
         .find(|c| error_code_name(*c) == name)
         .ok_or(WireError::WrongType(key))
 }
@@ -400,7 +409,7 @@ fn limits(key: &'static str, j: Json) -> Result<Limits, WireError> {
 // ---------------------------------------------------------------------------------------------
 // Writers: each returns the canonical JSON text of one field value.
 
-fn hex(text: &str) -> String {
+pub(super) fn hex(text: &str) -> String {
     encode_str(text)
 }
 
@@ -408,7 +417,7 @@ fn opt<T>(value: Option<T>, write: impl FnOnce(T) -> String) -> String {
     value.map_or_else(|| "null".to_owned(), write)
 }
 
-fn array(items: impl IntoIterator<Item = String>) -> String {
+pub(super) fn array(items: impl IntoIterator<Item = String>) -> String {
     let items: Vec<String> = items.into_iter().collect();
     ostrel_core::canon::encode_array(&items)
 }
