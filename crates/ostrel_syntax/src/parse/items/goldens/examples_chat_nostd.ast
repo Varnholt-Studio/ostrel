@@ -1,0 +1,58 @@
+app Chat
+  (auth paseto open)
+data Room
+  (field name Text)
+  (field members Set[User] (= (set me)))
+  (check (in (. name len) (.. 1 40)))
+  (see signed)
+  (make (== members (set me)))
+  (edit members (or (== added (set me)) (== removed (set me))))
+data Message
+  (field room Room)
+  (field text Text)
+  (check (in (. text len) (.. 1 2000)))
+  (see (in me (. room members)))
+  (make (in me (. room members)))
+var current: Room?
+var roomDraft = (str )
+var messageDraft = (str )
+fn createRoom()
+  (let name (. roomDraft trim))
+  if (> (. name len) 0)
+    (= current (make Room (name name)))
+    (= roomDraft (str ))
+fn send(r: Room)
+  (let text (. messageDraft trim))
+  if (> (. text len) 0)
+    (make Message (room r) (text text))
+    (= messageDraft (str ))
+view Main
+  <row ~app>
+    <col>
+      for r (query Room (sort name))
+        <button (. r name) (~active (== r current)) (on click (= current r))>
+      <row>
+        <input (bind: roomDraft) (hint: (str "New room")) (on enter (call createRoom))>
+        <button (str "Create") (on click (call createRoom))>
+      <text (. sync state) ~muted>
+    <col>
+      if let r current
+        <row>
+          <text (. r name) ~title>
+          if (in me (. r members))
+            <button (str "Leave") (on click (call (. (. r members) remove) me))>
+          else
+            <button (str "Join") (on click (call (. (. r members) add) me))>
+        <col ~log>
+          for m (query Message (where (== room r)) (sort made desc) (limit 200))
+            <row (~mine (== (. m author) me)) (~pending (. m pending)) (~rejected (. m rejected))>
+              <text (. (. m author) handle) ~strong>
+              <text (. m text)>
+              <text (. (. m made) clock) ~muted>
+        if (in me (. r members))
+          <row>
+            <input (bind: messageDraft) (hint: (str "Message")) (on enter (call send r))>
+            <button (str "Send") (on click (call send r))>
+      else
+        <text (str "Pick or create a room") ~muted>
+style 1634..2089

@@ -1,4 +1,4 @@
-//! Expression parser for the v0.1 slice (WP T1-3b, D43, SYNTAX 7).
+//! Expression parser (WP T1-3b, D43, SYNTAX 7).
 //!
 //! [`Exprs`] implements [`ExprParse`], the seam to the statement parser in
 //! `mod.rs`. The contract is documented there.
@@ -6,44 +6,52 @@
 //! # Grammar read here
 //!
 //! ```text
-//! expr    = orExpr ;
-//! orExpr  = andExpr { "or" andExpr } ;
-//! andExpr = notExpr { "and" notExpr } ;
-//! notExpr = "not" notExpr | cmpExpr ;
-//! cmpExpr = addExpr [ cmpOp addExpr ] ;
-//! addExpr = mulExpr { ( "+" | "-" ) mulExpr } ;
-//! mulExpr = unary { ( "*" | "/" | "%" ) unary } ;
-//! unary   = [ "-" ] postfix ;
-//! postfix = primary { "(" [ expr { "," expr } ] ")" } ;
-//! primary = Number | String | "true" | "false" | name | "(" expr ")" ;
+//! expr      = orExpr ;
+//! orExpr    = andExpr { "or" andExpr } ;
+//! andExpr   = notExpr { "and" notExpr } ;
+//! notExpr   = "not" notExpr | cmpExpr ;
+//! cmpExpr   = fbExpr [ cmpOp fbExpr ] ;
+//! cmpOp     = "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "not" "in" ;
+//! fbExpr    = rangeExpr [ "catch" Name { "," Name } ] { "??" rangeExpr } ;
+//! rangeExpr = addExpr [ ".." addExpr ] ;
+//! addExpr   = mulExpr { ( "+" | "-" ) mulExpr } ;
+//! mulExpr   = unary { ( "*" | "/" | "%" ) unary } ;
+//! unary     = [ "-" ] postfix ;
+//! postfix   = primary { "." name | "(" [ expr { "," expr } ] ")" | "[" expr "]" } ;
+//! primary   = Number | String | "true" | "false" | "none" | "me" | "now" | "signed"
+//!           | name | "(" expr ")" | "{" [ expr { "," expr } ] "}"
+//!           | "[" [ listOrMap ] "]"
+//!           | "make" Name "{" [ name ":" expr { "," name ":" expr } ] "}" ;
+//! listOrMap = ":" | expr ( { "," expr } | ":" expr { "," expr ":" expr } ) ;
 //! ```
 //!
 //! # How operator chains are read (D43)
 //!
 //! The levels from `orExpr` down to `mulExpr` are not one function each.
 //! [`expr`] reads them by precedence climbing with its own stack of
-//! [`Pending`] operators: it reads an operand, then looks at the next binary
+//! [`Pending`] operators: it reads an operand, then looks at the next infix
 //! operator and first combines every pending operator that binds at least as
 //! tightly. Prefix `not` waits on the same stack. So a chain such as
-//! `1 + 1 + ... + 1` or `not not ... x` costs heap memory, never native stack,
-//! however long it is. The AST height limit (D54) then ends a chain that is
-//! too high for the later recursive passes.
+//! `1 + 1 + ... + 1`, `a ?? b ?? ...` or `not not ... x` costs heap memory,
+//! never native stack, however long it is. The AST height limit (D54) then
+//! ends a chain that is too high for the later recursive passes.
 //!
-//! Native recursion happens only through brackets: a call's arguments, a
-//! parenthesized expression and the expression of a string interpolation.
-//! Calls and parentheses pass [`Parser::enter`], so their depth is bounded by
-//! the nesting limit; an interpolation cannot contain another string (G1), so
-//! it adds at most one level around them.
+//! Comparisons (`in` and `not in` included) and the range operator `..` do
+//! not chain: the grammar allows one of them per level. `catch` follows the
+//! value before the first `??` (G11).
 //!
-//! # Constructs of later milestones
-//!
-//! The AST of v0.1 has no node for `none`, `me`, `now`, `signed`, `make`,
-//! set, list and map literals, `.name`, `[expr]`, `..`, `??`, `catch`, `in`
-//! and `not in`. Each of them is reported once with `E0100 not available in
-//! v0.1` and the line is skipped, like the statement parser does for `for`.
+//! Native recursion happens only through brackets: call arguments, index
+//! brackets, parentheses, set, list and map literals, the field list of
+//! `make` and the expression of a string interpolation. Each bracket passes
+//! [`Parser::enter`], so the depth is bounded by the nesting limit; an
+//! interpolation cannot contain another string (G1), so it adds at most one
+//! level around them.
 
 use super::{ExprParse, ParseLimits, Parser, Stop, codes, text_range};
-use crate::ast::{BinaryOp, ExprId, ExprKind, Ident, Module, StrPart, TextRange, UnaryOp};
+use crate::ast::{
+    BinaryOp, ExprId, ExprKind, FieldInit, Ident, KeywordValue, MakeExpr, MapEntry, Module,
+    StrPart, TextRange, UnaryOp,
+};
 use crate::lex::{Keyword, Token, TokenKind};
 use ostrel_core::{Diagnostic, FileId};
 
@@ -62,7 +70,7 @@ pub fn parse(
     super::parse_with(src, file, tokens, lexed, ParseLimits::DEFAULT, &Exprs)
 }
 
-/// The expression parser of the v0.1 slice.
+/// The expression parser of the language.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Exprs;
 
@@ -73,16 +81,31 @@ impl ExprParse for Exprs {
 }
 
 /// Binding strength of the operator levels, from loosest to tightest
-/// (`docs/grammar.md` section 4). Unary `-` and calls bind tighter than all
-/// of them and are read with the operand.
+/// (`docs/grammar.md` section 4). Unary `-` and the postfix forms bind
+/// tighter than all of them and are read with the operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Prec {
     Or,
     And,
     Not,
     Cmp,
+    Fallback,
+    Range,
     Add,
     Mul,
+}
+
+/// An infix operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Infix {
+    /// One of the operators of the v0.1 slice.
+    Binary(BinaryOp),
+    /// `in`, or `not in` when `negated` is true.
+    In { negated: bool },
+    /// `??`
+    Fallback,
+    /// `..`
+    Range,
 }
 
 /// An operator on the stack of [`expr`], still waiting for its right
@@ -91,42 +114,45 @@ enum Prec {
 enum Pending {
     /// A prefix `not` that starts at byte offset `start`.
     Not { start: u32 },
-    /// A binary operator and its complete left operand.
-    Binary {
-        op: BinaryOp,
-        prec: Prec,
-        lhs: ExprId,
-    },
+    /// An infix operator and its complete left operand.
+    Infix { op: Infix, prec: Prec, lhs: ExprId },
 }
 
 impl Pending {
     fn prec(self) -> Prec {
         match self {
             Pending::Not { .. } => Prec::Not,
-            Pending::Binary { prec, .. } => prec,
+            Pending::Infix { prec, .. } => prec,
         }
     }
 }
 
-/// The binary operator that `kind` spells, if any.
-fn binary_op(kind: TokenKind) -> Option<(BinaryOp, Prec)> {
-    let op = match kind {
-        TokenKind::Kw(Keyword::Or) => (BinaryOp::Or, Prec::Or),
-        TokenKind::Kw(Keyword::And) => (BinaryOp::And, Prec::And),
-        TokenKind::EqEq => (BinaryOp::Eq, Prec::Cmp),
-        TokenKind::BangEq => (BinaryOp::Ne, Prec::Cmp),
-        TokenKind::Lt => (BinaryOp::Lt, Prec::Cmp),
-        TokenKind::Le => (BinaryOp::Le, Prec::Cmp),
-        TokenKind::Gt => (BinaryOp::Gt, Prec::Cmp),
-        TokenKind::Ge => (BinaryOp::Ge, Prec::Cmp),
-        TokenKind::Plus => (BinaryOp::Add, Prec::Add),
-        TokenKind::Minus => (BinaryOp::Sub, Prec::Add),
-        TokenKind::Star => (BinaryOp::Mul, Prec::Mul),
-        TokenKind::Slash => (BinaryOp::Div, Prec::Mul),
-        TokenKind::Percent => (BinaryOp::Rem, Prec::Mul),
-        _ => return None,
-    };
-    Some(op)
+/// The infix operator at the current token, its level and the number of
+/// tokens it takes (2 for `not in`).
+fn infix(p: &Parser<'_>) -> Option<(Infix, Prec, usize)> {
+    let binary = |op| Some((Infix::Binary(op), Prec::Cmp, 1));
+    match p.peek() {
+        TokenKind::Kw(Keyword::Or) => Some((Infix::Binary(BinaryOp::Or), Prec::Or, 1)),
+        TokenKind::Kw(Keyword::And) => Some((Infix::Binary(BinaryOp::And), Prec::And, 1)),
+        TokenKind::EqEq => binary(BinaryOp::Eq),
+        TokenKind::BangEq => binary(BinaryOp::Ne),
+        TokenKind::Lt => binary(BinaryOp::Lt),
+        TokenKind::Le => binary(BinaryOp::Le),
+        TokenKind::Gt => binary(BinaryOp::Gt),
+        TokenKind::Ge => binary(BinaryOp::Ge),
+        TokenKind::Kw(Keyword::In) => Some((Infix::In { negated: false }, Prec::Cmp, 1)),
+        TokenKind::Kw(Keyword::Not) if p.nth(1) == TokenKind::Kw(Keyword::In) => {
+            Some((Infix::In { negated: true }, Prec::Cmp, 2))
+        }
+        TokenKind::QuestionQuestion => Some((Infix::Fallback, Prec::Fallback, 1)),
+        TokenKind::DotDot => Some((Infix::Range, Prec::Range, 1)),
+        TokenKind::Plus => Some((Infix::Binary(BinaryOp::Add), Prec::Add, 1)),
+        TokenKind::Minus => Some((Infix::Binary(BinaryOp::Sub), Prec::Add, 1)),
+        TokenKind::Star => Some((Infix::Binary(BinaryOp::Mul), Prec::Mul, 1)),
+        TokenKind::Slash => Some((Infix::Binary(BinaryOp::Div), Prec::Mul, 1)),
+        TokenKind::Percent => Some((Infix::Binary(BinaryOp::Rem), Prec::Mul, 1)),
+        _ => None,
+    }
 }
 
 /// Reads one expression (`orExpr`) by precedence climbing.
@@ -149,31 +175,44 @@ fn expr(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
         }
 
         let mut operand = operand(p)?;
-        reject_later_operator(p)?;
-        let next = binary_op(p.peek());
+        if p.peek() == TokenKind::Kw(Keyword::Catch) {
+            operand = catch(p, &mut pending, operand)?;
+        }
+        let next = infix(p);
 
         // Combine every pending operator that binds at least as tightly as
         // the next one; all of them at the end of the expression. This makes
-        // the binary levels left associative.
+        // the chaining levels left associative.
         while let Some(&top) = pending.last() {
-            if let Some((_, next_prec)) = next {
+            if let Some((_, next_prec, _)) = next {
                 if top.prec() < next_prec {
                     break;
                 }
-                if top.prec() == Prec::Cmp && next_prec == Prec::Cmp {
-                    let at = p.current();
-                    return Err(p.report(codes::COMPARISON_CHAIN, at, codes::MSG_COMPARISON_CHAIN));
+                if top.prec() == next_prec {
+                    if next_prec == Prec::Cmp {
+                        let at = p.current();
+                        return Err(p.report(
+                            codes::COMPARISON_CHAIN,
+                            at,
+                            codes::MSG_COMPARISON_CHAIN,
+                        ));
+                    }
+                    if next_prec == Prec::Range {
+                        return Err(p.expected("the end of the range (`..` does not chain)"));
+                    }
                 }
             }
             pending.pop();
             operand = combine(p, top, operand)?;
         }
 
-        let Some((op, prec)) = next else {
+        let Some((op, prec, tokens)) = next else {
             return Ok(operand);
         };
-        p.bump();
-        pending.push(Pending::Binary {
+        for _ in 0..tokens {
+            p.bump();
+        }
+        pending.push(Pending::Infix {
             op,
             prec,
             lhs: operand,
@@ -193,27 +232,69 @@ fn combine(p: &mut Parser<'_>, pending: Pending, rhs: ExprId) -> Result<ExprId, 
             };
             p.add_expr(kind, range)
         }
-        Pending::Binary { op, lhs, .. } => {
+        Pending::Infix { op, lhs, .. } => {
             let range = range_of(p, lhs).cover(range_of(p, rhs));
-            p.add_expr(ExprKind::Binary { op, lhs, rhs }, range)
+            let kind = match op {
+                Infix::Binary(op) => ExprKind::Binary { op, lhs, rhs },
+                Infix::In { negated } => ExprKind::In {
+                    element: lhs,
+                    collection: rhs,
+                    negated,
+                },
+                Infix::Fallback => ExprKind::Fallback {
+                    value: lhs,
+                    fallback: rhs,
+                },
+                Infix::Range => ExprKind::Range { lo: lhs, hi: rhs },
+            };
+            p.add_expr(kind, range)
         }
     }
 }
 
-/// Reports E0100 for a binary operator of a later milestone after an
-/// operand: `..`, `??`, `catch`, `in` and `not in`.
-fn reject_later_operator(p: &mut Parser<'_>) -> Result<(), Stop> {
-    let what = match p.peek() {
-        TokenKind::DotDot => "the range operator `..`",
-        TokenKind::QuestionQuestion => "the fallback operator `??`",
-        TokenKind::Kw(Keyword::Catch) => "`catch`",
-        TokenKind::Kw(Keyword::In) => "the operator `in`",
-        TokenKind::Kw(Keyword::Not) if p.nth(1) == TokenKind::Kw(Keyword::In) => {
-            "the operator `not in`"
+/// `catch Name { "," Name }` after `operand` (G11); the current token is
+/// `catch`.
+///
+/// `catch` belongs to the whole `rangeExpr` before it, so the pending
+/// operators that bind more tightly than `??` are combined first. It must
+/// come before the first `??` of its `fbExpr`, and only once.
+fn catch(p: &mut Parser<'_>, pending: &mut Vec<Pending>, operand: ExprId) -> Result<ExprId, Stop> {
+    let mut value = operand;
+    while let Some(&top) = pending.last() {
+        if top.prec() <= Prec::Fallback {
+            break;
         }
-        _ => return Ok(()),
+        pending.pop();
+        value = combine(p, top, value)?;
+    }
+    if pending
+        .last()
+        .is_some_and(|top| top.prec() == Prec::Fallback)
+    {
+        return Err(p.expected(
+            "`??` or the end of the expression (`catch` stands right after the remote \
+             value, before the first `??`)",
+        ));
+    }
+    p.bump();
+    let mut kinds = Vec::new();
+    loop {
+        kinds.push(p.name("an error kind such as `Denied` after `catch`")?);
+        if p.peek() != TokenKind::Comma {
+            break;
+        }
+        p.bump();
+    }
+    let range = text_range(range_of(p, value).start(), p.prev_end());
+    let kind = ExprKind::Catch {
+        value,
+        kinds: kinds.into_boxed_slice(),
     };
-    Err(not_in_v0_1(p, what))
+    let caught = p.add_expr(kind, range)?;
+    if p.peek() == TokenKind::Kw(Keyword::Catch) {
+        return Err(p.expected("`??` (name all error kinds after one `catch`)"));
+    }
+    Ok(caught)
 }
 
 /// `unary = [ "-" ] postfix`. The minus applies once (`docs/grammar.md` 3).
@@ -234,16 +315,40 @@ fn operand(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
     p.add_expr(kind, range)
 }
 
-/// `postfix = primary { "(" args ")" }`.
+/// `postfix = primary { "." name | "(" args ")" | "[" expr "]" }`.
 fn postfix(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
     let mut value = primary(p)?;
     loop {
         match p.peek() {
             TokenKind::LParen => value = call(p, value)?,
-            TokenKind::Dot => return Err(not_in_v0_1(p, "field access with `.`")),
-            TokenKind::LBracket => return Err(not_in_v0_1(p, "indexing with `[...]`")),
+            TokenKind::Dot => {
+                p.bump();
+                let name = p.name("a field or property name after `.`")?;
+                let range = text_range(range_of(p, value).start(), name.range.end());
+                value = p.add_expr(ExprKind::Field { base: value, name }, range)?;
+            }
+            TokenKind::LBracket => {
+                let open = p.bump();
+                p.enter(open)?;
+                let index = expr(p).and_then(|index| close(p, TokenKind::RBracket, "`]`", index));
+                p.leave();
+                let index = index?;
+                let range = text_range(range_of(p, value).start(), p.prev_end());
+                value = p.add_expr(ExprKind::Index { base: value, index }, range)?;
+            }
             _ => return Ok(value),
         }
+    }
+}
+
+/// Consumes the closing bracket `kind` after `inner`, or reports E0028
+/// naming `what`.
+fn close<T>(p: &mut Parser<'_>, kind: TokenKind, what: &str, inner: T) -> Result<T, Stop> {
+    if p.peek() == kind {
+        p.bump();
+        Ok(inner)
+    } else {
+        Err(p.expected(what))
     }
 }
 
@@ -251,7 +356,7 @@ fn postfix(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
 fn call(p: &mut Parser<'_>, callee: ExprId) -> Result<ExprId, Stop> {
     let open = p.bump();
     p.enter(open)?;
-    let args = call_args(p);
+    let args = list_items(p, TokenKind::RParen, "`,` or `)`");
     p.leave();
     let args = args?;
     let range = range_of(p, callee).cover(text_range(open.span.start, p.prev_end()));
@@ -262,29 +367,30 @@ fn call(p: &mut Parser<'_>, callee: ExprId) -> Result<ExprId, Stop> {
     p.add_expr(kind, range)
 }
 
-/// The arguments of a call after its `(`, up to and including the `)`.
-fn call_args(p: &mut Parser<'_>) -> Result<Vec<ExprId>, Stop> {
-    let mut args = Vec::new();
-    if p.peek() == TokenKind::RParen {
+/// Comma separated expressions after an opening bracket, up to and
+/// including the closing bracket `end`.
+fn list_items(p: &mut Parser<'_>, end: TokenKind, what: &str) -> Result<Vec<ExprId>, Stop> {
+    let mut items = Vec::new();
+    if p.peek() == end {
         p.bump();
-        return Ok(args);
+        return Ok(items);
     }
     loop {
-        args.push(expr(p)?);
+        items.push(expr(p)?);
         match p.peek() {
             TokenKind::Comma => {
                 p.bump();
             }
-            TokenKind::RParen => {
+            kind if kind == end => {
                 p.bump();
-                return Ok(args);
+                return Ok(items);
             }
-            _ => return Err(p.expected("`,` or `)`")),
+            _ => return Err(p.expected(what)),
         }
     }
 }
 
-/// `primary = Number | String | "true" | "false" | name | "(" expr ")"`.
+/// `primary`, see the grammar in the module documentation.
 fn primary(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
     let tok = p.current();
     let range = text_range(tok.span.start, tok.span.end);
@@ -292,6 +398,10 @@ fn primary(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
         TokenKind::Int => ExprKind::Int(int_value(p.text(tok))),
         TokenKind::Kw(Keyword::True) => ExprKind::Bool(true),
         TokenKind::Kw(Keyword::False) => ExprKind::Bool(false),
+        TokenKind::Kw(Keyword::None) => ExprKind::Keyword(KeywordValue::NoneValue),
+        TokenKind::Kw(Keyword::Me) => ExprKind::Keyword(KeywordValue::Me),
+        TokenKind::Kw(Keyword::Now) => ExprKind::Keyword(KeywordValue::Now),
+        TokenKind::Kw(Keyword::Signed) => ExprKind::Keyword(KeywordValue::Signed),
         TokenKind::Ident => ExprKind::Name(Ident::new(p.text(tok), range)),
         TokenKind::Str => {
             let mut parts = Vec::new();
@@ -300,11 +410,9 @@ fn primary(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
         }
         TokenKind::StrHead => return interpolated(p),
         TokenKind::LParen => return parenthesized(p),
-        TokenKind::LBrace => return Err(not_in_v0_1(p, "a set literal")),
-        TokenKind::LBracket => return Err(not_in_v0_1(p, "a list or map literal")),
-        TokenKind::Kw(
-            kw @ (Keyword::None | Keyword::Me | Keyword::Now | Keyword::Signed | Keyword::Make),
-        ) => return Err(not_in_v0_1(p, &format!("`{}`", kw.as_str()))),
+        TokenKind::LBrace => return set_literal(p),
+        TokenKind::LBracket => return list_or_map(p),
+        TokenKind::Kw(Keyword::Make) => return make(p),
         TokenKind::Kw(kw) if !is_operator_word(kw) => {
             let msg = codes::msg_keyword_as_name(kw);
             return Err(p.report(codes::KEYWORD_AS_NAME, tok, msg));
@@ -322,6 +430,139 @@ fn is_operator_word(kw: Keyword) -> bool {
         kw,
         Keyword::And | Keyword::Or | Keyword::Not | Keyword::In | Keyword::Catch
     )
+}
+
+/// `"{" [ expr { "," expr } ] "}"`, a set literal (G2); the current token is
+/// the `{`.
+fn set_literal(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
+    let open = p.bump();
+    p.enter(open)?;
+    let items = list_items(p, TokenKind::RBrace, "`,` or `}`");
+    p.leave();
+    let items = items?;
+    let range = text_range(open.span.start, p.prev_end());
+    p.add_expr(ExprKind::Set(items.into_boxed_slice()), range)
+}
+
+/// `"[" [ listOrMap ] "]"`, a list or map literal (G2); the current token is
+/// the `[`. The first element decides: `k: v` makes a map, `[:]` is the
+/// empty map.
+fn list_or_map(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
+    let open = p.bump();
+    p.enter(open)?;
+    let kind = list_or_map_items(p);
+    p.leave();
+    let kind = kind?;
+    let range = text_range(open.span.start, p.prev_end());
+    p.add_expr(kind, range)
+}
+
+fn list_or_map_items(p: &mut Parser<'_>) -> Result<ExprKind, Stop> {
+    match p.peek() {
+        TokenKind::RBracket => {
+            p.bump();
+            return Ok(ExprKind::List(Box::default()));
+        }
+        TokenKind::Colon => {
+            p.bump();
+            return close(
+                p,
+                TokenKind::RBracket,
+                "`]` after `[:`",
+                ExprKind::Map(Box::default()),
+            );
+        }
+        _ => {}
+    }
+    let first = expr(p)?;
+    if p.peek() != TokenKind::Colon {
+        let mut items = vec![first];
+        match p.peek() {
+            TokenKind::RBracket => {
+                p.bump();
+            }
+            TokenKind::Comma => {
+                p.bump();
+                items.extend(list_items(p, TokenKind::RBracket, "`,` or `]`")?);
+            }
+            _ => return Err(p.expected("`,`, `:` or `]`")),
+        }
+        return Ok(ExprKind::List(items.into_boxed_slice()));
+    }
+    let mut entries = Vec::new();
+    let mut key = first;
+    loop {
+        if p.peek() != TokenKind::Colon {
+            return Err(p.expected("`:` and a value (every entry of a map is `key: value`)"));
+        }
+        p.bump();
+        let value = expr(p)?;
+        entries.push(MapEntry { key, value });
+        match p.peek() {
+            TokenKind::RBracket => {
+                p.bump();
+                return Ok(ExprKind::Map(entries.into_boxed_slice()));
+            }
+            TokenKind::Comma => {
+                p.bump();
+            }
+            _ => return Err(p.expected("`,` or `]`")),
+        }
+        key = expr(p)?;
+    }
+}
+
+/// `"make" Name "{" [ name ":" expr { "," name ":" expr } ] "}"`; the current
+/// token is `make`.
+fn make(p: &mut Parser<'_>) -> Result<ExprId, Stop> {
+    let kw = p.bump();
+    let ty = p.name("a data type name after `make`")?;
+    if p.peek() != TokenKind::LBrace {
+        let what = format!("`{{` and the field values after `make {}`", ty.text);
+        return Err(p.expected(&what));
+    }
+    let open = p.bump();
+    p.enter(open)?;
+    let fields = make_fields(p);
+    p.leave();
+    let fields = fields?;
+    let range = text_range(kw.span.start, p.prev_end());
+    let make = MakeExpr {
+        ty,
+        fields: fields.into_boxed_slice(),
+    };
+    p.add_expr(ExprKind::Make(Box::new(make)), range)
+}
+
+/// The `name: value` pairs of `make` after its `{`, up to and including the
+/// `}`.
+fn make_fields(p: &mut Parser<'_>) -> Result<Vec<FieldInit>, Stop> {
+    let mut fields = Vec::new();
+    if p.peek() == TokenKind::RBrace {
+        p.bump();
+        return Ok(fields);
+    }
+    loop {
+        let name = p.name("a field name")?;
+        if p.peek() != TokenKind::Colon {
+            let what = format!("`:` and a value after field `{}`", name.text);
+            return Err(p.expected(&what));
+        }
+        p.bump();
+        let value = expr(p)?;
+        let range = text_range(name.range.start(), range_of(p, value).end());
+        fields.push(FieldInit { name, value, range });
+        match p.peek() {
+            TokenKind::Comma => {
+                p.bump();
+            }
+            TokenKind::RBrace => {
+                p.bump();
+                return Ok(fields);
+            }
+            _ => return Err(p.expected("`,` or `}`")),
+        }
+    }
 }
 
 /// `"(" expr ")"`; the current token is the `(`.
@@ -461,12 +702,6 @@ fn range_of(p: &Parser<'_>, id: ExprId) -> TextRange {
         .map_or(TextRange::default(), |e| e.range)
 }
 
-/// Reports E0100 for `what` at the current token.
-fn not_in_v0_1(p: &mut Parser<'_>, what: &str) -> Stop {
-    let at = p.current();
-    p.report(codes::NOT_IN_V0_1, at, codes::msg_not_in_v0_1(what))
-}
-
 #[cfg(test)]
 mod tests {
     //! Unit tests of the expression parser. Sources go through the real
@@ -511,45 +746,7 @@ mod tests {
 
     /// An expression as an S-expression, for example `(+ 1 (* 2 3))`.
     fn sexpr(m: &Module, id: ExprId) -> String {
-        let Some(e) = m.expr(id) else {
-            return "<missing>".into();
-        };
-        match &e.kind {
-            ExprKind::Int(v) => v.to_string(),
-            ExprKind::Bool(b) => b.to_string(),
-            ExprKind::Name(name) => name.text.to_string(),
-            ExprKind::Str(parts) => {
-                let parts: Vec<String> = parts
-                    .iter()
-                    .map(|part| match part {
-                        StrPart::Text(t) => format!("{t:?}"),
-                        StrPart::Interp(i) => format!("{{{}}}", sexpr(m, *i)),
-                    })
-                    .collect();
-                format!("(str {})", parts.join(" "))
-            }
-            ExprKind::Unary { op, operand } => {
-                let op = match op {
-                    UnaryOp::Neg => "neg",
-                    UnaryOp::Not => "not",
-                };
-                format!("({op} {})", sexpr(m, *operand))
-            }
-            ExprKind::Binary { op, lhs, rhs } => {
-                format!("({} {} {})", op.as_str(), sexpr(m, *lhs), sexpr(m, *rhs))
-            }
-            ExprKind::Call { callee, args } => {
-                let mut out = format!("(call {}", sexpr(m, *callee));
-                for arg in args.iter() {
-                    out.push(' ');
-                    out.push_str(&sexpr(m, *arg));
-                }
-                out + ")"
-            }
-            ExprKind::Paren(inner) => format!("(paren {})", sexpr(m, *inner)),
-            // The v0.1 parser builds none of the v0.2 kinds.
-            other => format!("<unexpected {other:?}>"),
-        }
+        super::super::items::dump::expr(m, id)
     }
 
     /// Parses `let x = <expr>` that must have no diagnostic; returns the
@@ -764,12 +961,20 @@ mod tests {
                         StrPart::Text(_) => None,
                     })
                     .collect(),
-                ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Name(_) => Vec::new(),
-                // The v0.1 parser builds none of the v0.2 kinds.
-                other => {
-                    texts.push(format!("<unexpected {other:?}>"));
-                    Vec::new()
-                }
+                ExprKind::Field { base, .. } => vec![*base],
+                ExprKind::Index { base, index } => vec![*base, *index],
+                ExprKind::In {
+                    element,
+                    collection,
+                    ..
+                } => vec![*element, *collection],
+                ExprKind::Range { lo, hi } => vec![*lo, *hi],
+                ExprKind::Catch { value, .. } => vec![*value],
+                ExprKind::Fallback { value, fallback } => vec![*value, *fallback],
+                ExprKind::Set(items) | ExprKind::List(items) => items.to_vec(),
+                ExprKind::Map(entries) => entries.iter().flat_map(|e| [e.key, e.value]).collect(),
+                ExprKind::Make(make) => make.fields.iter().map(|f| f.value).collect(),
+                _ => Vec::new(),
             };
             children.reverse();
             todo.extend(children);
@@ -832,28 +1037,208 @@ mod tests {
         );
     }
 
+    // ----- v0.2 expressions (T119) -----
+
     #[test]
-    fn constructs_of_later_milestones_are_e0100() {
+    fn value_keywords_fields_and_indexes() {
+        assert_eq!(tree("none"), "none");
+        assert_eq!(tree("me == signed"), "(== me signed)");
+        assert_eq!(tree("now - days.days"), "(- now (. days days))");
+        assert_eq!(tree("m.author.handle"), "(. (. m author) handle)");
+        assert_eq!(tree("t.roles[me]"), "(index (. t roles) me)");
+        assert_eq!(tree("r.members.add(me)"), "(call (. (. r members) add) me)");
+        assert_eq!(tree("f(x)[0].y"), "(. (index (call f x) 0) y)");
+        assert_eq!(tree("-a.b"), "(neg (. a b))");
+    }
+
+    #[test]
+    fn membership_ranges_and_fallbacks() {
+        assert_eq!(tree("me in room.members"), "(in me (. room members))");
+        assert_eq!(tree("a not in b"), "(not-in a b)");
+        assert_eq!(tree("not a in b"), "(not (in a b))");
+        assert_eq!(tree("text.len in 1..2000"), "(in (. text len) (.. 1 2000))");
+        assert_eq!(tree("a + 1..b * 2"), "(.. (+ a 1) (* b 2))");
+        assert_eq!(tree("a ?? b ?? c"), "(?? (?? a b) c)");
+        assert_eq!(
+            tree("(team.roles[me] ?? guest) >= member"),
+            "(>= (paren (?? (index (. team roles) me) guest)) member)"
+        );
+        assert_eq!(tree("a ?? b == c"), "(== (?? a b) c)");
+        assert_eq!(tree("a ?? b + 1"), "(?? a (+ b 1))");
+        assert_eq!(
+            tree("added == {me} or removed == {me}"),
+            "(or (== added (set me)) (== removed (set me)))"
+        );
+    }
+
+    #[test]
+    fn catch_names_the_kinds_before_the_first_fallback() {
+        assert_eq!(
+            tree("f(x) catch Denied ?? y"),
+            "(?? (catch (call f x) Denied) y)"
+        );
+        assert_eq!(
+            tree("f(x) catch Denied, Invalid ?? y ?? z"),
+            "(?? (?? (catch (call f x) Denied Invalid) y) z)"
+        );
+        assert_eq!(tree("a + b catch Offline"), "(catch (+ a b) Offline)");
+        assert_eq!(
+            tree("not f(x) catch Denied"),
+            "(not (catch (call f x) Denied))"
+        );
+        assert_eq!(
+            tree("x == f(y) catch Denied ?? z"),
+            "(== x (?? (catch (call f y) Denied) z))"
+        );
+    }
+
+    #[test]
+    fn collection_literals_and_make() {
+        assert_eq!(tree("{}"), "(set)");
+        assert_eq!(tree("{a, b + 1}"), "(set a (+ b 1))");
+        assert_eq!(tree("[]"), "(list)");
+        assert_eq!(tree("[1, 2, 3]"), "(list 1 2 3)");
+        assert_eq!(tree("[:]"), "(map)");
+        assert_eq!(tree("[me: admin]"), "(map (me admin))");
+        assert_eq!(tree("[a: 1, b: {c}]"), "(map (a 1) (b (set c)))");
+        assert_eq!(tree("make Room {}"), "(make Room)");
+        assert_eq!(
+            tree("make Message { room: r, text: it }"),
+            "(make Message (room r) (text it))"
+        );
+        assert_eq!(
+            tree("make Team { roles: [me: admin] }.roles"),
+            "(. (make Team (roles (map (me admin)))) roles)"
+        );
+    }
+
+    #[test]
+    fn v0_2_ranges_cover_the_source_of_each_node() {
+        assert_eq!(
+            node_texts("t.roles[me] ?? guest"),
+            [
+                "t.roles[me] ?? guest",
+                "t.roles[me]",
+                "t.roles",
+                "t",
+                "me",
+                "guest"
+            ]
+        );
+        assert_eq!(
+            node_texts("f(x) catch Denied, Invalid"),
+            ["f(x) catch Denied, Invalid", "f(x)", "f", "x"]
+        );
+        assert_eq!(
+            node_texts("make M { a: [k: v], b: {1} }"),
+            [
+                "make M { a: [k: v], b: {1} }",
+                "[k: v]",
+                "k",
+                "v",
+                "{1}",
+                "1"
+            ]
+        );
+        assert_eq!(
+            node_texts("x not in 1..9"),
+            ["x not in 1..9", "x", "1..9", "1", "9"]
+        );
+    }
+
+    #[test]
+    fn faulty_v0_2_expressions_report_once() {
+        let msg = codes::MSG_COMPARISON_CHAIN.to_string();
+        assert_eq!(one_error("a in b in c"), (27, 7, msg.clone()));
+        assert_eq!(one_error("a == b not in c"), (27, 7, msg));
         let cases = [
-            ("none", 0, "`none`"),
-            ("me", 0, "`me`"),
-            ("now", 0, "`now`"),
-            ("signed", 0, "`signed`"),
-            ("make Msg { text: t }", 0, "`make`"),
-            ("{1, 2}", 0, "a set literal"),
-            ("[1, 2]", 0, "a list or map literal"),
-            ("a.len", 1, "field access with `.`"),
-            ("f(x)[0]", 4, "indexing with `[...]`"),
-            ("1..5", 1, "the range operator `..`"),
-            ("a ?? b", 2, "the fallback operator `??`"),
-            ("f(x) catch Denied", 5, "`catch`"),
-            ("a in b", 2, "the operator `in`"),
-            ("a not in b", 2, "the operator `not in`"),
-            ("1 + a.b", 5, "field access with `.`"),
+            (
+                "1..2..3",
+                4,
+                "the end of the range (`..` does not chain)",
+                "`..`",
+            ),
+            (
+                "a ?? b catch Denied",
+                7,
+                "`??` or the end of the expression (`catch` stands right after the remote \
+                 value, before the first `??`)",
+                "`catch`",
+            ),
+            (
+                "f(x) catch Denied catch Invalid",
+                18,
+                "`??` (name all error kinds after one `catch`)",
+                "`catch`",
+            ),
+            (
+                "f(x) catch",
+                10,
+                "an error kind such as `Denied` after `catch`",
+                "end of line",
+            ),
+            ("a.", 2, "a field or property name after `.`", "end of line"),
+            ("a[1", 3, "`]`", "end of line"),
+            ("{1 2}", 3, "`,` or `}`", "`2`"),
+            ("[1, 2: 3]", 5, "`,` or `]`", "`:`"),
+            (
+                "[1: 2, 3]",
+                8,
+                "`:` and a value (every entry of a map is `key: value`)",
+                "`]`",
+            ),
+            ("[1 2]", 3, "`,`, `:` or `]`", "`2`"),
+            ("[:", 2, "`]` after `[:`", "end of line"),
+            ("make", 4, "a data type name after `make`", "end of line"),
+            (
+                "make M(a)",
+                6,
+                "`{` and the field values after `make M`",
+                "`(`",
+            ),
+            ("make M { a }", 11, "`:` and a value after field `a`", "`}`"),
+            ("make M { a: 1 b: 2 }", 14, "`,` or `}`", "`b`"),
         ];
-        for (expr, at, what) in cases {
-            let expected = (100, at, codes::msg_not_in_v0_1(what));
+        for (expr, at, what, found) in cases {
+            let expected = (28, at, codes::msg_expected(what, found));
             assert_eq!(one_error(expr), expected, "{expr}");
+        }
+        assert_eq!(
+            one_error("a.if"),
+            (
+                26,
+                2,
+                "`if` is a keyword and cannot be used as a name".into()
+            )
+        );
+        assert_eq!(
+            one_error("make M { if: 1 }"),
+            (
+                26,
+                9,
+                "`if` is a keyword and cannot be used as a name".into()
+            )
+        );
+    }
+
+    #[test]
+    fn long_fallback_chains_and_nested_literals_are_bounded() {
+        let lifted = limits(MAX_DEPTH, u32::MAX, u32::MAX);
+        let chain = vec!["a"; 50_000].join(" ?? ");
+        assert!(diags_of(&wrap(&chain), lifted).is_empty());
+        // Every bracket form counts as one nesting level.
+        for (open, close) in [("{", "}"), ("[", "]"), ("a[", "]"), ("make M { f: ", " }")] {
+            let ok = format!("{}1{}", open.repeat(255), close.repeat(255));
+            assert!(
+                diags_of(&wrap(&ok), ParseLimits::DEFAULT).is_empty(),
+                "{open}"
+            );
+            let deep = format!("{}1{}", open.repeat(256), close.repeat(256));
+            let codes: Vec<u16> = diags_of(&wrap(&deep), ParseLimits::DEFAULT)
+                .iter()
+                .map(|d| d.0)
+                .collect();
+            assert_eq!(codes, [29], "{open}");
         }
     }
 

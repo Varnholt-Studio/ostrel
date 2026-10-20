@@ -1,4 +1,4 @@
-//! Parser for the v0.1 slice (ARCHITECTURE 3.4, SYNTAX 7, WP T1-3).
+//! Parser (ARCHITECTURE 3.4, SYNTAX 7, WP T1-3, T119).
 //!
 //! The parser turns the tokens of one file into an [`ast::Module`](crate::ast::Module) and never
 //! fails: every fault is a [`Diagnostic`]. It reads declarations, blocks and
@@ -9,29 +9,35 @@
 //! # Grammar read here
 //!
 //! ```text
-//! program = { fnDecl } ;
-//! fnDecl  = "fn" name "(" [ name ":" type { "," name ":" type } ] ")" [ "->" type ] block ;
+//! program = { decl } ;
 //! block   = NL INDENT { stmt } DEDENT ;
 //! stmt    = "let" name "=" expr NL
-//!         | "if" expr block [ "else" block ]
+//!         | "if" cond block [ "else" block ]
+//!         | "for" name "in" source block
+//!         | "drop" source NL
 //!         | "return" expr NL
-//!         | expr NL ;
+//!         | expr [ "=" expr ] NL ;
+//! cond    = "let" name "=" expr | expr ;
 //! ```
 //!
-//! Other declarations and statements of SYNTAX 7 (`data`, `for`, assignment,
-//! `if let` and so on) are reported once with `E0100 not available in v0.1`
-//! and skipped, so the next item or statement still parses.
+//! The declarations (`decl`), `source` and the function heads with their
+//! `call` rule are read in [`items`]. `extern` (v0.3, D95) is reported once
+//! with `E0100` and skipped, so the next item still parses. Which of the
+//! parsed constructs a stage accepts is decided by that stage: the v0.1
+//! checker reports `E0100 not available in v0.1` for everything outside the
+//! slice (ARCHITECTURE 3.4).
 //!
 //! # Recovery
 //!
 //! One fault gives one diagnostic (SPEC 12.1):
 //!
-//! * A fault in a statement skips the rest of its logical line. An indented
-//!   block below a line that no known block head opened is skipped without a
-//!   further diagnostic.
-//! * A fault in a block head (`fn`, `if`, `else`) skips the rest of the head
-//!   line, but the block below it is still parsed, so faults inside the block
-//!   are reported and nothing in it is reported twice.
+//! * A fault in a statement or a line of a declaration skips the rest of its
+//!   logical line. An indented block below a line that no known block head
+//!   opened is skipped without a further diagnostic.
+//! * A fault in a block head (`fn`, `if`, `else`, `for`, `data`, `view`, an
+//!   element line and so on) skips the rest of the head line, but the block
+//!   below it is still parsed, so faults inside the block are reported and
+//!   nothing in it is reported twice.
 //! * A logical line on which a lexer diagnostic starts has already been
 //!   reported. The parser never reports a second diagnostic on such a line.
 //!   The lines are found from the spans of the lexer diagnostics passed to
@@ -54,6 +60,7 @@
 
 pub mod codes;
 mod expr;
+mod items;
 
 #[cfg(test)]
 mod tests;
@@ -61,8 +68,8 @@ mod tests;
 pub use expr::{Exprs, parse};
 
 use crate::ast::{
-    AstError, BlockId, ExprId, ExprKind, FnDecl, Ident, Limits, Module, Param, StmtId, StmtKind,
-    TextRange, TypeRef,
+    AstError, BlockId, CallRule, Cond, ExprId, ExprKind, Ident, Limits, Module, StmtId, StmtKind,
+    TextRange,
 };
 use crate::lex::{Keyword, Token, TokenKind};
 use ostrel_core::{Code, Diagnostic, FileId, Span};
@@ -458,16 +465,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Recovery after a faulty block head: skip the rest of the head line and
-    /// parse the block below it, if any, for its own diagnostics.
-    fn recover_head(&mut self) -> Result<(), Stop> {
-        self.skip_line();
-        if self.peek() == TokenKind::Indent {
-            self.block()?;
-        }
-        Ok(())
-    }
-
     /// Consumes a lone `}` line left over from a block opened with `{`.
     fn skip_closing_brace(&mut self) -> bool {
         if self.peek() == TokenKind::RBrace && self.braces > 0 {
@@ -514,120 +511,28 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         self.check_unclosed()?;
-        let not_in_slice = |what: &str| codes::msg_not_in_v0_1(what);
         match tok.kind {
-            TokenKind::Kw(Keyword::Fn) => match self.fn_decl() {
-                Err(Stop::Line) => self.recover_head(),
-                other => other,
-            },
-            TokenKind::Kw(
-                kw @ (Keyword::App
-                | Keyword::Data
-                | Keyword::Enum
-                | Keyword::Var
-                | Keyword::View
-                | Keyword::Style
-                | Keyword::Extern),
-            ) => {
-                let what = format!("`{}` declaration", kw.as_str());
-                Err(self.report(codes::NOT_IN_V0_1, tok, not_in_slice(&what)))
-            }
+            TokenKind::Kw(Keyword::Fn) => self.fn_decl(),
             TokenKind::Kw(Keyword::Server) if self.nth(1) == TokenKind::Kw(Keyword::Fn) => {
-                Err(self.report(codes::NOT_IN_V0_1, tok, not_in_slice("`server fn`")))
+                self.fn_decl()
             }
             TokenKind::Ident
                 if self.is_word(tok, "client") && self.nth(1) == TokenKind::Kw(Keyword::Fn) =>
             {
-                Err(self.report(codes::NOT_IN_V0_1, tok, not_in_slice("`client fn`")))
+                self.fn_decl()
+            }
+            TokenKind::Kw(Keyword::App) => self.app_decl(),
+            TokenKind::Kw(Keyword::Enum) => self.enum_decl(),
+            TokenKind::Kw(Keyword::Data) => self.data_decl(),
+            TokenKind::Kw(Keyword::Var) => self.var_decl(),
+            TokenKind::Kw(Keyword::View) => self.view_decl(),
+            TokenKind::Kw(Keyword::Style) => self.style_decl(),
+            TokenKind::Kw(Keyword::Extern) => {
+                let what = codes::msg_not_in_v0_1("`extern` declaration");
+                Err(self.report(codes::NOT_IN_V0_1, tok, what))
             }
             _ => Err(self.expected("a declaration such as `fn main()`")),
         }
-    }
-
-    fn fn_decl(&mut self) -> Result<(), Stop> {
-        let fn_tok = self.bump();
-        let name = self.name("a function name after `fn`")?;
-        if self.peek() != TokenKind::LParen {
-            return Err(self.expected("`(` after the function name"));
-        }
-        let open = self.bump();
-        self.enter(open)?;
-        let params = self.params();
-        self.leave();
-        let params = params?;
-        let result = if self.peek() == TokenKind::Arrow {
-            self.bump();
-            Some(self.type_ref()?)
-        } else {
-            None
-        };
-        if self.peek() == TokenKind::Kw(Keyword::As) {
-            let at = self.current();
-            return Err(self.report(
-                codes::NOT_IN_V0_1,
-                at,
-                codes::msg_not_in_v0_1("`as system`"),
-            ));
-        }
-        let what = format!("`{}`", name.text);
-        self.head_end()?;
-        let Some(body) = self.block_after_head(&format!("as the body of {what}"))? else {
-            return Ok(());
-        };
-        let end = self
-            .module
-            .block(body)
-            .map_or(self.prev_end(), |b| b.range.end());
-        let decl = FnDecl {
-            name,
-            params: params.into_boxed_slice(),
-            result,
-            body,
-            range: text_range(fn_tok.span.start, end),
-        };
-        let added = self.module.add_fn(decl);
-        self.tree(added)
-    }
-
-    fn params(&mut self) -> Result<Vec<Param>, Stop> {
-        let mut params = Vec::new();
-        if self.peek() == TokenKind::RParen {
-            self.bump();
-            return Ok(params);
-        }
-        loop {
-            let name = self.name("a parameter name")?;
-            if self.peek() != TokenKind::Colon {
-                let what = format!("`:` and a type after parameter `{}`", name.text);
-                return Err(self.expected(&what));
-            }
-            self.bump();
-            let ty = self.type_ref()?;
-            params.push(Param::new(name, ty));
-            match self.peek() {
-                TokenKind::Comma => {
-                    self.bump();
-                }
-                TokenKind::RParen => {
-                    self.bump();
-                    return Ok(params);
-                }
-                _ => return Err(self.expected("`,` or `)`")),
-            }
-        }
-    }
-
-    fn type_ref(&mut self) -> Result<TypeRef, Stop> {
-        if self.peek() != TokenKind::Ident {
-            return Err(self.expected("a type name"));
-        }
-        let tok = self.bump();
-        let what = match self.peek() {
-            TokenKind::Question => "an optional type",
-            TokenKind::LBracket => "a type with type arguments",
-            _ => return Ok(TypeRef::named(self.ident(tok))),
-        };
-        Err(self.report(codes::NOT_IN_V0_1, tok, codes::msg_not_in_v0_1(what)))
     }
 
     /// A name where the grammar wants one; a keyword is E0026.
@@ -714,9 +619,17 @@ impl<'a> Parser<'a> {
     /// `INDENT { stmt } DEDENT`. Statement faults are handled inside; only a
     /// limit stops it.
     fn block(&mut self) -> Result<BlockId, Stop> {
+        self.block_with(None)
+    }
+
+    /// [`Parser::block`] that, when `call` is given, reads a `call` rule on
+    /// the first line of the block into it (a function body, SYNTAX 7
+    /// `fnDecl`). The rule is not a statement of the block.
+    fn block_with(&mut self, mut call: Option<&mut Option<CallRule>>) -> Result<BlockId, Stop> {
         let indent = self.bump();
         self.enter(indent)?;
         let mut stmts = Vec::new();
+        let mut first = true;
         loop {
             let before = self.pos;
             match self.peek() {
@@ -728,12 +641,24 @@ impl<'a> Parser<'a> {
                 TokenKind::Nl => {
                     self.bump();
                 }
-                _ => match self.stmt() {
-                    Ok(Some(stmt)) => stmts.push(stmt),
-                    Ok(None) => {}
-                    Err(Stop::Line) => self.recover(),
-                    Err(Stop::File) => return Err(Stop::File),
-                },
+                kind => {
+                    let result = match call.as_deref_mut() {
+                        Some(slot) if first && kind == TokenKind::Kw(Keyword::Call) => {
+                            self.call_rule().map(|rule| {
+                                *slot = Some(rule);
+                                None
+                            })
+                        }
+                        _ => self.stmt(),
+                    };
+                    first = false;
+                    match result {
+                        Ok(Some(stmt)) => stmts.push(stmt),
+                        Ok(None) => {}
+                        Err(Stop::Line) => self.recover(),
+                        Err(Stop::File) => return Err(Stop::File),
+                    }
+                }
             }
             if self.pos == before {
                 self.bump();
@@ -765,17 +690,15 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         self.check_unclosed()?;
-        let not_in_slice = |what: &str| codes::msg_not_in_v0_1(what);
         match tok.kind {
             TokenKind::Kw(Keyword::Let) => self.let_stmt().map(Some),
             TokenKind::Kw(Keyword::If) => self.if_stmt(),
             TokenKind::Kw(Keyword::Return) => self.return_stmt().map(Some),
-            TokenKind::Kw(Keyword::For) => {
-                Err(self.report(codes::NOT_IN_V0_1, tok, not_in_slice("`for`")))
-            }
-            TokenKind::Kw(Keyword::Drop) => {
-                Err(self.report(codes::NOT_IN_V0_1, tok, not_in_slice("`drop`")))
-            }
+            TokenKind::Kw(Keyword::For) => self.for_stmt(),
+            TokenKind::Kw(Keyword::Drop) => self.drop_stmt().map(Some),
+            TokenKind::Kw(Keyword::Call) => Err(self.expected(
+                "a statement (a `call` rule stands only on the first line of a function body)",
+            )),
             TokenKind::Kw(kw) if !starts_expr(kw) => Err(self.expected("a statement")),
             _ => self.expr_stmt().map(Some),
         }
@@ -811,20 +734,13 @@ impl<'a> Parser<'a> {
         self.tree(added)
     }
 
-    /// `if cond block [else block]`. A fault in a head line is reported and
-    /// the blocks are still parsed; then no statement is built.
+    /// `if cond block [else block]`, where `cond` is an expression or
+    /// `let name = value`. A fault in a head line is reported and the blocks
+    /// are still parsed; then no statement is built.
     fn if_stmt(&mut self) -> Result<Option<StmtId>, Stop> {
         let kw = self.bump();
-        let head = self.if_head();
-        let cond = match head {
-            Ok(cond) => Some(cond),
-            Err(Stop::File) => return Err(Stop::File),
-            Err(Stop::Line) => {
-                self.skip_line();
-                None
-            }
-        };
-        let then_block = self.block_after_head("after `if`")?;
+        let cond = self.head(Parser::cond)?;
+        let then_block = self.body_after(cond.is_some(), "after `if`")?;
         if self.peek() == TokenKind::RBrace
             && self.braces > 0
             && self.nth(1) == TokenKind::Kw(Keyword::Else)
@@ -845,23 +761,107 @@ impl<'a> Parser<'a> {
             .or(Some(then_block))
             .and_then(|b| self.module.block(b))
             .map_or(self.prev_end(), |b| b.range.end());
-        let kind = StmtKind::If {
-            cond,
-            then_block,
-            else_block,
+        let kind = match cond {
+            Cond::Expr(cond) => StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            },
+            Cond::Let { name, value } => StmtKind::IfLet {
+                name,
+                value,
+                then_block,
+                else_block,
+            },
         };
         let added = self.module.add_stmt(kind, text_range(kw.span.start, end));
         self.tree(added).map(Some)
     }
 
-    fn if_head(&mut self) -> Result<ExprId, Stop> {
-        let tok = self.current();
-        if tok.kind == TokenKind::Kw(Keyword::Let) {
-            return Err(self.report(codes::NOT_IN_V0_1, tok, codes::msg_not_in_v0_1("`if let`")));
+    /// Reads the rest of a block head with `read` and its line end. A fault
+    /// is reported and the rest of the line skipped; then `None` comes back,
+    /// so the caller still parses the block below the head.
+    fn head<T>(&mut self, read: fn(&mut Parser<'a>) -> Result<T, Stop>) -> Result<Option<T>, Stop> {
+        let head = read(self).and_then(|value| self.head_end().map(|()| value));
+        match head {
+            Ok(value) => Ok(Some(value)),
+            Err(Stop::File) => Err(Stop::File),
+            Err(Stop::Line) => {
+                self.skip_line();
+                Ok(None)
+            }
         }
-        let cond = self.expr()?;
-        self.head_end()?;
-        Ok(cond)
+    }
+
+    /// The block after a head line. A missing block is reported once, but
+    /// only after a head without fault (one fault, one diagnostic).
+    fn body_after(&mut self, head_ok: bool, what: &str) -> Result<Option<BlockId>, Stop> {
+        if !head_ok && self.peek() != TokenKind::Indent {
+            return Ok(None);
+        }
+        self.block_after_head(what)
+    }
+
+    /// `cond = "let" name "=" expr | expr`, the condition of an `if` in a
+    /// function body or a view.
+    fn cond(&mut self) -> Result<Cond, Stop> {
+        if self.peek() != TokenKind::Kw(Keyword::Let) {
+            return self.expr().map(Cond::Expr);
+        }
+        self.check_assign_operator()?;
+        self.bump();
+        let name = self.name("a name after `if let`")?;
+        if self.peek() != TokenKind::Eq {
+            return Err(self.expected(&format!("`=` after `if let {}`", name.text)));
+        }
+        self.bump();
+        let value = self.expr()?;
+        Ok(Cond::Let { name, value })
+    }
+
+    /// `for name in source block`. Like `if`, a faulty head still parses the
+    /// block.
+    fn for_stmt(&mut self) -> Result<Option<StmtId>, Stop> {
+        let kw = self.bump();
+        let head = self.head(Parser::for_head)?;
+        let body = self.body_after(head.is_some(), "as the body of `for`")?;
+        let (Some((name, source)), Some(body)) = (head, body) else {
+            return Ok(None);
+        };
+        let end = self
+            .module
+            .block(body)
+            .map_or(self.prev_end(), |b| b.range.end());
+        let kind = StmtKind::For { name, source, body };
+        let added = self.module.add_stmt(kind, text_range(kw.span.start, end));
+        self.tree(added).map(Some)
+    }
+
+    /// `name "in" source` after `for`, in a function body or a view.
+    fn for_head(&mut self) -> Result<(Ident, ExprId), Stop> {
+        let name = self.name("a loop variable after `for`")?;
+        if self.peek() != TokenKind::Kw(Keyword::In) {
+            return Err(self.expected("`in` after the loop variable (Ostrel writes `for x in xs`)"));
+        }
+        self.bump();
+        let source = self.source()?;
+        Ok((name, source))
+    }
+
+    /// `drop source`: one record or every record of a query.
+    fn drop_stmt(&mut self) -> Result<StmtId, Stop> {
+        let kw = self.bump();
+        if matches!(
+            self.peek(),
+            TokenKind::Nl | TokenKind::Eof | TokenKind::Dedent
+        ) {
+            return Err(self.expected("a record or a query after `drop`"));
+        }
+        let source = self.source()?;
+        let range = self.range_from(kw.span.start);
+        self.line_end()?;
+        let added = self.module.add_stmt(StmtKind::Drop { source }, range);
+        self.tree(added)
     }
 
     /// `else` and its block. `else if` on one line is E0024; the `if` is then
@@ -887,25 +887,36 @@ impl<'a> Parser<'a> {
             let added = self.module.add_block(vec![stmt], range);
             return self.tree(added).map(Some);
         }
-        match self.head_end() {
-            Ok(()) => {}
+        let head_ok = match self.head_end() {
+            Ok(()) => true,
             Err(Stop::File) => return Err(Stop::File),
-            Err(Stop::Line) => self.skip_line(),
-        }
-        self.block_after_head("after `else`")
+            Err(Stop::Line) => {
+                self.skip_line();
+                false
+            }
+        };
+        self.body_after(head_ok, "after `else`")
     }
 
+    /// `expr [ "=" expr ]`: an expression statement or an assignment. Which
+    /// targets are assignable is checked in sema (SYNTAX 7).
     fn expr_stmt(&mut self) -> Result<StmtId, Stop> {
         let start = self.current().span.start;
         self.check_assign_operator()?;
         let value = self.expr()?;
-        if self.peek() == TokenKind::Eq {
-            let at = self.current();
-            return Err(self.report(codes::NOT_IN_V0_1, at, codes::msg_not_in_v0_1("assignment")));
-        }
+        let kind = if self.peek() == TokenKind::Eq {
+            self.bump();
+            let new = self.expr()?;
+            StmtKind::Assign {
+                target: value,
+                value: new,
+            }
+        } else {
+            StmtKind::Expr(value)
+        };
         let range = self.range_from(start);
         self.line_end()?;
-        let added = self.module.add_stmt(StmtKind::Expr(value), range);
+        let added = self.module.add_stmt(kind, range);
         self.tree(added)
     }
 
