@@ -1,0 +1,17 @@
+// Case S-03 (EXPECTED.md 4): an outer loop variable named like a field of the inner query type.
+app Naming
+
+data Slot
+  at: Int
+  see if true
+
+data Post
+  text: Text
+  pos: Int
+  see if true
+
+view Main
+  col
+    for pos in Slot sort at
+      for p in Post where pos == 1
+        text p.text

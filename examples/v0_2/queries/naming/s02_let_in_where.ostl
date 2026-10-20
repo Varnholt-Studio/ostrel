@@ -1,0 +1,12 @@
+// Case S-02 (EXPECTED.md 4): a let name equal to a field of the queried type.
+app Naming
+
+data Post
+  text: Text
+  pos: Int
+  see if true
+  drop if true
+
+fn dropFirst()
+  let pos = 1
+  drop Post where pos == pos
