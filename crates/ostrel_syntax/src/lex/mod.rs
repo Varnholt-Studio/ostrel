@@ -261,7 +261,8 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             self.css = None;
         }
         let top = self.top();
-        if self.css.is_none() && column > top && self.css_pending.is_some() {
+        let opens_css = self.css.is_none() && column > top && self.css_pending.is_some();
+        if opens_css {
             // The first line deeper than a `style` line starts its CSS body.
             self.css = self.css_pending.take();
         }
@@ -270,7 +271,9 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         } else {
             rest.starts_with("//")
         };
-        if comment_only {
+        // The first line of a CSS body opens its block even when it holds only
+        // a comment, so the line that ends the body always closes it (D138).
+        if comment_only && !opens_css {
             // Comment only line: no layout tokens, nothing checked, unless it
             // ends a CSS body; then only the closing DEDENTs, still unchecked.
             if ends_css {
@@ -293,6 +296,12 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             // lines of that block are not reported again (D68).
             self.push(TokenKind::Indent, start, ws_end);
             self.indents.push(column);
+            if comment_only {
+                // A CSS body opened by a comment line: the line still ends
+                // with NL, so its block never shares a logical line with the
+                // line after the body.
+                self.line_has_tokens = true;
+            }
             return;
         }
         self.close_blocks(column);

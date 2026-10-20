@@ -17,6 +17,8 @@
 //!   `style` line ends the comment (E0015) and the body (D137, D138). A
 //!   comment that is not closed before the
 //!   end of the body is E0015 at its `/*` and ends there. `//` is CSS text.
+//!   The first line of the body opens its block even when it holds only a
+//!   comment, and then ends with NL like a line with CSS text (D138).
 //! * Everything else is CSS text: one [`TokenKind::Css`] token per run between
 //!   comments on a line. `;`, `$token`, `#id`, `@media` and quotes are not
 //!   checked; the lexer does not validate CSS.
@@ -488,6 +490,72 @@ mod tests {
     }
 
     #[test]
+    fn a_body_that_starts_with_comment_lines_opens_its_block_there() {
+        // The first body line opens the block also when it holds only a
+        // closed comment, so the comment line that ends the body closes it
+        // and the deeper `.c` line after it opens a new block outside.
+        let src = "style\n  /* x */\n// b\n  .c {}\n";
+        assert_eq!(
+            pairs(src),
+            [
+                (STYLE, "style"),
+                (Nl, "\n"),
+                (Indent, "  "),
+                (Comment, "/* x */"),
+                (Nl, "\n"),
+                (Dedent, ""),
+                (Comment, "// b"),
+                (Indent, "  "),
+                (TokenKind::Dot, "."),
+                (TokenKind::Ident, "c"),
+                (TokenKind::LBrace, "{"),
+                (TokenKind::RBrace, "}"),
+                (Nl, "\n"),
+                (Dedent, ""),
+                (Eof, ""),
+            ]
+        );
+        assert!(css_texts(src).is_empty());
+        assert!(diags(src).is_empty(), "{:?}", diags(src));
+        // The same with an open `/*`: E0015 at it, the body still closes on
+        // the `//` line.
+        let src = "style\n  /* a\n// b\n  .c {}\n";
+        let at = src.find("/*").unwrap_or(0) as u32;
+        assert_eq!(
+            diags(src),
+            vec![(codes::UNTERMINATED_CSS_COMMENT, at, at + 2)]
+        );
+        assert_eq!(
+            after_first_dedent(src).get(..3),
+            Some(&[(Dedent, ""), (Comment, "// b"), (Indent, "  ")][..])
+        );
+        assert_eq!(
+            kinds(src).get(..6),
+            Some(&[STYLE, Nl, Indent, Comment, Nl, Dedent][..])
+        );
+        // Two comment lines first, then the body goes on as CSS.
+        let src = "style\n  /* x */\n  /* y */\n  .c {}\n";
+        assert_eq!(
+            kinds(src),
+            vec![
+                STYLE, Nl, Indent, Comment, Nl, Comment, Css, Nl, Dedent, Eof
+            ]
+        );
+        assert_eq!(css_texts(src), [".c {}"]);
+        // A nested `style` closes back to its own column only.
+        let src = "a\n  style\n    /* x */\n  // b\n    .c {}\n";
+        assert_eq!(
+            after_first_dedent(src).get(..3),
+            Some(&[(Dedent, ""), (Comment, "// b"), (Indent, "    ")][..])
+        );
+        assert!(css_texts(src).is_empty());
+        // The opening comment line carries layout, so its column is checked
+        // like that of any first body line.
+        let src = "style\n   /* x */\n  .c {}\n";
+        assert_eq!(diags(src).first().map(|d| d.0), Some(codes::ODD_INDENT));
+    }
+
+    #[test]
     fn a_nested_style_body_ends_at_its_own_column() {
         let src = "a\n  style\n    .x {\n    }\n  b;\n";
         let at = src.find(';').unwrap_or(0) as u32;
@@ -574,14 +642,13 @@ mod tests {
             d.first(),
             Some(&(codes::UNTERMINATED_CSS_COMMENT, at, at + 2))
         );
-        // The ending line is code again (D137); the comment line opened no
-        // block, so there is nothing to close.
-        let p = pairs(src);
-        assert!(p.contains(&(TokenKind::Ident, "b")), "{p:?}");
-        assert!(
-            !p.iter().any(|(k, _)| *k == Indent || *k == Dedent),
-            "{p:?}"
+        // The ending line is code again (D137); the comment line opened the
+        // block of the body, so the ending line closes it before `b` (D138).
+        assert_eq!(
+            after_first_dedent(src).get(..2),
+            Some(&[(Dedent, ""), (TokenKind::Ident, "b")][..])
         );
+        assert_eq!(kinds(src).get(..3), Some(&[STYLE, Nl, Indent][..]));
         // With a block open, the ending line closes it before its first token.
         let src = "style\n  .a {\n  /* a\nb */\n";
         assert_eq!(
