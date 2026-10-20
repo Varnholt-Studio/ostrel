@@ -3,8 +3,9 @@
 //!
 //! The CLI needs only [`Host::print`]. The server adds by addition what a server function
 //! reaches outside the VM: the principal of the request, the clock, calls into the Node
-//! sidecar (ARCHITECTURE 7.2, D60), the audit log of elevated code (ARCHITECTURE 5.7,
-//! AC-32) and the database through the abstract interface `ostrel_db::api` (ARCHITECTURE 6).
+//! sidecar (ARCHITECTURE 7.2, D60) and the audit log of elevated code (ARCHITECTURE 5.7,
+//! AC-32). The database, through the abstract interface `ostrel_db::api` (ARCHITECTURE 6),
+//! is not a host method but sits next to the host in [`ServerContext`] (D117).
 //!
 //! Concurrency follows ARCHITECTURE 4.1: tokio `current_thread` with one `LocalSet`, one VM
 //! task per request or incoming batch, values `Rc` based. Every database call, sidecar call
@@ -19,8 +20,9 @@
 //! sidecar or write the audit entry inside it. Two disjoint borrows keep both usable.
 //!
 //! The incoming call of a server function (the RPC from a client, or a batch of ops) is not
-//! a host method: it is the entry into the VM. Its principal reaches the VM through
-//! [`ServerHost::principal`], and every rule the VM evaluates uses it (AC-11, AC-32).
+//! a host method: it is the entry into the VM, and the server never calls client code
+//! (ARCHITECTURE 4.3, D117). Its principal reaches the VM through [`ServerHost::principal`],
+//! and every rule the VM evaluates uses it (AC-11, AC-32).
 //!
 //! Values cross this boundary as the persisted and wire [`Value`] of `ostrel_core`; the VM
 //! converts its own `Rc` based values at the boundary (ARCHITECTURE 5.3).
@@ -29,8 +31,8 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-pub use ostrel_core::ids::RowId;
-pub use ostrel_core::value::{SafeInt, Value};
+use ostrel_core::ids::RowId;
+use ostrel_core::value::{SafeInt, Value};
 
 use crate::Host;
 
@@ -44,7 +46,9 @@ pub trait ServerHost: Host {
     /// The user row of the principal the request is evaluated against (`me`), or `None`
     /// for a request without a verified principal. From v0.3 it comes from a verified
     /// PASETO v4.public token (D18); in debug builds the test harness may supply a
-    /// development identity (AC-12). It does not change during one VM task.
+    /// development identity (AC-12). It does not change during one VM task, also not
+    /// inside nested calls of elevated functions, which keep the `me` of the original
+    /// request (D98, D117).
     fn principal(&self) -> Option<RowId>;
 
     /// The current time in milliseconds since the Unix epoch, the value of a `Time`.
@@ -67,9 +71,16 @@ pub trait ServerHost: Host {
         args: &'a [Value],
     ) -> BoxFuture<'a, Result<Value, ExternError>>;
 
-    /// Writes the audit entry of one execution of elevated (`as system`) code before that
-    /// code runs (ARCHITECTURE 5.7, AC-32). On `Err` the VM does not run the elevated
-    /// function and the request fails, so no elevated execution happens without its entry.
+    /// Writes the audit entry of one execution of elevated (`as system`) code
+    /// (ARCHITECTURE 5.7, AC-32, D117).
+    ///
+    /// The VM calls it once per entry into an elevated function, also when server code
+    /// calls it: after the model arguments are resolved through `see` and the `call` rule
+    /// has admitted the call, and before the first instruction of the body. The entry is
+    /// written outside the transaction of the body and stays when that transaction rolls
+    /// back: an entry without an effect is acceptable, an effect without an entry is not.
+    /// On `Err` the VM does not run the body and the call fails, so no elevated execution
+    /// happens without its entry.
     fn audit<'a>(&'a mut self, entry: &'a AuditEntry) -> BoxFuture<'a, Result<(), AuditError>>;
 }
 
@@ -157,14 +168,18 @@ impl std::error::Error for ExternError {}
 
 /// One audit log entry of an elevated execution (ARCHITECTURE 5.7: function, caller,
 /// arguments hash, time; AC-32).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The VM hands over the arguments themselves. The implementation in `ostrel_server`
+/// stores only the SHA-256 of the canonical encoding (ARCHITECTURE 5.3) of the arguments
+/// as one list, never the arguments (D117, D118); the VM does no hashing.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuditEntry {
     /// Qualified name of the elevated function.
     pub function: String,
     /// The principal of the original request, as [`ServerHost::principal`] gives it.
     pub principal: Option<RowId>,
-    /// SHA-256 of the canonical encoding (ARCHITECTURE 5.3) of the arguments as a list.
-    pub arguments_hash: [u8; 32],
+    /// The resolved arguments of the call, in parameter order.
+    pub arguments: Vec<Value>,
     /// Time of the entry, from [`ServerHost::now`].
     pub time: SafeInt,
 }
@@ -316,7 +331,7 @@ mod tests {
             let entry = AuditEntry {
                 function: "admin.reset".to_owned(),
                 principal: ctx.host.principal(),
-                arguments_hash: [0; 32],
+                arguments: args.to_vec(),
                 time,
             };
             let audited = ctx.host.audit(&entry).await;
@@ -336,6 +351,10 @@ mod tests {
         assert_eq!(host.lines, ["inside"]);
         assert_eq!(host.calls.len(), 1);
         assert_eq!(host.audit.len(), 1);
+        assert_eq!(
+            host.audit.first().map(|e| e.arguments.as_slice()),
+            Some(&[Value::Text("a".to_owned()), Value::Bool(true)][..])
+        );
     }
 
     #[test]
@@ -357,7 +376,7 @@ mod tests {
         let entry = AuditEntry {
             function: "f".to_owned(),
             principal: None,
-            arguments_hash: [0; 32],
+            arguments: Vec::new(),
             time: host.now(),
         };
         let audited = ready(host.audit(&entry));
