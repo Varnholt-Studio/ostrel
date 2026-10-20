@@ -13,3 +13,6 @@ data Post
 
 fn dropSlotsAt(pos: Int)
   drop Slot where at == pos
+
+view Main
+  text "Naming"

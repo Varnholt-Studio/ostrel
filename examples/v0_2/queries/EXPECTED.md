@@ -8,7 +8,8 @@ A case changes only together with the source or the spec, never to match an impl
 ## 1. Fixture
 
 Unless a case says otherwise, the database holds exactly these `Post` rows, written by crafted
-make ops before the client opens the app:
+make ops before the client opens the app. Every crafted make in this file sets `hidden`
+explicitly, so no case depends on how the server fills a field with a default (QUESTION #1471):
 
 | text | pos | hidden |
 |---|---|---|
@@ -41,11 +42,11 @@ two rows in that order are `c`, `a`, still in sort order.
 ## 3. Live lists (SYNTAX 4.5: a query in a view is a live subscription limited by `see`)
 
 Each case starts from the fixture with the app open in context A. The change is a crafted op
-from a second principal, then context A is observed without a reload.
+from a second client, then context A is observed without a reload.
 
 | Id | Change | Expected in "Last three" | Expected in "Last two up to five" |
 |---|---|---|---|
-| L-01 | Make `Post { text: "g", pos: 7 }` | `d`, `f`, `g` | unchanged: `c`, `d` |
+| L-01 | Make `Post { text: "g", pos: 7, hidden: false }` | `d`, `f`, `g` | unchanged: `c`, `d` |
 | L-02 | Make `Post { text: "h", pos: 7, hidden: true }` | unchanged: `c`, `d`, `f` (must deny: `f` alone) | unchanged: `c`, `d` |
 | L-03 | Edit `f`: `hidden` to `true` | `a`, `c`, `d` | unchanged: `c`, `d` |
 | L-04 | Edit `e`: `hidden` to `false` | `d`, `e`, `f` | `d`, `e` |
@@ -75,7 +76,7 @@ Expected for every `c..` case: `ostrel check naming/FILE.ostl` exits 0 and print
 | S-02 | `s02_let_in_where.ostl` | `let pos` | `Post.pos`, used in `where` | compile error, rename hint |
 | S-03 | `s03_loop_var_in_where.ostl` | outer loop variable `pos` (a `Slot`) | `Post.pos`, used in `where` | compile error, rename hint |
 | S-04 | `s04_loop_var_in_sort.ostl` | outer loop variable `pos` (a `Slot`) | `Post.pos`, used in `sort` | compile error, rename hint |
-| S-05 | `s05_implicit_field.ostl` | parameter `made` | implicit field `Post.made` (SYNTAX 4.2), used in `where` | compile error, rename hint |
+| S-05 | `s05_implicit_field.ostl` | parameter `made` | implicit field `Post.made` (SYNTAX 4.2), used in `where` | compile error, rename hint (ASSUMPTION A3) |
 | S-06 | `s06_unused_local.ostl` | parameter `pos`, not used in the query | `Post.pos`; the `where` names only `text` | compile error, rename hint (ASSUMPTION A1) |
 | C-01 | `c01_local_of_other_type.ostl` | parameter `pos` | `Slot` has no field `pos`; `where at == pos` compares `Slot.at` with the parameter | accepted |
 | C-02 | `c02_no_where_no_sort.ostl` | outer loop variable `pos` | `Post`, query without `where` and `sort` | accepted (the rule covers only `where` and `sort`) |
@@ -92,6 +93,11 @@ enclosing `for` counts as a local in scope.
   S-06 becomes a control case (accepted) and nothing else changes.
 * ASSUMPTION A2: the std elements `col` and `text` and the attribute `look:` are available in
   v0.2, as in the notes example (`examples/v0_2/notes/EXPECTED.md` A2).
+* ASSUMPTION A3 (S-05): the implicit field `made` is not optional, so `made < made` is no
+  ordering on an optional operand and S-05 gives only the rename diagnostic. If `made` were
+  optional, AC-33 (a) would add a second diagnostic and S-05 would need a new expectation.
+* Every file in `naming/` has a minimal `view Main`, so no case depends on whether an app
+  without a home view is an error (SYNTAX 4.1, not decided).
 * O-1 (not a case): the order of rows with equal sort values under `desc` together with `last n`.
   SYNTAX 4.5 says only that every sort ends with `id`; `docs/db-mapping.md` 6.5 reverses the id
   tie break with the direction. No case here depends on it, because all `pos` values differ.

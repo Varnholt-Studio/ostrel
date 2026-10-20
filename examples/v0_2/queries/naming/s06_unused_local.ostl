@@ -9,3 +9,6 @@ data Post
 
 fn dropText(pos: Int, t: Text)
   drop Post where text == t
+
+view Main
+  text "Naming"

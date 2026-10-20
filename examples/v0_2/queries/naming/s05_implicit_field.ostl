@@ -9,3 +9,6 @@ data Post
 
 fn dropBefore(made: Time)
   drop Post where made < made
+
+view Main
+  text "Naming"

@@ -10,3 +10,6 @@ data Post
 fn dropFirst()
   let pos = 1
   drop Post where pos == pos
+
+view Main
+  text "Naming"
