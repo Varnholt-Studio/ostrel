@@ -67,6 +67,12 @@ impl LiveRow {
 
     /// Applies a [`Write::Update`] that passed [`LiveRow::check`]: the version grows by one,
     /// the given fields replace the stored ones and the collection changes are applied.
+    ///
+    /// Contract for drivers that load only part of a row (D148): the result for every field and
+    /// every entry the write names is the same when `self` holds only the version, no fields
+    /// and, per collection field the write names, only the `Set` tags and `Map` entries whose
+    /// element or key is [`compare_key`] equal to one the change names. The changes read
+    /// nothing else; a collection field that is missing or of the other kind starts over empty.
     pub fn update(
         &mut self,
         fields: &[(FieldId, Value)],

@@ -1,6 +1,7 @@
 //! Edge cases of the shared evaluation in `ostrel_db::eval` (D129) that the conformance cases
 //! reach only through a driver: errors of the row lookup, refusal before any lookup, empty
-//! input, limit zero, cursor ties and a collection field that changes kind.
+//! input, limit zero, cursor ties, a collection field that changes kind and updates applied to
+//! a partly loaded row (D148).
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -9,6 +10,7 @@ use std::rc::Rc;
 use ostrel_db::api::{
     CmpOp, CollectionChange, CollectionState, Cursor, DbError, Dir, EnumColumn, Expr, FieldId, Hlc,
     Hop, MapEntry, ModelId, OpId, Path, Query, ReplicaId, RowId, SetChange, Value, Write,
+    compare_key,
 };
 use ostrel_db::eval::{self, LiveRow, Lookup};
 
@@ -294,4 +296,156 @@ fn update_raises_the_version_and_keeps_untouched_fields() {
     assert_eq!(r.fields.get(&F), Some(&int(9)));
     let twice = LiveRow::inserted(M, &[(F, int(8)), (F, int(9))], &[]);
     assert_eq!(twice.fields.get(&F), Some(&int(9)));
+}
+
+/// Elements or keys a collection change names.
+fn named(change: &CollectionChange) -> Vec<Value> {
+    match change {
+        CollectionChange::Set(cs) => cs
+            .iter()
+            .map(|c| match c {
+                SetChange::Add { elem, .. } | SetChange::Remove { elem, .. } => elem.clone(),
+            })
+            .collect(),
+        CollectionChange::Map(es) => es.iter().map(|e| e.key.clone()).collect(),
+    }
+}
+
+/// The part of `state` under the elements or keys in `keys`, or (with `keep` false) the rest.
+fn part(state: &CollectionState, keys: &[Value], keep: bool) -> CollectionState {
+    let hit = |v: &Value| keys.iter().any(|k| compare_key(k, v).is_eq()) == keep;
+    match state {
+        CollectionState::Set(t) => {
+            CollectionState::Set(t.iter().filter(|x| hit(&x.elem)).cloned().collect())
+        }
+        CollectionState::Map(e) => {
+            CollectionState::Map(e.iter().filter(|x| hit(&x.key)).cloned().collect())
+        }
+    }
+}
+
+/// D148: an update applied to the version plus the named slice of each named collection gives
+/// the same named entries as on the full row, and leaves every other entry as it was.
+#[test]
+fn eval_slice_equals_full() {
+    let op = |replica, seq| OpId {
+        replica: ReplicaId(replica),
+        seq,
+    };
+    let add = |n, r, s| SetChange::Add {
+        elem: int(n),
+        tag: op(r, s),
+    };
+    let remove = |n, r, s| SetChange::Remove {
+        elem: int(n),
+        tag: op(r, s),
+    };
+    let put = |k, v: Option<i64>, t| MapEntry {
+        key: int(k),
+        value: v.map(int),
+        hlc: Hlc::new(t, 0, ReplicaId(1)).unwrap(),
+    };
+    let (set, map) = (2, 3);
+    // Elements 1 to 6 with tags of two replicas, map keys 1 to 6.
+    let tags: Vec<SetChange> = (1..=6).flat_map(|n| [add(n, 1, 5), add(n, 2, 5)]).collect();
+    let entries: Vec<MapEntry> = (1..=6).map(|k| put(k, Some(k), 5)).collect();
+    let full = LiveRow::inserted(
+        M,
+        &[(F, int(1)), (REF, int(2))],
+        &[
+            (set, CollectionChange::Set(tags)),
+            (map, CollectionChange::Map(entries)),
+        ],
+    );
+    let cases: Vec<(&str, Vec<(FieldId, CollectionChange)>)> = vec![
+        (
+            "add",
+            vec![(set, CollectionChange::Set(vec![add(9, 1, 6)]))],
+        ),
+        (
+            "replay",
+            vec![(set, CollectionChange::Set(vec![add(2, 1, 5)]))],
+        ),
+        (
+            "older add",
+            vec![(set, CollectionChange::Set(vec![add(3, 2, 4)]))],
+        ),
+        (
+            "newer add",
+            vec![(set, CollectionChange::Set(vec![add(3, 2, 7)]))],
+        ),
+        (
+            "remove of a foreign tag",
+            vec![(
+                set,
+                CollectionChange::Set(vec![remove(4, 1, 9), remove(5, 3, 5)]),
+            )],
+        ),
+        (
+            "remove",
+            vec![(set, CollectionChange::Set(vec![remove(4, 1, 5)]))],
+        ),
+        (
+            "map put and overwrite",
+            vec![(
+                map,
+                CollectionChange::Map(vec![put(2, Some(20), 6), put(8, None, 6)]),
+            )],
+        ),
+        (
+            "kind change",
+            vec![
+                (set, CollectionChange::Map(vec![put(1, Some(1), 6)])),
+                (map, CollectionChange::Set(vec![add(1, 1, 6)])),
+            ],
+        ),
+        (
+            "new field",
+            vec![(7, CollectionChange::Set(vec![add(1, 1, 1)]))],
+        ),
+    ];
+    for (name, changes) in cases {
+        let mut whole = full.clone();
+        whole.update(&[(F, int(9))], &changes);
+        // What a driver loads: version and model, and per named field of the same kind only
+        // the entries under the named elements or keys.
+        let mut slice = LiveRow {
+            fields: BTreeMap::new(),
+            collections: BTreeMap::new(),
+            ..full.clone()
+        };
+        let same_kind = |f: &FieldId, c: &CollectionChange| {
+            matches!(
+                (c, full.collections.get(f)),
+                (CollectionChange::Set(_), Some(CollectionState::Set(_)))
+                    | (CollectionChange::Map(_), Some(CollectionState::Map(_)))
+            )
+        };
+        for (f, c) in &changes {
+            if same_kind(f, c) {
+                let state = part(&full.collections[f], &named(c), true);
+                slice.collections.insert(*f, state);
+            }
+        }
+        slice.update(&[(F, int(9))], &changes);
+        assert_eq!(slice.version, whole.version, "{name}");
+        assert_eq!(slice.fields.get(&F), whole.fields.get(&F), "{name}");
+        for (f, c) in &changes {
+            let after = &whole.collections[f];
+            if same_kind(f, c) {
+                // Named entries as on the full row, and the full row keeps all others.
+                let keys = named(c);
+                assert_eq!(slice.collections[f], part(after, &keys, true), "{name}");
+                let before = &full.collections[f];
+                assert_eq!(
+                    part(after, &keys, false),
+                    part(before, &keys, false),
+                    "{name}"
+                );
+            } else {
+                // New or changed kind: the driver writes the field whole.
+                assert_eq!(slice.collections.get(f), Some(after), "{name}");
+            }
+        }
+    }
 }
