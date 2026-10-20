@@ -1,0 +1,17 @@
+{
+  "strategy": "set",
+  "description": "Removes that name only the tag of a concurrent add or an unknown tag leave the make tag of x and y live: both stay, each with the make tag only.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "make": ["x", "y"] } },
+    { "id": "000000000000000b00000001", "hlc": "018bcfe568000000000000000000000b", "op": { "add": "x" } },
+    { "id": "000000000000000c00000001", "hlc": "018bcfe568010000000000000000000c",
+      "op": { "remove": "x", "tags": ["000000000000000b00000001"] } },
+    { "id": "000000000000000c00000002", "hlc": "018bcfe568010001000000000000000c",
+      "op": { "remove": "y", "tags": ["000000000000000d00000001"] } }
+  ],
+  "deliveries": [[0, 1, 2, 3], [1, 2, 0, 3], [1, 0, 3, 2, 0, 3]],
+  "expect": {
+    "value": ["x", "y"],
+    "state": [["x", ["000000000000000a00000001"]], ["y", ["000000000000000a00000001"]]]
+  }
+}

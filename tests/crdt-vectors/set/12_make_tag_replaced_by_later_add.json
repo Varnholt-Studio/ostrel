@@ -1,0 +1,15 @@
+{
+  "strategy": "set",
+  "description": "A later add of x by the replica of the make replaces the make tag of x (one live tag per replica); a remove that names only the make tag then leaves x with the newer tag.",
+  "ops": [
+    { "id": "000000000000000a00000001", "hlc": "018bcfe568000000000000000000000a", "op": { "make": ["x"] } },
+    { "id": "000000000000000a00000002", "hlc": "018bcfe568010000000000000000000a", "op": { "add": "x" } },
+    { "id": "000000000000000c00000001", "hlc": "018bcfe568010000000000000000000c",
+      "op": { "remove": "x", "tags": ["000000000000000a00000001"] } }
+  ],
+  "deliveries": [[0, 1, 2], [0, 2, 1], [0, 0, 2, 1, 1]],
+  "expect": {
+    "value": ["x"],
+    "state": [["x", ["000000000000000a00000002"]]]
+  }
+}

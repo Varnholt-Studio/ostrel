@@ -23,8 +23,9 @@ export function createLwwReplica() {
 
 /**
  * Add wins observed remove set with add tags (D49). Op bodies: `{ "add": e }` creates the tag
- * equal to the op id; `{ "remove": e, "tags": [...] }` deletes exactly the named live tags.
- * Each replica keeps at most one live tag per element, its newest one.
+ * equal to the op id; `{ "make": [e, ...] }` (D107) does the same for each initial element, so
+ * they all carry the one op id; `{ "remove": e, "tags": [...] }` deletes exactly the named live
+ * tags of e. Each replica keeps at most one live tag per element, its newest one.
  */
 export function createSetReplica() {
   // canonical element -> { element, tags: Map(replica hex -> op id hex) }
@@ -34,15 +35,19 @@ export function createSetReplica() {
     return [...elements.values()].sort((left, right) => compareKey(left.element, right.element));
   }
 
+  function add(element, id) {
+    const slot = encode(element);
+    const entry = elements.get(slot) ?? { element, tags: new Map() };
+    const replica = id.slice(0, REPLICA_HEX_WIDTH);
+    const older = entry.tags.get(replica);
+    if (older === undefined || older < id) entry.tags.set(replica, id);
+    elements.set(slot, entry);
+  }
+
   return {
     apply({ id, op }) {
-      if ('add' in op) {
-        const slot = encode(op.add);
-        const entry = elements.get(slot) ?? { element: op.add, tags: new Map() };
-        const replica = id.slice(0, REPLICA_HEX_WIDTH);
-        const older = entry.tags.get(replica);
-        if (older === undefined || older < id) entry.tags.set(replica, id);
-        elements.set(slot, entry);
+      if ('add' in op || 'make' in op) {
+        for (const element of 'add' in op ? [op.add] : op.make) add(element, id);
         return;
       }
       const slot = encode(op.remove);

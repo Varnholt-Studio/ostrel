@@ -294,6 +294,12 @@ impl Model for AddWinsSet {
             ["add"] => {
                 self.add(id, body.field("add").to_value()).unwrap();
             }
+            // A make (D107) tags every initial element with its own id, as one add each.
+            ["make"] => {
+                for element in body.field("make").arr() {
+                    self.add(id, element.to_value()).unwrap();
+                }
+            }
             ["remove", "tags"] => {
                 let tags: Vec<OpId> = body
                     .field("tags")

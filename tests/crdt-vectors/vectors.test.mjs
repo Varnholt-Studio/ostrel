@@ -13,11 +13,16 @@ import { loadVectors, STRATEGIES, validateVector } from './format.mjs';
 import { createLwwReplica, createRankReplica, createSetReplica } from './oracle.mjs';
 
 // The set module has its own interface (`apply(op, opId)`, `values()`, `tagsOf(e)`); this
-// adapter gives it the model shape of README.md without changing the module.
+// adapter gives it the model shape of README.md without changing the module. The set module
+// knows no make: the initial elements of a row reach it as one add per element, each with the
+// make's OpId as tag (D106, D107), which is what the adapter does.
 function createAddWinsSetReplica() {
   const set = new AddWinsSet();
   return {
-    apply: ({ id, op }) => set.apply(op, id),
+    apply: ({ id, op }) => {
+      if (!('make' in op)) return set.apply(op, id);
+      for (const element of op.make) set.apply({ add: element }, id);
+    },
     value: () => set.values(),
     state: () => set.values().map((element) => [element, set.tagsOf(element)]),
   };
@@ -151,4 +156,46 @@ test('validator refuses a set op that is both add and remove', () => {
   vector.ops.push({ id: C1, hlc: HLC_C, op: { remove: 'x', tags: [B1] } });
   vector.ops[1] = { ...vector.ops[1], op: { add: 'x', remove: 'x', tags: [A1] } };
   assert.throws(() => validateVector(vector, 'set'), /must be \{ "add": e \} or/);
+});
+
+// make (D107): one op tags every initial element of the row with its own id.
+const M1 = '000000000000000a00000001';
+
+function makeVector(make, extra, deliveries) {
+  return setVector({
+    ops: [{ id: M1, hlc: HLC_A, op: { make } }, ...extra],
+    deliveries,
+    expect: { value: [], state: [] },
+  });
+}
+
+test('validator accepts a make, also an empty one', () => {
+  const remove = { id: B1, hlc: '018bcfe568010000000000000000000b', op: { remove: 'e1', tags: [M1] } };
+  validateVector(makeVector(['e1', 'e2'], [remove], [[0, 1]]), 'set');
+  validateVector(makeVector([], [remove], [[0, 1], [1, 0]]), 'set');
+});
+
+test('validator refuses a second make', () => {
+  const second = { id: C1, hlc: HLC_C, op: { make: ['e3'] } };
+  assert.throws(() => validateVector(makeVector(['e1'], [second], [[0, 1]]), 'set'), /second make/);
+});
+
+test('validator refuses a make that lists one element twice', () => {
+  assert.throws(() => validateVector(makeVector(['e1', 'e2', 'e1'], [], [[0]]), 'set'), /twice/);
+  assert.throws(() => validateVector(makeVector([1, 'x', 1.5, 1], [], [[0]]), 'set'), /twice/);
+});
+
+test('validator refuses a make whose list is not an array', () => {
+  assert.throws(() => validateVector(makeVector('e1', [], [[0]]), 'set'), /array of elements/);
+});
+
+test('validator refuses a make delivered after a remove of one of its elements', () => {
+  const remove = { id: B1, hlc: '018bcfe568010000000000000000000b', op: { remove: 'e2', tags: [M1] } };
+  const late = makeVector(['e1', 'e2'], [remove], [[0, 1, 0]]);
+  assert.throws(() => validateVector(late, 'set'), /delivers ops\[0\] after its remove ops\[1\]/);
+});
+
+test('validator ignores a make tag named for an element the make does not list (D96)', () => {
+  const remove = { id: B1, hlc: '018bcfe568010000000000000000000b', op: { remove: 'e3', tags: [M1] } };
+  validateVector(makeVector(['e1', 'e2'], [remove], [[1, 0], [0, 1, 0]]), 'set');
 });
