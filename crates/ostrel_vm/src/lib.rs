@@ -22,6 +22,7 @@ use std::fmt;
 mod bytecode;
 mod exec;
 pub mod host;
+mod output;
 
 pub use bytecode::CompileError;
 pub use ostrel_ir::Span;
@@ -78,6 +79,9 @@ pub enum RuntimeErrorKind {
     HeapLimit,
     /// A `Text` would exceed [`Limits::max_text_bytes`].
     TextLimit,
+    /// A `print` would bring the output of the run above 268435456 bytes, newlines
+    /// included (D113). The limit is fixed; the refused `print` writes nothing.
+    OutputLimit,
 }
 
 impl RuntimeErrorKind {
@@ -90,6 +94,7 @@ impl RuntimeErrorKind {
             RuntimeErrorKind::StepLimit => "StepLimit",
             RuntimeErrorKind::HeapLimit => "HeapLimit",
             RuntimeErrorKind::TextLimit => "TextLimit",
+            RuntimeErrorKind::OutputLimit => "OutputLimit",
         }
     }
 
@@ -108,6 +113,7 @@ impl RuntimeErrorKind {
             }
             RuntimeErrorKind::HeapLimit => "VM heap would grow beyond 268435456 bytes",
             RuntimeErrorKind::TextLimit => "`Text` value would be longer than 16777216 bytes",
+            RuntimeErrorKind::OutputLimit => "program output would exceed 268435456 bytes",
         }
     }
 }
@@ -151,7 +157,9 @@ pub fn compile(program: &ostrel_ir::Program) -> Result<Image, CompileError> {
 
 /// Runs `fn main()` of `image` to completion within `limits`.
 ///
-/// Output goes through `host`. Output written before an error stays written.
+/// Output goes through `host`, at most 268435456 bytes in one run with the newline
+/// of each line included (`OutputLimit`). Output written before an error stays
+/// written.
 pub fn run<H: Host + ?Sized>(
     image: &Image,
     host: &mut H,
@@ -190,6 +198,7 @@ mod tests {
             RuntimeErrorKind::StepLimit,
             RuntimeErrorKind::HeapLimit,
             RuntimeErrorKind::TextLimit,
+            RuntimeErrorKind::OutputLimit,
         ]
         .iter()
         .map(ToString::to_string)
@@ -202,7 +211,8 @@ mod tests {
                 "CallDepth",
                 "StepLimit",
                 "HeapLimit",
-                "TextLimit"
+                "TextLimit",
+                "OutputLimit"
             ]
         );
     }
@@ -216,6 +226,7 @@ mod tests {
             RuntimeErrorKind::StepLimit,
             RuntimeErrorKind::HeapLimit,
             RuntimeErrorKind::TextLimit,
+            RuntimeErrorKind::OutputLimit,
         ]
         .iter()
         .map(|kind| kind.message())
@@ -229,6 +240,7 @@ mod tests {
                 "program exceeded its step limit; raise it with `--max-steps`",
                 "VM heap would grow beyond 268435456 bytes",
                 "`Text` value would be longer than 16777216 bytes",
+                "program output would exceed 268435456 bytes",
             ]
         );
     }
@@ -260,6 +272,11 @@ mod tests {
             RuntimeErrorKind::TextLimit
                 .message()
                 .ends_with(&format!(" {} bytes", limits.max_text_bytes))
+        );
+        assert!(
+            RuntimeErrorKind::OutputLimit
+                .message()
+                .ends_with(&format!(" {} bytes", output::MAX_OUTPUT_BYTES))
         );
     }
 
