@@ -54,7 +54,11 @@ function startHost(modules = { math: "math.mjs", bad: "bad.mjs" }) {
   });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => (stderr += chunk));
-  const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+  // stdout and stderr are separate pipes, so a protocol message can arrive
+  // before stderr output the host wrote earlier. "close" is emitted only after
+  // the process exited and both pipes reached end of file, so once it fired
+  // every byte the host ever wrote has been read.
+  const exited = new Promise((resolve) => child.on("close", (code) => resolve(code)));
 
   async function nextMessage(timeoutMs = 5000) {
     const deadline = Date.now() + timeoutMs;
@@ -133,10 +137,11 @@ test("module output never reaches the protocol stream", async () => {
   const host = await readyHost();
   const res = await host.call(1, "math", "chatty", ["hi"]);
   assert.equal(res.result, "hi");
+  // Check both streams only after they are fully drained (see startHost).
+  assert.equal(await host.stop(), 0);
   assert.equal(host.rawLines.length, 0);
   assert.match(host.stderr(), /log line from module/);
   assert.match(host.stderr(), /raw stdout from module/);
-  await host.stop();
 });
 
 test("thrown errors and rejections become Threw", async () => {
