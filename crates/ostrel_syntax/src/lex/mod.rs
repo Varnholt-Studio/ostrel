@@ -253,9 +253,11 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         } else {
             width
         };
-        if self.css.is_some_and(|style| column <= style) {
-            // A line not deeper than its `style` line ends the CSS body, also
-            // when it holds only a comment (SYNTAX 3: CSS mode until the DEDENT).
+        // A line not deeper than its `style` line ends the CSS body, also when
+        // it holds only a comment (D137). The blocks of the body close on that
+        // same line, so mode end and DEDENT coincide (SYNTAX 3).
+        let ends_css = self.css.is_some_and(|style| column <= style);
+        if ends_css {
             self.css = None;
         }
         let top = self.top();
@@ -269,7 +271,11 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             rest.starts_with("//")
         };
         if comment_only {
-            // Comment only line: no layout tokens, nothing checked.
+            // Comment only line: no layout tokens, nothing checked, unless it
+            // ends a CSS body; then only the closing DEDENTs, still unchecked.
+            if ends_css {
+                self.close_blocks(column);
+            }
             return;
         }
         self.css_pending = None;
@@ -289,12 +295,19 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             self.indents.push(column);
             return;
         }
-        while self.top() > column {
-            self.indents.pop();
-            self.push(TokenKind::Dedent, ws_end, ws_end);
-        }
+        self.close_blocks(column);
         // A column between two stack entries can only follow a recovery; the
         // line belongs to the block that is now on top, without a diagnostic.
+    }
+
+    /// Closes every open block deeper than `column` with a DEDENT at the
+    /// current position (the end of the line's indentation).
+    fn close_blocks(&mut self, column: u32) {
+        let at = self.pos;
+        while self.top() > column {
+            self.indents.pop();
+            self.push(TokenKind::Dedent, at, at);
+        }
     }
 
     /// The column of the innermost open block.

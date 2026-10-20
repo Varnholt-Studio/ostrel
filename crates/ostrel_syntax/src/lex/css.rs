@@ -2,8 +2,9 @@
 //!
 //! A logical line that holds only the keyword `style` (comments aside) starts
 //! CSS mode for the block under it. The body ends at the first non blank line
-//! that is not deeper than the `style` line, also when that line holds only a
-//! comment; such a line is lexed as code again.
+//! that is not deeper than the `style` line, by indentation alone, also when
+//! that line holds only a comment (D137); such a line is lexed as code again,
+//! and the blocks of the body close on it with their DEDENTs.
 //!
 //! Inside the body:
 //!
@@ -12,7 +13,9 @@
 //!   E0013). Brackets and braces never continue a line, so `url(//x)` cannot
 //!   swallow the lines after it.
 //! * `/* */` is a comment ([`TokenKind::Comment`]) and may span lines. The
-//!   lines inside it carry no layout. A comment that is not closed before the
+//!   lines inside it carry no layout, except that a line not deeper than the
+//!   `style` line ends the comment (E0015) and the body (D137, D138). A
+//!   comment that is not closed before the
 //!   end of the body is E0015 at its `/*` and ends there. `//` is CSS text.
 //! * Everything else is CSS text: one [`TokenKind::Css`] token per run between
 //!   comments on a line. `;`, `$token`, `#id`, `@media` and quotes are not
@@ -385,6 +388,105 @@ mod tests {
         );
     }
 
+    /// The tokens from the first DEDENT on, as kind and text.
+    fn after_first_dedent(src: &str) -> Vec<(TokenKind, &str)> {
+        pairs(src)
+            .into_iter()
+            .skip_while(|(k, _)| *k != Dedent)
+            .collect()
+    }
+
+    #[test]
+    fn a_comment_line_that_ends_the_body_closes_its_blocks_at_once() {
+        // `//` at the `style` column ends the body (D137), and the DEDENTs of
+        // the body stand before that comment, so no deeper line after it can
+        // be read as part of the body.
+        let src = "style\n  .a {\n// note\n    color: red;\n  }\n";
+        let k = kinds(src);
+        assert_eq!(
+            k.get(..7),
+            Some(&[STYLE, Nl, Indent, Css, Nl, Dedent, Comment][..]),
+            "{k:?}"
+        );
+        assert_eq!(css_texts(src), [".a {"]);
+        let body_end = src.find("// note").unwrap_or(0) as u32;
+        let d = diags(src);
+        assert!(!d.is_empty(), "{d:?}");
+        assert!(d.iter().all(|d| d.1 >= body_end), "{d:?}");
+        // The same without `;`: no diagnostic needed, but still no CSS after
+        // the comment and the body closed before it.
+        let src = "style\n  .a {\n// note\n    color: red\n  }\n";
+        assert_eq!(css_texts(src), [".a {"]);
+        assert_eq!(
+            after_first_dedent(src).get(..2),
+            Some(&[(Dedent, ""), (Comment, "// note")][..])
+        );
+        // `/* */` at the `style` column is code after the body; its line
+        // closes the body before its first token.
+        let src = "style\n  .a {\n    color: red;\n/* section */\n    b: c;\n  }\n";
+        let k = kinds(src);
+        let slash = k.iter().position(|k| *k == TokenKind::Slash);
+        let last_css = k.iter().rposition(|k| *k == Css);
+        let dedent = k.iter().position(|k| *k == Dedent);
+        assert!(
+            matches!((last_css, dedent, slash), (Some(c), Some(d), Some(s)) if c < d && d < s),
+            "{k:?}"
+        );
+        assert_eq!(css_texts(src), [".a {", "color: red;"]);
+        let body_end = src.find("/* section").unwrap_or(0) as u32;
+        assert!(diags(src).iter().all(|d| d.1 >= body_end));
+        // Two open blocks close together, also on a faulty (odd) column,
+        // which a comment line never reports.
+        let src = "a\n  style\n    .x {\n      y: z;\n // odd\n  b\n";
+        assert_eq!(
+            after_first_dedent(src).get(..3),
+            Some(&[(Dedent, ""), (Dedent, ""), (Comment, "// odd")][..])
+        );
+        assert!(diags(src).is_empty(), "{:?}", diags(src));
+        // A comment line still deeper than `style` keeps the body open.
+        let src = "style\n  .a {\n  /* k */\n    color: red;\n  }\n";
+        assert_eq!(css_texts(src), [".a {", "color: red;", "}"]);
+        assert!(diags(src).is_empty());
+    }
+
+    #[test]
+    fn d138_examples_end_the_body_with_its_dedent() {
+        // (a) `//` at column 0: DEDENT before it, the comment is code trivia,
+        // the deeper `.b` line opens a new block outside the body.
+        let src = "style\n  .a {}\n// rows\n  .b {}\n";
+        assert_eq!(css_texts(src), [".a {}"]);
+        assert_eq!(
+            after_first_dedent(src).get(..2),
+            Some(&[(Dedent, ""), (Comment, "// rows")][..])
+        );
+        // (b) `/* */` at column 0: DEDENT before it, then lexed as code.
+        let src = "style\n  .a {}\n/* rows */\n  .b {}\n";
+        assert_eq!(css_texts(src), [".a {}"]);
+        assert_eq!(
+            after_first_dedent(src).get(..2),
+            Some(&[(Dedent, ""), (TokenKind::Slash, "/")][..])
+        );
+        // (c) an indented `/* */` is a CSS comment and the body goes on.
+        let src = "style\n  .a {}\n  /* rows */\n  .b {}\n";
+        assert_eq!(css_texts(src), [".a {}", ".b {}"]);
+        assert!(kinds(src).contains(&Comment));
+        assert!(diags(src).is_empty(), "{:?}", diags(src));
+        assert_eq!(after_first_dedent(src), [(Dedent, ""), (Eof, "")]);
+        // (d) an open `/*`, then `.x` at column 0: E0015 at the `/*`, DEDENT
+        // before `.x`.
+        let src = "style\n  .a {}\n  /* open\n.x\n";
+        let at = src.find("/*").unwrap_or(0) as u32;
+        assert_eq!(
+            diags(src).first(),
+            Some(&(codes::UNTERMINATED_CSS_COMMENT, at, at + 2))
+        );
+        assert_eq!(css_texts(src), [".a {}"]);
+        assert_eq!(
+            after_first_dedent(src).get(..2),
+            Some(&[(Dedent, ""), (TokenKind::Dot, ".")][..])
+        );
+    }
+
     #[test]
     fn a_nested_style_body_ends_at_its_own_column() {
         let src = "a\n  style\n    .x {\n    }\n  b;\n";
@@ -472,6 +574,20 @@ mod tests {
             d.first(),
             Some(&(codes::UNTERMINATED_CSS_COMMENT, at, at + 2))
         );
+        // The ending line is code again (D137); the comment line opened no
+        // block, so there is nothing to close.
+        let p = pairs(src);
+        assert!(p.contains(&(TokenKind::Ident, "b")), "{p:?}");
+        assert!(
+            !p.iter().any(|(k, _)| *k == Indent || *k == Dedent),
+            "{p:?}"
+        );
+        // With a block open, the ending line closes it before its first token.
+        let src = "style\n  .a {\n  /* a\nb */\n";
+        assert_eq!(
+            after_first_dedent(src).get(..2),
+            Some(&[(Dedent, ""), (TokenKind::Ident, "b")][..])
+        );
         // To the end of the input, also with CRLF; `/*/` does not close.
         for src in [
             "style\n  .a {} /*",
@@ -546,6 +662,9 @@ mod tests {
             "style\n  \u{FC}\u{202E}/*\u{FEFF}*/\"\u{1F600}\n",
             "a\n  style\n    .b {\n      c: d;\n    }\n  e\nf\n",
             "style\r\n  .a {\r\n    b: c;\r\n  }\r\n",
+            "style\n  .a {\n// note\n    color: red;\n  }\n",
+            "a\n  style\n    .x {\n      y: z;\n/* a */\n    b\n",
+            "style\n  /* a\n// b\n    c\n",
         ] {
             let (tokens, _) = run(src);
             let opened = tokens.iter().filter(|t| t.kind == Indent).count();
