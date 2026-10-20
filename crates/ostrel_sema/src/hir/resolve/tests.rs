@@ -251,19 +251,19 @@ fn unknown_field_is_e0204_at_the_field_name() {
 }
 
 #[test]
-fn unknown_model_is_e0205_at_the_type_name() {
-    assert_eq!(diags("fn f()\n  make Nope { a: 1 }\n"), ["E0205 2:8"]);
+fn unknown_model_in_make_is_e0203_and_in_a_query_head_e0200() {
+    assert_eq!(diags("fn f()\n  make Nope { a: 1 }\n"), ["E0203 2:8"]);
     assert_eq!(
         diags("enum E = a\nfn f()\n  make E { a: 1 }\n"),
-        ["E0205 3:8"]
+        ["E0203 3:8"]
     );
     assert_eq!(
         diags("enum E = a | b\nfn f()\n  for x in E where x\n    print(1)\n"),
-        ["E0205 3:12"]
+        ["E0200 3:12"]
     );
     assert_eq!(
         diags("fn f()\n  for x in Nope sort a\n    print(1)\n"),
-        ["E0205 2:12"]
+        ["E0200 2:12"]
     );
 }
 
