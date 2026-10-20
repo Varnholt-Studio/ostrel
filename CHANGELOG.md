@@ -8,12 +8,13 @@ All notable changes are documented here.
 
 - The step limit of `ostrel run` now counts weighted work instead of executed instructions. An
   instruction costs 1 + ceil(B / 64) steps, where B is the number of bytes it reads, writes or
-  copies: both texts of a `==` comparison of equal length (texts of different length cost one
-  step), the parts and register references of a concatenation, the text written by `print` and
-  the registers a call initialises. Loading a text constant costs one step. The default limit
-  (`--max-steps`, 100 000 000) and the `StepLimit` message and position are unchanged; only a
-  total above the limit stops the program. An instruction that fails with `TextLimit` or
-  `HeapLimit` reports that error, not `StepLimit`.
+  copies: for a `==` comparison, the length of the compared texts when both have the same length
+  (counted once, texts of different length cost one step), the parts and register references of
+  a concatenation, the text written by `print` and the registers a call initialises. Loading a
+  text constant costs one step. The default limit (`--max-steps`, 100 000 000) and the
+  `StepLimit` message and position are unchanged; only a total above the limit stops the
+  program. An instruction that fails with `TextLimit` or `HeapLimit` reports that error, not
+  `StepLimit`.
 - The step limit now also bounds programs that spend their time on text work. This lifts the
   v0.1 known limitation that the step limit did not bound the running time in every case: a
   program that compares two 16 MiB texts once per level of a deep recursion, which previously
