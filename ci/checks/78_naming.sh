@@ -32,8 +32,8 @@ PHRASES=(
 # matched for the TLDs below; .rs, .sh and similar are left out on purpose because they are
 # file extensions. A host under any other TLD is caught only when written with a scheme.
 hosts() {
-  grep -oiE 'https?://[^/[:space:]"'"'"'<>)`]+' "$1" | sed -E 's#^[a-zA-Z]+://##; s#^.*@##; s#:[0-9]+$##'
-  grep -oiE '[a-z0-9.-]*ostrel[a-z0-9.-]*\.(org|com|net|dev|io|app|ai|co|de|eu|info|page|site|xyz|tech|cloud)\b' "$1"
+  grep -oiE 'https?://[^/[:space:]"'"'"'<>)`]+' -- "$1" | sed -E 's#^[a-zA-Z]+://##; s#^.*@##; s#:[0-9]+$##'
+  grep -oiE '[a-z0-9.-]*ostrel[a-z0-9.-]*\.(org|com|net|dev|io|app|ai|co|de|eu|info|page|site|xyz|tech|cloud)\b' -- "$1"
 }
 
 # scan FILE: prints one line per violation, returns 1 if any.
@@ -58,8 +58,8 @@ scan() {
 # readme_ok FILE: first heading or first sentence contains the full name.
 readme_ok() {
   local heading sentence
-  heading=$(grep -m1 -E '^#' "$1")
-  sentence=$(grep -vE '^(#|[[:space:]]*$)' "$1" | tr '\n' ' ' | sed -E 's/\. .*//')
+  heading=$(grep -m1 -E '^#' -- "$1")
+  sentence=$(grep -vE '^(#|[[:space:]]*$)' -- "$1" | tr '\n' ' ' | sed -E 's/\. .*//')
   case "$heading" in *"Ostrel programming language"*) return 0 ;; esac
   case "$sentence" in *"Ostrel programming language"*) return 0 ;; esac
   return 1
@@ -79,7 +79,8 @@ list_files() {
 }
 
 # check_tree: runs the whole check on the tree in the current directory, returns 1 on any
-# violation, including an empty file list or a missing required file.
+# violation, including an empty file list or a missing required file. A path that starts with
+# "-" is passed as "./path", so no tool reads it as an option or as standard input.
 check_tree() {
   local bad=0 f r found n=0 files=()
   mapfile -d '' files < <(list_files)
@@ -95,8 +96,9 @@ check_tree() {
   fi
   for f in "${files[@]}"; do
     [ "$f" = "$SELF" ] && continue
+    case $f in -*) f=./$f ;; esac
     [ -f "$f" ] || continue
-    grep -qI '' "$f" 2>/dev/null || continue
+    grep -qI '' -- "$f" 2>/dev/null || continue
     n=$((n + 1))
     scan "$f" || bad=1
   done
@@ -161,13 +163,29 @@ EOF
   (cd "$tmp/export" && check_tree > /dev/null) &&
     { echo "selftest: symbolic link not scanned"; ok=1; }
   rm "$tmp/export/docs/link.md"
+  # A file whose name starts with "-" is scanned, not read as an option.
+  for v in -v.md - --version; do
+    printf 'Made by the Ostrel GmbH.\n' > "$tmp/export/$v"
+    (cd "$tmp/export" && check_tree > /dev/null) &&
+      { echo "selftest: file named $v not scanned"; ok=1; }
+    rm -- "$tmp/export/$v"
+  done
   # A git checkout with a tracked README.md that is deleted on disk must fail.
   if git -C "$tmp/export" init -q 2>/dev/null &&
     git -C "$tmp/export" add README.md Cargo.toml docs/probe.md 2>/dev/null; then
     (cd "$tmp/export" && check_tree > /dev/null) || { echo "selftest: clean checkout rejected"; ok=1; }
+    printf 'Made by the Ostrel GmbH.\n' > "$tmp/export/-v.md"
+    git -C "$tmp/export" add -- -v.md
+    (cd "$tmp/export" && check_tree > /dev/null) &&
+      { echo "selftest: tracked file named -v.md not scanned"; ok=1; }
+    git -C "$tmp/export" rm -q -f -- -v.md
     rm "$tmp/export/README.md"
     (cd "$tmp/export" && check_tree > /dev/null) &&
       { echo "selftest: tracked, deleted README.md passes"; ok=1; }
+    git -C "$tmp/export" checkout -q -- README.md
+    rm "$tmp/export/Cargo.toml"
+    (cd "$tmp/export" && check_tree > /dev/null) &&
+      { echo "selftest: tracked, deleted Cargo.toml passes"; ok=1; }
   else
     echo "selftest: cannot create a git checkout"; ok=1
   fi
