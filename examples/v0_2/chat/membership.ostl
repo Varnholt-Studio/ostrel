@@ -1,0 +1,22 @@
+app Chat
+  auth paseto open
+
+data Room
+  name: Text
+  members: Set[User] = {me}
+  check name.len in 1..40
+  see if signed
+  make if members == {me}
+  edit members if added == {me} or removed == {me}
+
+view Main
+  col
+    entry hint: "New room" submit: "Create"
+      on submit make Room { name: it }
+    for r in Room sort name
+      row
+        text r.name look: strong
+        if me in r.members
+          button "Leave" on click r.members.remove(me)
+        else
+          button "Join" on click r.members.add(me)
