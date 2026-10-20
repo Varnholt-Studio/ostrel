@@ -1,0 +1,14 @@
+case: a_optional_ordering
+ac: AC-33 (a)
+kind: compile
+command: ostrel check examples/v0_2/rules_fail_closed/a_optional_ordering.ostl
+exit: 1
+stdout: empty
+stderr: exactly one diagnostic line, `PATH:LINE:COLUMN: error[CODE]: MESSAGE` (SPEC 12.1)
+  line: 12
+  column: 20 (the `>=` operator, the same convention as E0300 at its operator)
+  code: an E03xx type code; the number is assigned by the v0.2 checker task and entered in tests/errors/README.md
+  message: names `??` or `if let` as the way to unwrap `priority` (SYNTAX 4.4, SYNTAX 9)
+outputs: none; `ostrel build` on this file exits 1 with the same diagnostic and writes no target
+must not: exit 0, a warning instead of an error, a second diagnostic for the same fault, exit 70 or 101
+allowed form (not part of this case): `edit if (priority ?? 0) >= 3` compiles

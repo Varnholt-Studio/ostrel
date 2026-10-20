@@ -1,0 +1,29 @@
+case: e_limit_after_see
+ac: AC-33 (e), reading per SPEC 5.0: also for `last n`
+kind: query (rows sent to the client and rendered in the view)
+compile: ostrel check exits 0 with no diagnostic; the `see` rule is inside the pushdown subset
+  (ARCHITECTURE 9: field access, `or`, comparison with `me`)
+principals: alice, bob (development identities, debug build, AC-12)
+given: alice has made ten Note rows, each accepted before the next:
+  pos  body  shared
+  1    p1    false
+  2    p2    false
+  3    s3    true
+  4    p4    false
+  5    s5    true
+  6    s6    true
+  7    p7    false
+  8    s8    true
+  9    p9    false
+  10   p10   false
+probes:
+  1. bob opens the view (the must deny case)
+     first column, `sort pos limit 3`: s3, s5, s6 in this order
+     last column, `sort pos last 3`: s5, s6, s8 in this order
+     no row with shared = false reaches bob's client, neither in a Snapshot nor in the view
+  2. alice opens the view (control)
+     first column: p1, p2, s3
+     last column: s8, p9, p10
+final db: unchanged by both probes
+must not, for bob: first column s3 alone (limit applied before the rule), last column s8 alone
+  (last applied before the rule), fewer than three rows, or any p row
