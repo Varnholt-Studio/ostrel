@@ -38,15 +38,10 @@ use super::{
 use crate::codes;
 
 /// A field name that is neither declared in the model nor implicit, or an
-/// implicit field where only declared fields are allowed. ASSUMPTION until
-/// the spec owner fixes the code (#1882).
+/// implicit field where only declared fields are allowed (SPEC 12.6).
 pub(crate) const UNKNOWN_FIELD: Code = Code::new(204);
-/// A name where a data type is required (`make`, a query with clauses) that
-/// is not one. ASSUMPTION until the spec owner fixes the code (#1882).
-pub(crate) const UNKNOWN_MODEL: Code = Code::new(205);
-/// A name declared twice inside one declaration: a field, a variant, a field
-/// of `make`, an `app` line. ASSUMPTION until the spec owner fixes the code
-/// (#1882).
+/// A name declared twice inside one declaration: a field (SPEC 12.6), a
+/// variant, a field of `make`, an `app` line.
 pub(crate) const DUPLICATE_MEMBER: Code = Code::new(206);
 /// A local in scope at a query with the name of a field of the queried type,
 /// or the loop variable used in its own query (SPEC 12.10).
@@ -1216,7 +1211,7 @@ impl<'a> Rx<'a> {
     }
 
     fn make(&mut self, m: &'a ast::MakeExpr) -> ExprKind {
-        let model = self.model(&m.ty, "`make` needs a data type");
+        let model = self.model(&m.ty, "`make` needs a data type", codes::UNKNOWN_TYPE);
         let mut fields = Vec::with_capacity(m.fields.len());
         let mut seen: Vec<&str> = Vec::new();
         for init in m.fields.iter() {
@@ -1253,8 +1248,9 @@ impl<'a> Rx<'a> {
         }
     }
 
-    /// The model `name` declares, or E0205.
-    fn model(&mut self, name: &ast::Ident, need: &str) -> Option<DefId> {
+    /// The model `name` declares, or `code` at `name` (SPEC 12.6: E0203 where
+    /// a type is expected, E0200 in a query head).
+    fn model(&mut self, name: &ast::Ident, need: &str, code: Code) -> Option<DefId> {
         match self.defs.get(&*name.text).map(|&d| (d, self.def_kind(d))) {
             Some((d, Some(DefKind::Model(_)))) => Some(d),
             found => {
@@ -1263,7 +1259,7 @@ impl<'a> Rx<'a> {
                 } else {
                     format!("unknown data type `{}`", name.text)
                 };
-                self.error(UNKNOWN_MODEL, name.range, message);
+                self.error(code, name.range, message);
                 None
             }
         }
@@ -1284,6 +1280,7 @@ impl<'a> Rx<'a> {
                 let _ = self.model(
                     &q.head,
                     "a query with `where`, `sort`, `limit` or `last` needs a data type",
+                    codes::UNKNOWN_NAME,
                 );
                 ExprKind::Name(Res::Error)
             }
