@@ -41,6 +41,11 @@ fn ac_18_conformance_memory() {
   (`{"error": ...}`). Writes after the first failing one are not sent. A write that fails when
   `"ok"` is expected, a transaction that succeeds when an error is expected, and a different
   error variant are reported.
+* `append_ops` and `reject` items of a `tx` step are one `append_ops` or `record_reject` call
+  each, in order with the writes. An expected `Invalid` matches any rule text.
+* Each `last_seq` step runs begin, `last_seq`, rollback; each `replay` step runs
+  begin, `Transaction::replay_outcome`, rollback and compares the whole outcome, for an
+  accepted op the position and every field of the stored op.
 * Each `query` step runs `Connection::query` on committed state and compares the rows in order:
   id, version, the fields as a map by `FieldId`, and the collections (none in format 1). A returned row must have exactly the fields
   listed in the expectation, so a driver that drops `None` fields fails.
@@ -56,6 +61,7 @@ values that do not fit the field type and `text_repeat` values over 16 MiB make 
 
 `selftest.rs` runs in every test target that includes the harness. It runs small suites against
 a reference driver with one injected fault each (upsert, reused tombstone id, missing version
-increase, lost NUL, UTF-16 order, rollback that keeps writes, ignored limit) and checks that
-exactly the affected cases fail. It also runs the shared case files against the fault free
+increase, lost NUL, UTF-16 order, rollback that keeps writes, ignored limit, `last_seq` not
+raised by `append_ops`, a second outcome for one op) and checks that exactly the affected cases
+fail. It also runs the shared case files against the fault free
 reference driver, once through the entry shown above.

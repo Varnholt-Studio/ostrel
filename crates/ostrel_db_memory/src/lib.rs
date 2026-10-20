@@ -17,6 +17,8 @@
 //!   half applied writes can never be committed by mistake.
 //! * The applied schema and its enum columns are part of the database, so every connection of
 //!   the driver sees them (D87).
+//! * Final outcomes of ops (D110) are the op log plus a map of rejected op ids; `last_seq` per
+//!   replica is kept next to them and changes in the same transaction.
 //!
 //! Ordering of query results follows the column order of the contract (`ostrel_db::api` query
 //! module): `Null` and missing fields first, enum columns by declaration order, `Bytes` byte by
@@ -30,9 +32,9 @@ use std::rc::Rc;
 
 use ostrel_db::api::{
     AppliedSchema, BoxFuture, Capabilities, CmpOp, CollectionChange, CollectionState, Connection,
-    DbError, Dir, Driver, EnumColumn, Expr, FieldId, Hop, MigrationPlan, ModelId, NewOp, Path,
-    Query, Row, RowId, Rows, ServerSeq, SetChange, SetTag, StoredOp, Transaction, Value, Write,
-    check_writes, compare_key,
+    DbError, Dir, Driver, EnumColumn, Expr, FieldId, Hop, MigrationPlan, ModelId, NewOp, OpId,
+    Path, Query, ReplayOutcome, ReplicaId, Row, RowId, Rows, ServerSeq, SetChange, SetTag,
+    StoredOp, Transaction, Value, Write, check_reject_reason, check_writes, compare_key,
 };
 
 /// The URL scheme this driver serves.
@@ -56,6 +58,10 @@ struct State {
     rows: BTreeMap<RowId, Stored>,
     /// The op log. The op at index `i` has the position `i + 1`.
     ops: Vec<StoredOp>,
+    /// Ops rejected for good, with their reason code.
+    rejects: BTreeMap<OpId, String>,
+    /// Highest `seq` with a final outcome, per replica.
+    last_seqs: BTreeMap<ReplicaId, u32>,
     sequences: BTreeMap<String, u64>,
     /// What the last successful migration stored; `None` before the first one.
     schema: Option<AppliedSchema>,
@@ -64,6 +70,25 @@ struct State {
 }
 
 impl State {
+    /// Whether `op` already has a final outcome.
+    fn decided(&self, op: OpId) -> bool {
+        self.rejects.contains_key(&op) || self.ops.iter().any(|o| o.op.id == op)
+    }
+
+    /// Raises `last_seq` of the op's replica to the op's `seq`.
+    fn raise_last_seq(&mut self, op: OpId) {
+        let last = self.last_seqs.entry(op.replica).or_insert(0);
+        *last = (*last).max(op.seq);
+    }
+
+    fn replay_outcome(&self, op: OpId) -> Option<ReplayOutcome> {
+        if let Some(reason) = self.rejects.get(&op) {
+            return Some(ReplayOutcome::Rejected(reason.clone()));
+        }
+        let stored = self.ops.iter().find(|o| o.op.id == op)?;
+        Some(ReplayOutcome::Accepted(stored.clone()))
+    }
+
     /// Declaration order of an enum column, if `(model, field)` is one.
     fn variants(&self, model: ModelId, field: FieldId) -> Option<&[String]> {
         self.enums
@@ -228,9 +253,8 @@ impl<'c> Transaction<'c> for MemoryTransaction<'c> {
                 // Every id is checked before the first op is appended, so a refused call
                 // appends nothing.
                 for (i, op) in ops.iter().enumerate() {
-                    let in_log = s.ops.iter().any(|o| o.op.id == op.id);
                     let earlier = ops.get(..i).unwrap_or_default();
-                    if in_log || earlier.iter().any(|o| o.id == op.id) {
+                    if s.decided(op.id) || earlier.iter().any(|o| o.id == op.id) {
                         return Err(DbError::Conflict);
                     }
                 }
@@ -241,6 +265,7 @@ impl<'c> Transaction<'c> for MemoryTransaction<'c> {
                         seq,
                         op: op.clone(),
                     });
+                    s.raise_last_seq(op.id);
                 }
                 Ok(ServerSeq(s.ops.len() as u64))
             })
@@ -260,6 +285,36 @@ impl<'c> Transaction<'c> for MemoryTransaction<'c> {
                 Ok(rest.iter().take(limit as usize).cloned().collect())
             })
         })
+    }
+
+    fn record_reject<'a>(
+        &'a mut self,
+        op: OpId,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<(), DbError>> {
+        self.dirty = true;
+        Box::pin(async move {
+            self.step(|s| {
+                check_reject_reason(reason)?;
+                if s.decided(op) {
+                    return Err(DbError::Conflict);
+                }
+                s.rejects.insert(op, reason.to_owned());
+                s.raise_last_seq(op);
+                Ok(())
+            })
+        })
+    }
+
+    fn last_seq<'a>(&'a mut self, replica: ReplicaId) -> BoxFuture<'a, Result<u32, DbError>> {
+        Box::pin(async move { self.step(|s| Ok(s.last_seqs.get(&replica).copied().unwrap_or(0))) })
+    }
+
+    fn replay_outcome<'a>(
+        &'a mut self,
+        op: OpId,
+    ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
+        Box::pin(async move { self.step(|s| Ok(s.replay_outcome(op))) })
     }
 
     fn next_in_sequence<'a>(&'a mut self, key: &'a str) -> BoxFuture<'a, Result<u64, DbError>> {
