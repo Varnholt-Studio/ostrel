@@ -223,7 +223,7 @@
       "kind": "ops",
       "verdict": "deny",
       "as": "carol",
-      "source": "EXPECTED.md M-05; ARCHITECTURE 5.4 D132: a body with two kinds is a form fault",
+      "source": "EXPECTED.md M-05; D147 (2), ARCHITECTURE 5.6 (D97): a body with two kinds is Reject Invalid for this op only, the session stays open",
       "given": [
         {
           "as": "bob",
@@ -263,15 +263,15 @@
           },
           "expect": [
             {
-              "error": "Protocol",
-              "fatal": true
+              "reject": "Invalid",
+              "op": "$op"
             }
           ]
         }
       ],
       "db": "unchanged",
       "control": "ac_55_join",
-      "assumption": "AC-55 says Invalid for both directions in one op; under D132 a body object with two keys is a malformed op, a fatal Error Protocol. Either way nothing is applied, carol is not added. QUESTION to #spec."
+      "known_red": "crates/ostrel_sync/src/wire/op.rs raw_body still turns a body with more than one key into a fatal WireError; red until the T5 follow up task of D147 (2) lands"
     },
     {
       "name": "ac_55_hijack_one_op_several_elements",
@@ -597,41 +597,31 @@
     {
       "name": "ac_55_no_principal",
       "covers": "add_other",
-      "kind": "ops",
+      "kind": "session",
       "verdict": "deny",
       "as": "anonymous",
-      "source": "EXPECTED.md M-10",
+      "source": "EXPECTED.md M-10; D147 (1): in an app with auth a Hello without a token is a fatal Error Unauthorized, so no session exists and nothing can be sent",
       "steps": [
         {
           "send": {
             "v": 0,
-            "t": "ops",
-            "ops": [
-              {
-                "id": "$op",
-                "hlc": "$hlc",
-                "model": "Room",
-                "row": "$row:general",
-                "body": {
-                  "add": {
-                    "field": "members",
-                    "elem": "$user:carol"
-                  }
-                }
-              }
-            ]
+            "t": "hello",
+            "token": null,
+            "replica": null,
+            "replica_secret": null,
+            "last_server_seq": null
           },
           "expect": [
             {
-              "reject": "Denied",
-              "op": "$op"
+              "error": "Unauthorized",
+              "fatal": true
             }
-          ]
+          ],
+          "note": "The add of carol to general can never reach the server: the session is refused at Hello. M-10 of EXPECTED.md stays the rule level case (D147 (1))"
         }
       ],
       "db": "unchanged",
-      "control": "ac_55_join",
-      "assumption": "Same open point as ac_11_wrong_principal_no_identity."
+      "control": "ac_55_join"
     },
     {
       "name": "ac_55_leave_from_one_of_two_replicas",
@@ -804,7 +794,7 @@
       "kind": "ops",
       "verdict": "deny",
       "as": "bob",
-      "source": "EXPECTED.md S-03",
+      "source": "EXPECTED.md S-03; D147 (2), ARCHITECTURE 5.6 (D97): a body with two kinds is Reject Invalid for this op only, the session stays open",
       "given": [
         {
           "as": "bob",
@@ -844,15 +834,15 @@
           },
           "expect": [
             {
-              "error": "Protocol",
-              "fatal": true
+              "reject": "Invalid",
+              "op": "$op"
             }
           ]
         }
       ],
       "db": "unchanged",
       "control": "ac_55_leave",
-      "assumption": "As ac_55_hijack_one_op_both_directions."
+      "known_red": "crates/ostrel_sync/src/wire/op.rs raw_body still turns a body with more than one key into a fatal WireError; red until the T5 follow up task of D147 (2) lands"
     },
     {
       "name": "ac_55_shape_null_element",

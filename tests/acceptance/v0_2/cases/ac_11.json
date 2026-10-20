@@ -265,40 +265,31 @@
     {
       "name": "ac_11_wrong_principal_no_identity",
       "covers": "wrong_principal",
-      "kind": "ops",
+      "kind": "session",
       "verdict": "deny",
       "as": "anonymous",
+      "source": "D147 (1): in an app with auth a Hello without a token is a fatal Error Unauthorized, so no session exists and nothing can be sent",
       "steps": [
         {
           "send": {
             "v": 0,
-            "t": "ops",
-            "ops": [
-              {
-                "id": "$op",
-                "hlc": "$hlc",
-                "model": "Task",
-                "row": "$row:t1",
-                "body": {
-                  "set": {
-                    "field": "title",
-                    "value": "Anonymous"
-                  }
-                }
-              }
-            ]
+            "t": "hello",
+            "token": null,
+            "replica": null,
+            "replica_secret": null,
+            "last_server_seq": null
           },
           "expect": [
             {
-              "reject": "Denied",
-              "op": "$op"
+              "error": "Unauthorized",
+              "fatal": true
             }
-          ]
+          ],
+          "note": "The op this case used to send (rename task t1 as anonymous) can never reach the server: the session is refused at Hello"
         }
       ],
       "db": "unchanged",
-      "control": "ac_11_owner_renames_own_task",
-      "assumption": "ARCHITECTURE 5.5 step 1: a session without a verified token gets Denied for every op. protocol.rs documents Unauthorized for a missing token at Hello; if Hello without a token is fatal, the runner records Error Unauthorized instead. QUESTION to #spec."
+      "control": "ac_11_owner_renames_own_task"
     },
     {
       "name": "ac_11_forged_owner_in_make",
@@ -1078,6 +1069,7 @@
       "kind": "ops",
       "verdict": "deny",
       "as": "bob",
+      "source": "D147 (2): a body object whose keys are all known kinds but more than one is Reject Invalid for this op only; an unknown kind or a body that is no object stays fatal",
       "steps": [
         {
           "send": {
@@ -1095,6 +1087,46 @@
                     "value": "x"
                   },
                   "drop": {}
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task",
+      "known_red": "crates/ostrel_sync/src/wire/op.rs raw_body still turns a body with more than one key into a fatal WireError; red until the T5 follow up task of D147 (2) lands"
+    },
+    {
+      "name": "ac_11_malformed_body_unknown_kind",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D147 (2): a body key that is none of the seven kinds stays a fatal form fault, also next to a known kind",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "x"
+                  },
+                  "swap": {}
                 }
               }
             ]

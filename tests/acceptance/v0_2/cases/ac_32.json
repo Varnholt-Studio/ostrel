@@ -127,6 +127,7 @@
       "kind": "call",
       "verdict": "deny",
       "as": "alice",
+      "source": "D147 (3), D8, ARCHITECTURE 5.7: a server fn without call rule is CallError Denied; an unreadable model argument gives NotFound first (D99)",
       "steps": [
         {
           "send": {
@@ -148,8 +149,7 @@
         }
       ],
       "db": "unchanged",
-      "control": "ac_32_admin_clears_own_team",
-      "assumption": "SPEC AC-32 says default deny; the kind (Denied, not NotFound) is not stated. QUESTION to #spec."
+      "control": "ac_32_admin_clears_own_team"
     },
     {
       "name": "ac_32_bulk_drop_with_one_denied_row",

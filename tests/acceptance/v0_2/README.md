@@ -62,13 +62,14 @@ fixture.
 |---|---|
 | `name` | test name `ac_NN_<topic>` (SPEC 2 "Test name"), unique in the suite |
 | `covers` | the part of the criterion the case belongs to (`bypass_cases.test.mjs`, `REQUIRED`) |
-| `kind` | `ops`, `call`, `subscribe`, `session` (handshake), `migration` (server restarts with `app_after` between writing and sending the op), `scenario` (honest client behaviour), `compile` |
+| `kind` | `ops`, `call`, `subscribe`, `session` (handshake: the steps send `Hello` themselves, the runner sends none), `migration` (server restarts with `app_after` between writing and sending the op), `scenario` (honest client behaviour), `compile` |
 | `verdict` | `deny` (must be refused) or `allow` (control or honest behaviour) |
 | `as` | principal of the session: a user handle, `HANDLE@DEVICE` for a second device of the same user, a replica name in an app without `auth`, or `anonymous` (no identity) |
 | `control` | for `deny`: the allowed case on the same app and rule |
 | `steps` | frames to send, each with its `expect` list |
 | `db` | `"unchanged"`, or `{"expect": TEXT}` for an allowed case and for a deny case marked `partial` (an allowed op in the same batch) |
 | `source`, `assumption` | where the expectation comes from, and readings not stated yet (see Open points) |
+| `known_red` | why the current code fails this case and which task fixes it; the runner still runs and reports it, it is never skipped or weakened |
 
 A step sends exactly one of:
 
@@ -130,8 +131,8 @@ Not written yet (follows with `ostrel_server`, owner T4 with QA). Its contract:
    seeded by the fixture and case `given` entries. Principals are development identities.
 2. Before the first step the runner snapshots every table of the database: rows, tombstones,
    op log, reject table, replica table and the audit log.
-3. It opens a session as `as` (`Hello`, `Welcome`), sends the steps and compares the answers
-   with `expect`. No other answer may arrive for the step.
+3. Except for kind `session`, it opens a session as `as` (`Hello`, `Welcome`); it sends the
+   steps and compares the answers with `expect`. No other answer may arrive for the step.
 4. For `"db": "unchanged"` the snapshot after the last step must equal the one before it,
    byte for byte. A denied call writes no audit entry (D140).
 5. After a fatal error or close, the runner opens a new session of the same principal and
@@ -141,17 +142,20 @@ Not written yet (follows with `ostrel_server`, owner T4 with QA). Its contract:
 
 ## Open points
 
-* ASSUMPTION: a session without identity in an app with `auth` gets `Reject Denied` for
-  every op (ARCHITECTURE 5.5 step 1), as `examples/v0_2/chat/EXPECTED.md` M-10 says. The doc
-  comment of `ErrorCode::Unauthorized` names a missing token at `Hello`, which would refuse
-  the session instead. Cases: `ac_11_wrong_principal_no_identity`, `ac_54_elevated_call_without_identity`,
-  `ac_55_no_principal`.
-* ASSUMPTION: one op that names both directions is a body with two kinds and therefore a
-  form fault, a fatal `Error Protocol` under D132, while AC-55 says `Invalid`. Nothing is
-  applied either way. Cases: `ac_55_hijack_one_op_both_directions`,
-  `ac_55_shape_add_and_remove_self`.
-* ASSUMPTION: a client `Call` of a `server fn` without `call` rule is `Denied`, not
-  `NotFound` (AC-32 says default deny). Case: `ac_32_call_without_call_rule`.
+* Decided by D147 (1): in an app with `auth` a `Hello` without a token is a fatal
+  `Error Unauthorized`; there is no session, so no op or call can be sent. ARCHITECTURE 5.5
+  step 1 (`Reject Denied`) applies only to a session whose token became invalid after
+  `Hello`; `examples/v0_2/chat/EXPECTED.md` M-10 stays the rule level case. Cases:
+  `ac_11_wrong_principal_no_identity`, `ac_54_elevated_call_without_identity`,
+  `ac_55_no_principal`. The consistency test refuses any other expectation for `anonymous`
+  in an app with `auth`.
+* Decided by D147 (2): a body object with two or more keys, all of them known kinds, is
+  `Reject Invalid` for that op only (ARCHITECTURE 5.6, D97); an unknown kind or a body that is
+  no object stays a fatal `Error Protocol`. Cases: `ac_11_malformed_body_two_kinds`,
+  `ac_55_hijack_one_op_both_directions`, `ac_55_shape_add_and_remove_self` (known red, see
+  `known_red`), `ac_11_malformed_body_unknown_kind`.
+* Decided by D147 (3): a client `Call` of a `server fn` without `call` rule is `Denied`; an
+  unreadable model argument gives `NotFound` first (D99). Case: `ac_32_call_without_call_rule`.
 * ASSUMPTION: `last n` reaches the server as the reversed order with `limit n` (the query IR
   has no `last`). Case: `ac_33_e_last_counts_readable_rows`.
 * Functions travel by name in `call` (D132); `protocol.rs` still has a numeric `FnId` until

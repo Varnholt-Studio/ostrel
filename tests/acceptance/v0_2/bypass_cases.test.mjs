@@ -255,6 +255,14 @@ function scopeFor(fixture, c) {
 function checkOp(where, op, scope, expect) {
   assert.ok(sameKeys(op, OP_KEYS), `${where}: op keys must be ${OP_KEYS}`);
   const kinds = Object.keys(op.body ?? {});
+  if (kinds.length > 1) {
+    // D147 (2): a body with several known kinds is Invalid for this op only, never fatal.
+    assert.ok(
+      rejects(expect, "Invalid") && !expect.some(isFatal),
+      `${where}: a body with several kinds must be Reject Invalid for this op (D147)`,
+    );
+    return;
+  }
   assert.equal(kinds.length, 1, `${where}: body must have exactly one kind`);
   const [kind] = kinds;
   assert.ok(kind in BODY_KEYS, `${where}: unknown body kind ${kind}`);
@@ -305,15 +313,19 @@ function checkFrame(where, frame, scope, expect, c) {
   assert.ok(CLIENT_MESSAGES.includes(frame.t), `${where}: ${frame.t} is not a client message`);
   if (frame.t === "ops") {
     assert.ok(Array.isArray(frame.ops), `${where}: ops must be an array`);
+    // Only the head (id, hlc, row) and a body that is not an object of known kinds are form
+    // faults (D132, D135); several known kinds in one body are Invalid for that op (D147).
+    const bodyOk = (body) =>
+      body !== null &&
+      typeof body === "object" &&
+      !Array.isArray(body) &&
+      Object.keys(body).length > 0 &&
+      Object.entries(body).every(
+        ([kind, inner]) => kind in BODY_KEYS && (kind === "make" || sameKeys(inner, BODY_KEYS[kind])),
+      );
     const formOk = frame.ops.every(
       (op) =>
-        sameKeys(op, OP_KEYS) &&
-        Object.keys(op.body ?? {}).length === 1 &&
-        Object.keys(op.body)[0] in BODY_KEYS &&
-        (Object.keys(op.body)[0] === "make" ||
-          sameKeys(op.body[Object.keys(op.body)[0]], BODY_KEYS[Object.keys(op.body)[0]])) &&
-        typeof op.id === "string" &&
-        op.id.startsWith("$"),
+        sameKeys(op, OP_KEYS) && bodyOk(op.body) && typeof op.id === "string" && op.id.startsWith("$"),
     );
     if (!formOk) {
       assert.ok(
@@ -478,6 +490,20 @@ function checkCase(suite, c) {
     return;
   }
   assert.ok(knownPrincipal(fixture, c.as), `${where}: unknown principal ${c.as}`);
+  if (c.as === "anonymous" && (fixture.users ?? []).length > 0) {
+    // D147 (1): in an app with `auth` a Hello without a token is refused, there is no session.
+    const [first] = c.steps;
+    assert.ok(
+      c.kind === "session" &&
+        c.steps.length === 1 &&
+        first.send?.t === "hello" &&
+        first.send.token === null &&
+        first.expect.length === 1 &&
+        first.expect[0].error === "Unauthorized" &&
+        first.expect[0].fatal === true,
+      `${where}: anonymous in an app with auth is a Hello refused with fatal Unauthorized (D147)`,
+    );
+  }
   const scope = scopeFor(fixture, c);
   checkGiven(where, c.given ?? [], fixture, scope);
 
@@ -627,6 +653,36 @@ test("the checks reject broken cases", () => {
   assert.throws(broken((c) => (c.steps[0].send.v = 1)), /fatal/);
   assert.throws(broken((c) => (c.steps[0].send.ops[0].hlc = "$clock")), /placeholder/);
   assert.throws(broken((c) => (c.as = "mallory")), /principal/);
+  assert.throws(broken((c) => (c.as = "anonymous")), /D147/);
+  assert.throws(
+    broken((c) => {
+      const op = c.steps[0].send.ops[0];
+      op.body = { ...op.body, drop: {} };
+    }),
+    /several kinds/,
+  );
+  assert.throws(
+    broken((c) => {
+      const op = c.steps[0].send.ops[0];
+      op.body = { ...op.body, drop: {} };
+      c.steps[0].expect = [{ error: "Protocol", fatal: true }];
+    }),
+    /several kinds/,
+  );
+  assert.doesNotThrow(
+    broken((c) => {
+      const op = c.steps[0].send.ops[0];
+      op.body = { ...op.body, drop: {} };
+      c.steps[0].expect = [{ reject: "Invalid", op: "$op" }];
+    }),
+  );
+  assert.throws(
+    broken((c) => {
+      c.steps[0].send.ops[0].body = { set: c.steps[0].send.ops[0].body.set, swap: {} };
+      c.steps[0].expect = [{ reject: "Invalid", op: "$op" }];
+    }),
+    /fatal/,
+  );
   assert.throws(
     broken((c) => (c.steps[0].send = { v: 0, t: "call", call: 1, function: "nope", args: [] })),
     /NotFound/,

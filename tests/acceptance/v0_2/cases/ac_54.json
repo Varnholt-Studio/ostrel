@@ -95,32 +95,31 @@
     {
       "name": "ac_54_elevated_call_without_identity",
       "covers": "crafted_call",
-      "kind": "call",
+      "kind": "session",
       "verdict": "deny",
       "as": "anonymous",
+      "source": "D147 (1): in an app with auth a Hello without a token is a fatal Error Unauthorized, so no session exists and nothing can be sent",
       "steps": [
         {
           "send": {
             "v": 0,
-            "t": "call",
-            "call": 1,
-            "function": "archiveTeam",
-            "args": [
-              "$row:alpha"
-            ]
+            "t": "hello",
+            "token": null,
+            "replica": null,
+            "replica_secret": null,
+            "last_server_seq": null
           },
           "expect": [
             {
-              "return": {
-                "error": "NotFound"
-              }
+              "error": "Unauthorized",
+              "fatal": true
             }
-          ]
+          ],
+          "note": "The crafted Call of archiveTeam can never reach the server: the session is refused at Hello"
         }
       ],
       "db": "unchanged",
-      "control": "ac_54_elevated_call_by_admin",
-      "assumption": "Without a principal no Team row is readable (see if me in roles), so the argument resolves to NotFound. Same open point as ac_11_wrong_principal_no_identity."
+      "control": "ac_54_elevated_call_by_admin"
     }
   ]
 }
