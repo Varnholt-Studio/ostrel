@@ -1,0 +1,63 @@
+ok	https://a.b/x?y#z	https://a.b/x?y#z
+ok	HTTPS://A.B	HTTPS://A.B
+ok	MailTo:a@b.c	MailTo:a@b.c
+ok	/x	/x
+ok	?q	?q
+ok	#f	#f
+ok	//host/p	//host/p
+ok	\u{20}/x\u{20}	/x
+ok	javascript&#58;x	javascript&#58;x
+none	
+none	\u{20}\u{20}\u{20}
+none	javascript:alert(1)
+none	JaVaScRiPt:x
+none	java\tscript:x
+none	\u{1}javascript:x
+none	\u{85}/x
+none	data:text/html,x
+none	vbscript:x
+none	file:///etc/passwd
+none	http://
+none	https://[::1
+none	http:a.b
+none	http:/a.b
+none	http:\\\\a.b
+none	http://a@b.c
+none	https://[::1]
+none	http://a%2eb
+none	http://a..b
+none	http://.a
+none	http://a.b:
+none	http://a.b:65536
+none	http://999.1.1.1
+none	http://a.123
+none	http://a.0x1
+ok	http://xn--bcher-kva.de	http://xn--bcher-kva.de
+ok	http://1.2.3.4	http://1.2.3.4
+ok	http://a.b.:8080/x	http://a.b.:8080/x
+none	http://b\u{FC}cher.de
+ok	http://a.b	http://a.b
+ok	https://a-b.c:443	https://a-b.c:443
+ok	http://a.b:0	http://a.b:0
+ok	http://a.b:65535	http://a.b:65535
+ok	http://localhost	http://localhost
+ok	http://0.0.0.0	http://0.0.0.0
+ok	http://255.255.255.255	http://255.255.255.255
+ok	https://a.b?x	https://a.b?x
+ok	https://a.b#f	https://a.b#f
+ok	https://a.b/p\\q@r%20[s]	https://a.b/p\\q@r%20[s]
+none	http://a.b:123456
+none	http://a.b:8x
+none	http://a.b:1:2
+none	http://:80
+none	http://.
+none	http://a..
+none	http://a\\b.c
+none	http://a b.c
+none	http://a_b.c
+none	http://256.1.1.1
+none	http://01.2.3.4
+none	http://1.2.3
+none	http://1.2.3.4.5
+none	http://a.0X1
+none	http://0x7f.0.0.1
