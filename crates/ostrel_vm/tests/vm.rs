@@ -626,6 +626,204 @@ fn step_limit_ends_deep_recursion_too() {
     assert_eq!(result.map_err(|e| e.kind), Err(RuntimeErrorKind::StepLimit));
 }
 
+/// `fn double(t: Text, rounds: Int) -> Text`: `rounds` doublings of `t` by
+/// recursion, as function `id`.
+fn double(id: u32) -> Function {
+    func(
+        "double",
+        2,
+        &[Ty::Text, Ty::Int, Ty::Int, Ty::Bool, Ty::Text, Ty::Int],
+        Ty::Text,
+        vec![
+            block(
+                vec![i(int(2, 0)), i(bin(3, BinOp::Eq, 1, 2))],
+                Terminator::Branch {
+                    cond: l(3),
+                    then: BlockId(1),
+                    otherwise: BlockId(2),
+                },
+            ),
+            block(vec![], Terminator::Return(Some(l(0)))),
+            block(
+                vec![
+                    i(InstKind::Concat {
+                        dst: l(4),
+                        parts: vec![l(0), l(0)],
+                    }),
+                    i(int(2, 1)),
+                    i(bin(5, BinOp::Sub, 1, 2)),
+                    i(call(Some(4), id, &[4, 5])),
+                ],
+                Terminator::Return(Some(l(4))),
+            ),
+        ],
+    )
+}
+
+/// `fn spin(a: Text, b: Text, n: Int) -> Int`: compares `a == b` once per level of
+/// a recursion `n` deep and returns `n`, as function `id`.
+fn compare_spin(id: u32) -> Function {
+    func(
+        "spin",
+        3,
+        &[Ty::Text, Ty::Text, Ty::Int, Ty::Int, Ty::Bool, Ty::Int],
+        Ty::Int,
+        vec![
+            block(
+                vec![i(int(3, 0)), i(bin(4, BinOp::Eq, 2, 3))],
+                Terminator::Branch {
+                    cond: l(4),
+                    then: BlockId(1),
+                    otherwise: BlockId(2),
+                },
+            ),
+            block(vec![], Terminator::Return(Some(l(3)))),
+            block(
+                vec![
+                    at(200, bin(4, BinOp::Eq, 0, 1)),
+                    i(int(3, 1)),
+                    i(bin(5, BinOp::Sub, 2, 3)),
+                    i(call(Some(5), id, &[0, 1, 5])),
+                    i(bin(5, BinOp::Add, 5, 3)),
+                ],
+                Terminator::Return(Some(l(5))),
+            ),
+        ],
+    )
+}
+
+/// `fn main() { print(spin(double(a, ra), double(b, rb), n)) }`.
+fn compare_main(a: &str, ra: i64, b: &str, rb: i64, n: i64) -> Program {
+    let main = func(
+        "main",
+        0,
+        &[
+            Ty::Text,
+            Ty::Int,
+            Ty::Text,
+            Ty::Int,
+            Ty::Text,
+            Ty::Text,
+            Ty::Int,
+            Ty::Int,
+        ],
+        Ty::Unit,
+        vec![block(
+            vec![
+                i(text(0, a)),
+                i(int(1, ra)),
+                i(text(2, b)),
+                i(int(3, rb)),
+                at(10, call(Some(4), 1, &[0, 1])),
+                at(20, call(Some(5), 1, &[2, 3])),
+                i(int(6, n)),
+                at(30, call(Some(7), 2, &[4, 5, 6])),
+                at(40, print(7)),
+            ],
+            ret(),
+        )],
+    );
+    program(vec![main, double(1), compare_spin(2)])
+}
+
+#[test]
+fn step_limit_bounds_text_comparison_work() {
+    // Red #1136 (kira): two texts of 16 MiB compared once per level of a recursion
+    // 9 900 deep ran for 29.5 s CPU without any limit. Each comparison now costs a
+    // step per 64 bytes, so the default limit stops the program after a few hundred
+    // comparisons, at the running call in `main`.
+    let p = compare_main("a", 24, "a", 24, 9_900);
+    assert_eq!(exec(&p), (vec![], err(RuntimeErrorKind::StepLimit, 30)));
+}
+
+#[test]
+fn equal_length_texts_cost_steps_per_byte() {
+    let limits = Limits {
+        max_steps: 20_000,
+        ..Limits::default()
+    };
+    // 1 000 comparisons of two 1 KiB texts need 16 000 steps of work on top of the
+    // about 11 steps per level of the recursion.
+    let equal = compare_main("a", 10, "b", 10, 1_000);
+    assert_eq!(
+        exec_with(&equal, limits),
+        (vec![], err(RuntimeErrorKind::StepLimit, 30))
+    );
+    // Texts of different length compare without reading their bytes.
+    let unequal = compare_main("a", 10, "ab", 10, 1_000);
+    assert_eq!(
+        exec_with(&unequal, limits),
+        (vec!["1000".to_string()], Ok(()))
+    );
+    // Without the comparisons the same budget suffices for the equal texts too.
+    let none = compare_main("a", 10, "b", 10, 0);
+    assert_eq!(exec_with(&none, limits), (vec!["0".to_string()], Ok(())));
+}
+
+#[test]
+fn printing_long_text_costs_steps_per_byte() {
+    // `fn main() { print(double("a", 20)) }`: building the text writes 2 MiB in all
+    // (about 33 000 steps), printing its 1 MiB needs 16 384 more.
+    let p = program(vec![
+        func(
+            "main",
+            0,
+            &[Ty::Text, Ty::Int, Ty::Text],
+            Ty::Unit,
+            vec![block(
+                vec![
+                    i(text(0, "a")),
+                    i(int(1, 20)),
+                    i(call(Some(2), 1, &[0, 1])),
+                    at(60, print(2)),
+                ],
+                ret(),
+            )],
+        ),
+        double(1),
+    ]);
+    let limits = |max_steps| Limits {
+        max_steps,
+        ..Limits::default()
+    };
+    let (out, result) = exec_with(&p, limits(40_000));
+    assert!(out.is_empty(), "nothing is printed past the limit");
+    assert_eq!(result, err(RuntimeErrorKind::StepLimit, 60));
+    let (out, result) = exec_with(&p, limits(60_000));
+    assert_eq!(result, Ok(()));
+    assert_eq!(out.first().map(String::len), Some(1 << 20));
+}
+
+#[test]
+fn concatenation_costs_steps_per_byte_but_text_limit_wins() {
+    // Twelve doublings of "x" write 2 + 4 + ... + 4096 bytes, more than 8 000 / 64
+    // steps of work, so they fail at the concatenation with 120 steps.
+    let limits = Limits {
+        max_steps: 120,
+        ..Limits::default()
+    };
+    assert_eq!(
+        exec_with(&doubling(12), limits),
+        (vec![], err(RuntimeErrorKind::StepLimit, 50))
+    );
+    // A concatenation refused by `TextLimit` does no work and is not charged for it:
+    // 100 steps reach the eleventh concatenation with one step left, which is enough
+    // to report `TextLimit` although writing 2 048 bytes would cost 32 more.
+    let limits = |max_steps| Limits {
+        max_steps,
+        max_text_bytes: 1024,
+        ..Limits::default()
+    };
+    assert_eq!(
+        exec_with(&doubling(11), limits(100)),
+        (vec![], err(RuntimeErrorKind::TextLimit, 50))
+    );
+    assert_eq!(
+        exec_with(&doubling(11), limits(99)),
+        (vec![], err(RuntimeErrorKind::StepLimit, 50))
+    );
+}
+
 /// `let t = "x"`, then `t = "{t}{t}"` repeated `rounds` times, then `print("ok")`.
 /// The loop runs on a counter, lowered to blocks by hand.
 fn doubling(rounds: i64) -> Program {
