@@ -61,9 +61,29 @@ function isVnode(value) {
   return typeof value === "object" && value !== null && made.has(value);
 }
 
+// A value that did not come from el() or text() is a child of the wrong type.
 function checkVnode(vnode) {
   if (!isVnode(vnode)) {
-    throw new ViewError("VnodeForged", "virtual node was not created by el() or text()");
+    throw new ViewError("ChildType", "virtual node was not created by el() or text()");
+  }
+}
+
+// Checks the whole tree before mount or patch touches the DOM, so a forged node
+// or a replaced children list deep in the tree leaves the DOM unchanged. A node
+// that occurs twice is walked once; create() reports the reuse as before.
+function checkTree(root) {
+  const seen = new Set();
+  const stack = [root];
+  while (stack.length > 0) {
+    const vnode = stack.pop();
+    checkVnode(vnode);
+    if (seen.has(vnode)) continue;
+    seen.add(vnode);
+    if (vnode.kind !== "el") continue;
+    if (!Array.isArray(vnode.children)) {
+      throw new ViewError("ChildType", "children must be an array of virtual nodes");
+    }
+    for (const child of vnode.children) stack.push(child);
   }
 }
 
@@ -302,11 +322,13 @@ export function createRenderer(doc, sinks) {
   return {
     /** Appends the DOM for `vnode` to `parent`; returns `vnode`. */
     mount(parent, vnode) {
+      checkTree(vnode);
       parent.appendChild(create(vnode));
       return vnode;
     },
     /** Updates the DOM of `oldV` under `parent` to match `newV`; returns `newV`. */
     patch(parent, oldV, newV) {
+      checkTree(newV);
       patchNode(parent, oldV, newV);
       return newV;
     },

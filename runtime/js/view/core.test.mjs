@@ -285,16 +285,16 @@ test("forged element and text objects are rejected as children", () => {
 
 test("mount and patch refuse forged virtual nodes before touching the DOM", () => {
   const { doc, root, r } = setup();
-  assert.equal(code(() => r.mount(root, forgedScript())), "VnodeForged");
-  assert.equal(code(() => r.mount(root, { kind: "text", text: "x", node: null })), "VnodeForged");
+  assert.equal(code(() => r.mount(root, forgedScript())), "ChildType");
+  assert.equal(code(() => r.mount(root, { kind: "text", text: "x", node: null })), "ChildType");
   assert.equal(root.childNodes.length, 0);
   assert.equal(doc.ops.create, 0);
   const v = r.mount(root, el("p", {}, ["a"]));
   doc.resetOps();
-  assert.equal(code(() => r.patch(root, v, forgedScript())), "VnodeForged");
+  assert.equal(code(() => r.patch(root, v, forgedScript())), "ChildType");
   const sameShape = { kind: "el", tag: "p", attrs: { title: "x" }, on: {}, children: [], node: null };
-  assert.equal(code(() => r.patch(root, v, sameShape)), "VnodeForged");
-  assert.equal(code(() => r.patch(root, v.children[0], { kind: "text", text: "b", node: null })), "VnodeForged");
+  assert.equal(code(() => r.patch(root, v, sameShape)), "ChildType");
+  assert.equal(code(() => r.patch(root, v.children[0], { kind: "text", text: "b", node: null })), "ChildType");
   assert.deepEqual(doc.ops, { create: 0, insert: 0, remove: 0, text: 0, attr: 0, listen: 0 });
   assert.equal(show(root), '<div><p>"a"</p></div>');
 });
@@ -303,14 +303,14 @@ test("a forged node smuggled into a real tree after creation is rejected", () =>
   const { doc, root, r } = setup();
   const pushed = el("div", {}, []);
   pushed.children.push(forgedScript());
-  assert.equal(code(() => r.mount(root, pushed)), "VnodeForged");
+  assert.equal(code(() => r.mount(root, pushed)), "ChildType");
   assert.equal(root.childNodes.length, 0);
 
   const old = r.mount(root, el("ul", {}, [el("li", { key: 1 }, ["a"])]));
   const next = el("ul", {}, [el("li", { key: 1 }, ["a"])]);
   next.children.push(Object.assign(forgedScript(), { key: 2 }));
   doc.resetOps();
-  assert.equal(code(() => r.patch(root, old, next)), "VnodeForged");
+  assert.equal(code(() => r.patch(root, old, next)), "ChildType");
   assert.equal(doc.ops.create, 0);
   assert.ok(!show(root).includes("script"));
 });
@@ -325,4 +325,40 @@ test("a real node whose tag is changed after creation is still checked", () => {
   swapped.tag = "iframe";
   assert.equal(code(() => r.patch(root, ok, swapped)), "TagBlocked");
   assert.equal(show(root), '<div><p>"a"</p></div>');
+});
+
+test("a patch with a nested forged node changes nothing in the DOM", () => {
+  const { doc, root, r } = setup();
+  const keyedOld = r.mount(root, el("ul", {}, [el("li", { key: 0 }, ["x"]), el("li", { key: 1 }, ["a"])]));
+  const keyedNew = el("ul", {}, [el("li", { key: 0 }, ["x"]), el("li", { key: 1 }, ["b"])]);
+  keyedNew.children[0].children.push(forgedScript());
+  doc.resetOps();
+  assert.equal(code(() => r.patch(root, keyedOld, keyedNew)), "ChildType");
+  assert.deepEqual(doc.ops, { create: 0, insert: 0, remove: 0, text: 0, attr: 0, listen: 0 });
+  assert.equal(show(root), '<div><ul><li>"x"</li><li>"a"</li></ul></div>');
+
+  const second = setup();
+  const plainOld = second.r.mount(second.root, el("div", {}, [el("p", {}, ["a"]), el("p", {}, ["c"])]));
+  const plainNew = el("div", {}, [el("p", {}, ["b"]), el("p", {}, ["c"])]);
+  plainNew.children[1].children.push(forgedScript());
+  second.doc.resetOps();
+  assert.equal(code(() => second.r.patch(second.root, plainOld, plainNew)), "ChildType");
+  assert.deepEqual(second.doc.ops, { create: 0, insert: 0, remove: 0, text: 0, attr: 0, listen: 0 });
+  assert.equal(show(second.root), '<div><div><p>"a"</p><p>"c"</p></div></div>');
+});
+
+test("children replaced by a non array after creation give a ViewError", () => {
+  for (const bad of [null, undefined, "abc", { length: 1, 0: "x" }]) {
+    const { doc, root, r } = setup();
+    const v = el("div", {}, ["a"]);
+    v.children = bad;
+    assert.equal(code(() => r.mount(root, v)), "ChildType");
+    assert.equal(root.childNodes.length, 0);
+    const old = r.mount(root, el("div", {}, ["a"]));
+    const next = el("div", {}, ["b"]);
+    next.children = bad;
+    doc.resetOps();
+    assert.equal(code(() => r.patch(root, old, next)), "ChildType");
+    assert.equal(doc.ops.text, 0);
+  }
 });
