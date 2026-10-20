@@ -196,3 +196,87 @@ fn sort_by_an_implicit_field_is_representable() {
         }
     ));
 }
+
+#[test]
+fn serial_keys_are_fixed_scalar_fields_or_author() {
+    // D136: `serial per f` with f in each mode and type of SYNTAX 4.2.
+    let span = Span::point(file(), 0);
+    let team = DefId(0);
+    let status = DefId(1);
+    let boxed = Box::new;
+    let fixed = |ty: Ty| (ty, FieldMode::Fixed, Merge::Default);
+    let allowed = [
+        fixed(Ty::Bool),
+        fixed(Ty::Int),
+        fixed(Ty::Text),
+        fixed(Ty::Time),
+        fixed(Ty::Bytes),
+        fixed(Ty::Enum(status)),
+        fixed(Ty::Ref(team)),
+    ];
+    let rejected = [
+        (Ty::Ref(team), FieldMode::Plain, Merge::Default),
+        (Ty::Ref(team), FieldMode::Server, Merge::Default),
+        (Ty::Int, FieldMode::Serial(None), Merge::Default),
+        (Ty::Text, FieldMode::Fixed, Merge::Text),
+        fixed(Ty::Float),
+        fixed(Ty::Rank),
+        fixed(Ty::Optional(boxed(Ty::Ref(team)))),
+        fixed(Ty::Set(boxed(Ty::Int))),
+        fixed(Ty::Map(boxed(Ty::Int), boxed(Ty::Int))),
+        fixed(Ty::List(boxed(Ty::Int))),
+    ];
+    let fields = allowed
+        .iter()
+        .chain(&rejected)
+        .enumerate()
+        .map(|(i, (ty, mode, merge))| FieldDef {
+            name: format!("f{i}").into(),
+            span,
+            ty: ty.clone(),
+            default: None,
+            mode: *mode,
+            merge: *merge,
+        })
+        .collect();
+    let program = Program {
+        defs: vec![
+            Def {
+                name: "Issue".into(),
+                span,
+                kind: DefKind::Model(ModelDef {
+                    fields,
+                    rules: Vec::new(),
+                    checks: Vec::new(),
+                }),
+            },
+            Def {
+                name: "Status".into(),
+                span,
+                kind: DefKind::Enum(vec!["open".into()].into()),
+            },
+        ],
+        ..Program::default()
+    };
+    let issue = DefId(0);
+    for i in 0..allowed.len() + rejected.len() {
+        let key = FieldRef::Declared(FieldId(i as u32));
+        assert_eq!(
+            program.is_serial_key(issue, key),
+            i < allowed.len(),
+            "{key:?}"
+        );
+    }
+    let past_end = FieldId((allowed.len() + rejected.len()) as u32);
+    assert!(!program.is_serial_key(issue, FieldRef::Declared(past_end)));
+    assert!(!program.is_serial_key(status, FieldRef::Declared(FieldId(0))));
+    use ImplicitField::*;
+    for field in [Id, Made, Changed, Author, Pending, Rejected] {
+        let key = FieldRef::Implicit(field);
+        assert_eq!(
+            program.is_serial_key(issue, key),
+            field == Author,
+            "{key:?}"
+        );
+    }
+}

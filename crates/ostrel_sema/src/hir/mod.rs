@@ -177,6 +177,31 @@ impl Program {
             _ => None,
         }
     }
+
+    /// True if `serial per key` on a field of `model` numbers rows in groups
+    /// that a row never leaves (D136, SYNTAX 4.2): a `fixed` field of type
+    /// `Bool`, `Int`, `Text` without `merge text`, `Time`, `Bytes`, an enum
+    /// or a reference, or the implicit `author`. Every other key, and a key
+    /// that is not a field of `model`, is a compile error at the key.
+    pub fn is_serial_key(&self, model: DefId, key: FieldRef) -> bool {
+        match key {
+            FieldRef::Implicit(field) => field == ImplicitField::Author,
+            FieldRef::Declared(field) => self.field(model, field).is_some_and(|f| {
+                f.mode == FieldMode::Fixed
+                    && f.merge == Merge::Default
+                    && matches!(
+                        f.ty,
+                        Ty::Bool
+                            | Ty::Int
+                            | Ty::Text
+                            | Ty::Time
+                            | Ty::Bytes
+                            | Ty::Enum(_)
+                            | Ty::Ref(_)
+                    )
+            }),
+        }
+    }
 }
 
 /// A top level declaration.
@@ -266,8 +291,10 @@ pub enum FieldMode {
     Fixed,
     /// `server`: written by server code only.
     Server,
-    /// `serial [per f]`: assigned by the server (ARCHITECTURE 5.1).
-    Serial(Option<FieldId>),
+    /// `serial [per f]`: assigned by the server (ARCHITECTURE 5.1). The
+    /// field after `per` may be any field name; [`Program::is_serial_key`]
+    /// says whether `check` accepts it (D136).
+    Serial(Option<FieldRef>),
 }
 
 /// Merge strategy of a field (SYNTAX 4.3, ARCHITECTURE 5.1).
