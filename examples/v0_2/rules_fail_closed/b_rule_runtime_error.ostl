@@ -1,0 +1,16 @@
+// AC-33 (b): a runtime error while a rule is evaluated denies the operation.
+// The rule is written so that reading the failed division as `false` would allow the
+// write: `not` turns false into true. Only "error denies the operation" rejects it.
+
+app Venue
+  auth paseto open
+
+data Event
+  name: Text
+  seats: Int
+  check name.len in 1..80
+  see if signed
+  make if not (1000 / seats < 10)
+
+view Main
+  text "Events"

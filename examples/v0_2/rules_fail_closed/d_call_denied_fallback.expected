@@ -1,0 +1,28 @@
+case: d_call_denied_fallback
+ac: AC-33 (d), reading per SPEC 5.0 and 12.7
+kind: client (browser job), plus one crafted Call
+compile: ostrel check exits 0 with no diagnostic
+principals: alice, bob (development identities, debug build, AC-12)
+given: alice has made Coupon { code: "A10", percent: 10 }; both principals can see it (`see if signed`)
+each probe starts in a freshly loaded tab, so the text "shown -1" is visible before the click
+probes:
+  1. alice, online, clicks "Plain" on A10
+     server: call rule c.author == me is true; Return 10
+     expect: text "shown 10"
+  2. bob, online, clicks "Plain" on A10 (the must deny case)
+     server: the row resolves through bob's `see` (D99), then the call rule is false; Return Denied
+     expect: text stays "shown -1"; it never shows "shown 0"; the std error notice reports the failure
+  3. bob, online, clicks "Named" on A10
+     server: Return Denied
+     expect: text "shown 0", because `catch Denied` names the kind
+  4. bob, offline (`sync.state` is offline), clicks "Plain" on A10
+     expect: text "shown 0"; no Call frame is sent, and after reconnect the server has received no Call for it
+  5. bob, online, clicks "Plain" on A10 and the connection closes after the Call frame was sent
+     expect: the call fails with OutcomeUnknown; text stays "shown -1"; nothing is resent after reconnect
+  6. crafted Call by bob, sent directly over the protocol: discount(A10)
+     expect: Return Denied
+final db: one Coupon row, unchanged by all probes
+must not: "shown 0" after probe 2 or probe 5
+ASSUMPTION: an unhandled error of a `Remote` value ends the client function at that expression,
+  like a failed `check` in SYNTAX 5.2, so the assignment to `shown` does not happen. The binding
+  part is only that `shown` never becomes 0 in probes 2 and 5.

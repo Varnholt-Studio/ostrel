@@ -1,0 +1,15 @@
+// AC-33 (a): an ordering comparison with an optional operand inside a rule.
+
+app Board
+  auth paseto open
+
+data Task
+  title: Text
+  priority: Int?
+  check title.len in 1..200
+  see if signed
+  make if signed
+  edit if priority >= 3
+
+view Main
+  text "Tasks"
