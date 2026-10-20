@@ -264,3 +264,65 @@ test("view core source contains no HTML parsing sinks", () => {
     for (const p of patterns) assert.ok(!src.includes(p), `${file} contains ${p}`);
   }
 });
+
+// Finding #1408: only nodes made by el() and text() may reach the DOM. A plain object
+// with the same shape (for example from JSON) must never bypass the tag blocklist.
+function forgedScript() {
+  return JSON.parse(
+    '{"kind":"el","tag":"script","attrs":{},"on":{},"children":[{"kind":"text","text":"alert(1)"}],"node":null}',
+  );
+}
+
+test("forged element and text objects are rejected as children", () => {
+  assert.equal(code(() => el("div", {}, [forgedScript()])), "ChildType");
+  assert.equal(code(() => el("div", {}, [{ kind: "text", text: "x", node: null }])), "ChildType");
+  const copy = { ...el("b", {}, ["x"]) };
+  assert.equal(code(() => el("div", {}, [copy])), "ChildType");
+  const shell = Object.create(Object.getPrototypeOf(text("x")));
+  Object.assign(shell, text("x"));
+  assert.equal(code(() => el("div", {}, [shell])), "ChildType");
+});
+
+test("mount and patch refuse forged virtual nodes before touching the DOM", () => {
+  const { doc, root, r } = setup();
+  assert.equal(code(() => r.mount(root, forgedScript())), "VnodeForged");
+  assert.equal(code(() => r.mount(root, { kind: "text", text: "x", node: null })), "VnodeForged");
+  assert.equal(root.childNodes.length, 0);
+  assert.equal(doc.ops.create, 0);
+  const v = r.mount(root, el("p", {}, ["a"]));
+  doc.resetOps();
+  assert.equal(code(() => r.patch(root, v, forgedScript())), "VnodeForged");
+  const sameShape = { kind: "el", tag: "p", attrs: { title: "x" }, on: {}, children: [], node: null };
+  assert.equal(code(() => r.patch(root, v, sameShape)), "VnodeForged");
+  assert.equal(code(() => r.patch(root, v.children[0], { kind: "text", text: "b", node: null })), "VnodeForged");
+  assert.deepEqual(doc.ops, { create: 0, insert: 0, remove: 0, text: 0, attr: 0, listen: 0 });
+  assert.equal(show(root), '<div><p>"a"</p></div>');
+});
+
+test("a forged node smuggled into a real tree after creation is rejected", () => {
+  const { doc, root, r } = setup();
+  const pushed = el("div", {}, []);
+  pushed.children.push(forgedScript());
+  assert.equal(code(() => r.mount(root, pushed)), "VnodeForged");
+  assert.equal(root.childNodes.length, 0);
+
+  const old = r.mount(root, el("ul", {}, [el("li", { key: 1 }, ["a"])]));
+  const next = el("ul", {}, [el("li", { key: 1 }, ["a"])]);
+  next.children.push(Object.assign(forgedScript(), { key: 2 }));
+  doc.resetOps();
+  assert.equal(code(() => r.patch(root, old, next)), "VnodeForged");
+  assert.equal(doc.ops.create, 0);
+  assert.ok(!show(root).includes("script"));
+});
+
+test("a real node whose tag is changed after creation is still checked", () => {
+  const { root, r } = setup();
+  const v = el("p", {}, ["alert(1)"]);
+  v.tag = "script";
+  assert.equal(code(() => r.mount(root, v)), "TagBlocked");
+  const ok = r.mount(root, el("p", {}, ["a"]));
+  const swapped = el("p", {}, ["a"]);
+  swapped.tag = "iframe";
+  assert.equal(code(() => r.patch(root, ok, swapped)), "TagBlocked");
+  assert.equal(show(root), '<div><p>"a"</p></div>');
+});
