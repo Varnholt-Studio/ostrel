@@ -130,13 +130,17 @@ impl fmt::Debug for Server {
 
 /// The result of a task from what the VM returned and what the host saw.
 ///
-/// A task that stops after an audit entry could not be written ends with
-/// [`TaskError::Unavailable`] (D134): the VM did not run that body, whatever error it reports
-/// for the failed call. A task that ends normally stays `Ok`, because the program may have
-/// handled the failure with `catch Unavailable`.
+/// A task whose VM error follows directly on an audit entry that could not be written, with no
+/// host event in between, ends with [`TaskError::Unavailable`] (D134): the error is the failed
+/// call itself, whose body did not run. Once the program went on after the failure (it caught
+/// `Unavailable` and the host saw a later event), a later VM error stays a
+/// [`TaskError::Runtime`], because a retry would repeat what ran after the catch. A task that
+/// ends normally stays `Ok`.
 ///
 /// ASSUMPTION: the VM entry of elevated functions (T2) does not yet say how it reports a
-/// failed audit, so the host record decides.
+/// failed audit, so the host record decides. A program that catches `Unavailable` and fails
+/// before any further host event is still reported as `Unavailable`; nothing ran in between
+/// that a retry could repeat. T2 replaces this rule with the error the VM reports.
 fn outcome(
     principal: Option<RowId>,
     result: Result<(), RuntimeError>,
@@ -169,7 +173,9 @@ mod tests {
     use ostrel_core::FileId;
     use ostrel_db::api::Driver;
     use ostrel_db_memory::MemoryDriver;
+    use ostrel_vm::Host as _;
     use ostrel_vm::RuntimeErrorKind;
+    use ostrel_vm::host::{AuditEntry, ServerHost};
 
     fn image(src: &str) -> Image {
         let file = FileId::from_raw(0);
@@ -273,20 +279,44 @@ mod tests {
         }
     }
 
+    /// The outcome of a task whose host saw `events` and whose VM ended with `result`.
+    fn task_after(
+        events: impl FnOnce(&mut TaskHost<'_>),
+        result: Result<(), RuntimeError>,
+    ) -> Result<Outcome, TaskError> {
+        let mut clock = StepClock::default();
+        let mut log = ClosedLog;
+        let mut host = TaskHost::new(None, &mut clock, &mut log);
+        events(&mut host);
+        let (output, audit_failure) = host.finish();
+        outcome(None, result, output, audit_failure)
+    }
+
+    fn failed_audit(host: &mut TaskHost<'_>) {
+        let entry = AuditEntry {
+            function: "billing.charge".to_owned(),
+            principal: None,
+            arguments: Vec::new(),
+            time: host.now(),
+        };
+        assert!(ready(host.audit(&entry)).is_err());
+    }
+
+    /// D134: the call whose audit entry failed is the error that ends the task.
     #[test]
-    fn failed_audit_makes_the_call_unavailable() {
+    fn uncaught_audit_failure_makes_the_task_unavailable() {
         let error = runtime_error("fn main()\n  print(1 / 0)\n");
-        let refused = AuditError("log closed".to_owned());
-        let result = outcome(
-            None,
+        let result = task_after(
+            |h| {
+                h.print("before");
+                failed_audit(h);
+            },
             Err(error),
-            vec!["before".to_owned()],
-            Some(refused.clone()),
         );
         assert_eq!(
             result,
             Err(TaskError::Unavailable {
-                error: refused,
+                error: AuditError("log closed".to_owned()),
                 output: vec!["before".to_owned()],
             })
         );
@@ -301,13 +331,49 @@ mod tests {
         assert!(!shown.contains("runtime error"), "{shown}");
     }
 
+    /// D134: after `catch Unavailable` the program went on (here a bridge call, as in a mail
+    /// sent after the catch), so its later `1 / 0` is a runtime error, never a safe retry.
     #[test]
-    fn handled_audit_failure_keeps_the_task_successful() {
-        let refused = AuditError("log closed".to_owned());
+    fn caught_audit_failure_then_runtime_error_stays_a_runtime_error() {
+        let error = runtime_error("fn main()\n  print(1 / 0)\n");
+        let result = task_after(
+            |h| {
+                failed_audit(h);
+                let _ = ready(h.extern_call("mail", "send", &[]));
+                h.print("after");
+            },
+            Err(error),
+        );
         assert_eq!(
-            outcome(Some(user(3)), Ok(()), Vec::new(), Some(refused)),
+            result,
+            Err(TaskError::Runtime {
+                error,
+                output: vec!["after".to_owned()],
+            })
+        );
+        assert_eq!(error.kind, RuntimeErrorKind::DivisionByZero);
+    }
+
+    #[test]
+    fn caught_audit_failure_then_normal_end_is_ok() {
+        assert_eq!(
+            task_after(
+                |h| {
+                    failed_audit(h);
+                    h.print("handled");
+                },
+                Ok(())
+            ),
             Ok(Outcome {
-                principal: Some(user(3)),
+                principal: None,
+                output: vec!["handled".to_owned()],
+            })
+        );
+        // A task that ends normally stays `Ok` even when the failure was its last event.
+        assert_eq!(
+            task_after(failed_audit, Ok(())),
+            Ok(Outcome {
+                principal: None,
                 output: Vec::new(),
             })
         );

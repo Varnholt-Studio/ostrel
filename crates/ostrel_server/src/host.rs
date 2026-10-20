@@ -46,6 +46,7 @@ pub struct TaskHost<'a> {
     clock: &'a mut dyn Clock,
     audit: &'a mut dyn AuditStore,
     output: Vec<String>,
+    /// The failed audit entry, kept only while it is the latest event this host saw.
     audit_failure: Option<AuditError>,
 }
 
@@ -70,9 +71,16 @@ impl<'a> TaskHost<'a> {
         &self.output
     }
 
-    /// The first audit entry of this task that could not be written, if any (D134).
+    /// The audit entry that could not be written, if that failure is the latest event this
+    /// host saw (D134). Any later host event (a written audit entry, `print`, `now` or a bridge
+    /// call) clears it, because the program then went on after the failed call.
     pub fn audit_failure(&self) -> Option<&AuditError> {
         self.audit_failure.as_ref()
+    }
+
+    /// Records a host event that is not a failed audit entry.
+    fn went_on(&mut self) {
+        self.audit_failure = None;
     }
 
     /// Ends the task and returns its printed lines.
@@ -80,7 +88,8 @@ impl<'a> TaskHost<'a> {
         self.output
     }
 
-    /// Ends the task and returns its printed lines and its first failed audit entry.
+    /// Ends the task and returns its printed lines and the failed audit entry, if that failure
+    /// was the latest host event of the task.
     pub fn finish(self) -> (Vec<String>, Option<AuditError>) {
         (self.output, self.audit_failure)
     }
@@ -98,6 +107,7 @@ impl fmt::Debug for TaskHost<'_> {
 
 impl Host for TaskHost<'_> {
     fn print(&mut self, text: &str) {
+        self.went_on();
         self.output.push(text.to_owned());
     }
 }
@@ -108,6 +118,7 @@ impl ServerHost for TaskHost<'_> {
     }
 
     fn now(&mut self) -> SafeInt {
+        self.went_on();
         self.clock.now_ms()
     }
 
@@ -120,6 +131,7 @@ impl ServerHost for TaskHost<'_> {
         _function: &'b str,
         _args: &'b [Value],
     ) -> BoxFuture<'b, Result<Value, ExternError>> {
+        self.went_on();
         Box::pin(async {
             Err(ExternError {
                 kind: ExternErrorKind::Crashed,
@@ -132,17 +144,14 @@ impl ServerHost for TaskHost<'_> {
     /// itself, with its arguments, is not kept and not logged.
     ///
     /// A failure is returned to the VM, which then does not run the body, and is also kept
-    /// in the host, so that the task reports the call as `Unavailable` (D134) and not as a
-    /// runtime error of the program.
+    /// in the host until the next host event, so that a task that stops right after it
+    /// reports the call as `Unavailable` (D134) and not as a runtime error of the program.
+    /// A written entry clears an earlier failure.
     fn audit<'b>(&'b mut self, entry: &'b AuditEntry) -> BoxFuture<'b, Result<(), AuditError>> {
         let record = AuditRecord::from_entry(entry);
         Box::pin(async move {
             let result = self.audit.append(record).await;
-            if let Err(error) = &result
-                && self.audit_failure.is_none()
-            {
-                self.audit_failure = Some(error.clone());
-            }
+            self.audit_failure = result.as_ref().err().cloned();
             result
         })
     }
@@ -262,26 +271,54 @@ pub(crate) mod tests {
         }
     }
 
+    fn entry() -> AuditEntry {
+        AuditEntry {
+            function: "f".to_owned(),
+            principal: None,
+            arguments: Vec::new(),
+            time: SafeInt::new(0).unwrap_or_else(|_| unreachable!("zero is an Int")),
+        }
+    }
+
     #[test]
-    fn first_audit_failure_stays_after_later_entries() {
+    fn written_audit_entry_clears_an_earlier_failure() {
         let mut clock = StepClock::default();
         let mut log = FlakyLog::default();
-        let (output, failure) = {
+        let failure = {
             let mut host = TaskHost::new(None, &mut clock, &mut log);
-            assert_eq!(host.audit_failure(), None);
-            let entry = AuditEntry {
-                function: "f".to_owned(),
-                principal: None,
-                arguments: Vec::new(),
-                time: host.now(),
-            };
-            assert!(ready(host.audit(&entry)).is_err());
-            assert_eq!(ready(host.audit(&entry)), Ok(()));
-            host.finish()
+            assert!(ready(host.audit(&entry())).is_err());
+            assert_eq!(
+                host.audit_failure(),
+                Some(&AuditError("disk full".to_owned()))
+            );
+            assert_eq!(ready(host.audit(&entry())), Ok(()));
+            host.finish().1
         };
-        assert!(output.is_empty());
-        assert_eq!(failure, Some(AuditError("disk full".to_owned())));
+        assert_eq!(failure, None);
         assert_eq!(log.stored, 1);
+    }
+
+    /// D134: after the program went on past a failed call, a later error is not `Unavailable`.
+    #[test]
+    fn every_later_host_event_clears_an_audit_failure() {
+        let events: [fn(&mut TaskHost<'_>); 3] = [
+            |h| h.print("went on"),
+            |h| {
+                h.now();
+            },
+            |h| {
+                let _ = ready(h.extern_call("mail", "send", &[]));
+            },
+        ];
+        for event in events {
+            let mut clock = StepClock::default();
+            let mut log = ClosedLog;
+            let mut host = TaskHost::new(None, &mut clock, &mut log);
+            assert!(ready(host.audit(&entry())).is_err());
+            event(&mut host);
+            assert_eq!(host.audit_failure(), None);
+            assert_eq!(host.finish().1, None);
+        }
     }
 
     #[test]
