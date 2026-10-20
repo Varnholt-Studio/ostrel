@@ -34,6 +34,13 @@ none	http://a.123
 none	http://a.0x1
 ok	http://xn--bcher-kva.de	http://xn--bcher-kva.de
 ok	http://1.2.3.4	http://1.2.3.4
+ok	http://1.2.3.4.	http://1.2.3.4.
+none	http://1.2.3.4..
+none	http://1.2.3.
+none	http://1.2.3.4.5.
+none	http://01.2.3.4.
+none	http://1.2.3.256.
+ok	http://a.b:00080	http://a.b:00080
 ok	http://a.b.:8080/x	http://a.b.:8080/x
 none	http://b\u{FC}cher.de
 ok	http://a.b	http://a.b
