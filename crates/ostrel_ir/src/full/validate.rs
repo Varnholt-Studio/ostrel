@@ -8,10 +8,11 @@
 
 use ostrel_core::Span;
 
-use super::query::See;
+use super::query::{Filter, Path, QueryPlan, See};
 use super::view::{ForSource, Thunk, ViewNode, ViewNodeKind};
 use super::{
-    Auth, FieldMode, FieldRef, FnKind, FuncId, Function, InstKind, Placement, Program, RuleOp, Ty,
+    Auth, FieldMode, FieldRef, FnKind, FuncId, Function, ImplicitField, InstKind, Placement,
+    Program, RuleOp, Ty,
 };
 
 /// One broken rule of the contract.
@@ -51,6 +52,12 @@ pub enum Problem {
     /// An elevated function that is not on the server, or an elevated source
     /// function without `call` rule (D34).
     BadElevation,
+    /// A `Call` from code that is not elevated to an elevated function
+    /// without prologue (a function derived from `as system` code). Its body
+    /// would run with [`Auth::System`] without the `call` rule and the audit
+    /// entry of an elevated entry; elevation is entered only through the
+    /// prologue of an elevated source function (D98, D140 A3).
+    ElevatedWithoutEntry,
     /// A prologue that resolves a local that is not a model reference
     /// parameter, or whose `call` rule is not a `call` rule.
     BadPrologue,
@@ -60,9 +67,13 @@ pub enum Problem {
     /// A `make` that does not name every declared field except `serial`
     /// fields exactly once, in field order (D116).
     IncompleteMake,
-    /// `pending` or `rejected` read by code that runs on the server
-    /// (ARCHITECTURE 5.1).
+    /// `pending` or `rejected` read by code that runs on the server, also in
+    /// a filter of a server query or in a `see` rule (ARCHITECTURE 5.1).
     ClientFieldOnServer,
+    /// A filter [`Path`] that reads the implicit `id` (that is
+    /// [`Filter::RowId`]), or a hop through a field that is neither declared
+    /// nor the implicit `author`.
+    BadPath,
     /// A rule whose predicate is not a [`FnKind::Predicate`] function.
     RuleWithoutPredicate,
     /// A view thunk, handler, field default or `var` initialiser that does
@@ -132,6 +143,13 @@ impl Validator<'_> {
     fn models_and_vars(&mut self) {
         let program = self.program;
         for model in &program.models {
+            if let Some(see) = &model.see {
+                let mut problems = Vec::new();
+                filter_problems(see, true, &mut problems);
+                for problem in problems {
+                    self.report(None, model.span, problem);
+                }
+            }
             for rule in &model.rules {
                 if program.rule(*rule).is_none() {
                     self.report(None, model.span, Problem::UnknownId);
@@ -189,6 +207,11 @@ impl Validator<'_> {
                         ForSource::Live { plan, .. } => {
                             if plan.see != See::Replica {
                                 self.report(None, node.span, Problem::ClientOnly);
+                            }
+                            let mut problems = Vec::new();
+                            plan_problems(plan, false, &mut problems);
+                            for problem in problems {
+                                self.report(None, node.span, problem);
                             }
                         }
                         ForSource::Value(thunk) => self.thunk(thunk, node.span),
@@ -279,6 +302,15 @@ impl Validator<'_> {
                     if !ok {
                         out.push(Problem::CrossPlacementCall);
                     }
+                    // An elevated function off the server is already
+                    // `BadElevation`; it is not reported twice.
+                    if callee.elevated
+                        && callee.placement == Placement::Server
+                        && callee.prologue.is_none()
+                        && !f.elevated
+                    {
+                        out.push(Problem::ElevatedWithoutEntry);
+                    }
                 }
             },
             InstKind::RemoteCall { func, .. } => {
@@ -362,6 +394,7 @@ impl Validator<'_> {
                     out.push(Problem::NotPure);
                 }
                 see(&plan.see, &mut out);
+                plan_problems(plan, !client, &mut out);
             }
             InstKind::BulkDrop { plan, auth: a } | InstKind::BulkEdit { plan, auth: a, .. } => {
                 if !server {
@@ -369,6 +402,7 @@ impl Validator<'_> {
                 }
                 auth(*a, true, &mut out);
                 see(&plan.see, &mut out);
+                plan_problems(plan, true, &mut out);
                 let see_fits = match a {
                     Auth::System => plan.see == See::System,
                     Auth::Caller => matches!(plan.see, See::Rule(_) | See::DenyAll),
@@ -391,5 +425,75 @@ impl Validator<'_> {
             _ => {}
         }
         out
+    }
+}
+
+/// The path problems of a query plan: its `where` filter, its `see` filter
+/// and its sort field. `server` is true when the plan runs on the server.
+fn plan_problems(plan: &QueryPlan, server: bool, out: &mut Vec<Problem>) {
+    if let Some(filter) = &plan.filter {
+        filter_problems(filter, server, out);
+    }
+    if let See::Rule(filter) = &plan.see {
+        filter_problems(filter, server, out);
+    }
+    if let Some((FieldRef::Implicit(field), _)) = plan.sort
+        && server
+        && field.is_client_only()
+    {
+        out.push(Problem::ClientFieldOnServer);
+    }
+}
+
+/// The path problems of one filter, each at most once per node.
+fn filter_problems(filter: &Filter, server: bool, out: &mut Vec<Problem>) {
+    match filter {
+        Filter::Value(_) => {}
+        Filter::Field(path) => path_problems(path, server, out),
+        Filter::RowId(hops) => {
+            for hop in hops {
+                hop_problems(hop.field, out);
+            }
+        }
+        Filter::Cmp(_, a, b) => {
+            filter_problems(a, server, out);
+            filter_problems(b, server, out);
+        }
+        Filter::And(items) | Filter::Or(items) => {
+            for item in items {
+                filter_problems(item, server, out);
+            }
+        }
+        Filter::Not(inner) | Filter::Coalesce(inner, _) => filter_problems(inner, server, out),
+        Filter::InSet { elem, set } => {
+            filter_problems(elem, server, out);
+            path_problems(set, server, out);
+        }
+        Filter::InMap { key, map } | Filter::MapGet { map, key } => {
+            filter_problems(key, server, out);
+            path_problems(map, server, out);
+        }
+    }
+}
+
+fn path_problems(path: &Path, server: bool, out: &mut Vec<Problem>) {
+    for hop in &path.hops {
+        hop_problems(hop.field, out);
+    }
+    match path.field {
+        FieldRef::Implicit(ImplicitField::Id) => out.push(Problem::BadPath),
+        FieldRef::Implicit(field) if server && field.is_client_only() => {
+            out.push(Problem::ClientFieldOnServer);
+        }
+        _ => {}
+    }
+}
+
+fn hop_problems(field: FieldRef, out: &mut Vec<Problem>) {
+    if !matches!(
+        field,
+        FieldRef::Declared(_) | FieldRef::Implicit(ImplicitField::Author)
+    ) {
+        out.push(Problem::BadPath);
     }
 }

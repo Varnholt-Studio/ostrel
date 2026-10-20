@@ -4,7 +4,7 @@
 use ostrel_core::{FileId, Span};
 use ostrel_sema::hir;
 
-use super::query::{CmpOp, Filter, Operand, Path, QueryPlan, See};
+use super::query::{CmpOp, Filter, Hop, Operand, Path, QueryPlan, See};
 use super::*;
 
 fn span(at: u32) -> Span {
@@ -59,7 +59,7 @@ fn members_filter() -> Filter {
         elem: Box::new(Filter::Value(Operand::Me)),
         set: Path {
             hops: Vec::new(),
-            field: MEMBERS,
+            field: FieldRef::Declared(MEMBERS),
         },
     }
 }
@@ -71,7 +71,7 @@ fn plan(see: See) -> QueryPlan {
             CmpOp::Eq,
             Box::new(Filter::Field(Path {
                 hops: Vec::new(),
-                field: NAME,
+                field: FieldRef::Declared(NAME),
             })),
             Box::new(Filter::Value(Operand::Local(Local(0)))),
         )),
@@ -593,6 +593,163 @@ fn pending_and_rejected_are_never_read_on_the_server() {
         ));
     });
     assert_eq!(on_client, Vec::new());
+}
+
+/// `field == me` on the queried row.
+fn is_me(field: FieldRef, hops: Vec<Hop>) -> Filter {
+    Filter::Cmp(
+        CmpOp::Eq,
+        Box::new(Filter::Field(Path { hops, field })),
+        Box::new(Filter::Value(Operand::Me)),
+    )
+}
+
+const AUTHOR: FieldRef = FieldRef::Implicit(ImplicitField::Author);
+
+#[test]
+fn filters_reach_the_implicit_fields() {
+    // `see if author == me`, the rule of
+    // examples/v0_2/rules_fail_closed/e_limit_after_see.ostl.
+    let see_author = problems_after(|p| p.models[0].see = Some(is_me(AUTHOR, Vec::new())));
+    assert_eq!(see_author, Vec::new());
+    // `made` and `changed` in the `where` filter of a server query, and a hop
+    // through `author`.
+    let server_query = problems_after(|p| {
+        let mut plan = plan(See::Rule(is_me(AUTHOR, Vec::new())));
+        plan.filter = Some(Filter::And(vec![
+            Filter::Cmp(
+                CmpOp::Lt,
+                Box::new(Filter::Field(Path {
+                    hops: Vec::new(),
+                    field: FieldRef::Implicit(ImplicitField::Made),
+                })),
+                Box::new(Filter::Field(Path {
+                    hops: Vec::new(),
+                    field: FieldRef::Implicit(ImplicitField::Changed),
+                })),
+            ),
+            is_me(
+                FieldRef::Declared(NAME),
+                vec![Hop {
+                    field: AUTHOR,
+                    model: ROOM,
+                }],
+            ),
+        ]));
+        p.functions[SEND.index()].blocks[0].insts.push(inst(
+            14,
+            InstKind::Query {
+                dst: Local(1),
+                plan,
+            },
+        ));
+    });
+    assert_eq!(server_query, Vec::new());
+}
+
+#[test]
+fn filter_paths_keep_the_field_mapping() {
+    // The row id is `RowId`, never a path field.
+    let id_path = problems_after(|p| {
+        p.models[0].see = Some(is_me(FieldRef::Implicit(ImplicitField::Id), Vec::new()));
+    });
+    assert_eq!(id_path, vec![Problem::BadPath]);
+    // Only a declared field or `author` is a reference to hop through.
+    let made_hop = problems_after(|p| {
+        p.models[0].see = Some(Filter::RowId(vec![Hop {
+            field: FieldRef::Implicit(ImplicitField::Made),
+            model: ROOM,
+        }]));
+    });
+    assert_eq!(made_hop, vec![Problem::BadPath]);
+    // `pending` exists only in the replica: not in a `see` rule, not in a
+    // server query, but in a client query.
+    let pending = || is_me(FieldRef::Implicit(ImplicitField::Pending), Vec::new());
+    let in_see = problems_after(|p| p.models[0].see = Some(pending()));
+    assert_eq!(in_see, vec![Problem::ClientFieldOnServer]);
+    let in_server_query = problems_after(|p| {
+        if let InstKind::BulkDrop { plan, .. } = first_inst(p, CLOSE_ALL) {
+            plan.filter = Some(pending());
+        }
+    });
+    assert_eq!(in_server_query, vec![Problem::ClientFieldOnServer]);
+    let in_client_query = problems_after(|p| {
+        let mut plan = plan(See::Replica);
+        plan.filter = Some(pending());
+        p.functions[ON_CLICK.index()].blocks[0].insts.push(inst(
+            35,
+            InstKind::Query {
+                dst: Local(1),
+                plan,
+            },
+        ));
+    });
+    assert_eq!(in_client_query, Vec::new());
+}
+
+/// Adds `closeAll.rows`, a function the lowering derives from the elevated
+/// body of `closeAll`, and returns its id.
+fn add_elevated_derived(p: &mut Program) -> FuncId {
+    let mut rows = function(
+        "closeAll.rows",
+        Placement::Server,
+        FnKind::Derived,
+        vec![Ty::Text],
+    );
+    rows.params = 1;
+    rows.elevated = true;
+    rows.blocks = vec![block(
+        vec![inst(
+            80,
+            InstKind::BulkDrop {
+                plan: plan(See::System),
+                auth: Auth::System,
+            },
+        )],
+        Terminator::Return(None),
+    )];
+    p.functions.push(rows);
+    FuncId(p.functions.len() as u32 - 1)
+}
+
+fn call(at: u32, func: FuncId) -> Inst {
+    inst(
+        at,
+        InstKind::Call {
+            dst: None,
+            func,
+            args: vec![Local(1)],
+        },
+    )
+}
+
+#[test]
+fn elevation_is_entered_only_through_a_prologue() {
+    // A server fn that is not elevated calls a derived elevated function: its
+    // body would run as system without call rule and audit (D140 A3).
+    let from_plain = problems_after(|p| {
+        let rows = add_elevated_derived(p);
+        p.functions[SEND.index()].blocks[0]
+            .insts
+            .push(call(15, rows));
+    });
+    assert_eq!(from_plain, vec![Problem::ElevatedWithoutEntry]);
+    // From inside the elevated body it is part of that body.
+    let from_elevated = problems_after(|p| {
+        let rows = add_elevated_derived(p);
+        p.functions[CLOSE_ALL.index()].blocks[0]
+            .insts
+            .push(call(41, rows));
+    });
+    assert_eq!(from_elevated, Vec::new());
+    // An elevated source function has its prologue, which runs the call rule
+    // and the audit on every entry (D98).
+    let to_source = problems_after(|p| {
+        p.functions[SEND.index()].blocks[0]
+            .insts
+            .push(call(16, CLOSE_ALL));
+    });
+    assert_eq!(to_source, Vec::new());
 }
 
 #[test]

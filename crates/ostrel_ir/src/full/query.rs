@@ -7,8 +7,19 @@
 //! runtime replaces by values before the query reaches a driver; and models
 //! and fields are IR ids. The server backend maps a plan to `ostrel_db` and to
 //! the wire form of `Subscribe` (ARCHITECTURE 5.4) without further analysis.
+//!
+//! Fields are [`FieldRef`]s, so a filter reaches the implicit fields as well
+//! as the declared ones (`see if author == me`). The mapping to the database
+//! interface is fixed: a declared field and the implicit `made`, `changed` and
+//! `author` become the schema `FieldId` the compiled schema gives them
+//! (`ostrel_db::api::FieldId`, D135); the row id has no field id and is only
+//! addressed by [`Filter::RowId`], never by a [`Path`]. `pending` and
+//! `rejected` exist only in the client replica. [`Program::validate`]
+//! reports a path that breaks these rules.
+//!
+//! [`Program::validate`]: super::Program::validate
 
-use super::{FieldId, Local, ModelId};
+use super::{FieldRef, Local, ModelId};
 
 /// Largest number of [`Filter`] nodes in one filter, the same bound as the
 /// database interface (ARCHITECTURE 5.9, "Filter size").
@@ -33,8 +44,9 @@ pub enum Operand {
 /// One reference hop: the reference field of the current row and its model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Hop {
-    /// The reference field.
-    pub field: FieldId,
+    /// The reference field: a declared `Ref` field or the implicit `author`,
+    /// the only implicit field that is a reference.
+    pub field: FieldRef,
     /// The model the field points to.
     pub model: ModelId,
 }
@@ -45,8 +57,9 @@ pub struct Hop {
 pub struct Path {
     /// The hops from the queried row.
     pub hops: Vec<Hop>,
-    /// The field read at the end of the hops.
-    pub field: FieldId,
+    /// The field read at the end of the hops; never the implicit `id`, which
+    /// is [`Filter::RowId`].
+    pub field: FieldRef,
 }
 
 /// Comparison operators of a filter.
