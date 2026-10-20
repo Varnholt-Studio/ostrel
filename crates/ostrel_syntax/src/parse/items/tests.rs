@@ -105,6 +105,8 @@ fn goldens_match_their_trees() {
         "fn_call_rule_is_placed" => golden_source!("fn_call_rule_is_placed"),
         "fn_optional_param_is_placed" => golden_source!("fn_optional_param_is_placed"),
         "fn_type_args_result_is_placed" => golden_source!("fn_type_args_result_is_placed"),
+        "fn_optional_result_is_placed" => golden_source!("fn_optional_result_is_placed"),
+        "fn_type_args_param_is_placed" => golden_source!("fn_type_args_param_is_placed"),
         "tracker_excerpt" => golden_source!("tracker_excerpt"),
         "examples_notes" => include_str!("../../../../../examples/v0_2/notes/notes.ostl"),
         "examples_chat" => include_str!("../../../../../examples/chat/chat.ostl"),
@@ -145,6 +147,14 @@ fn each_criterion_alone_makes_a_placed_function() -> R {
         ),
         (
             golden_source!("fn_type_args_result_is_placed"),
+            Some(Placement::Inferred),
+        ),
+        (
+            golden_source!("fn_optional_result_is_placed"),
+            Some(Placement::Inferred),
+        ),
+        (
+            golden_source!("fn_type_args_param_is_placed"),
             Some(Placement::Inferred),
         ),
     ];
@@ -503,6 +513,38 @@ fn call_rule_only_on_the_first_body_line() {
     );
 }
 
+/// A body that holds only the `call` rule has an empty block; the range of
+/// the function still ends at the end of the rule, also with blank and
+/// comment lines before it.
+#[test]
+fn a_call_rule_alone_ends_the_function_range() -> R {
+    for src in [
+        "fn f()\n  call if signed\n",
+        "fn f()\n  // why\n  call if signed\n",
+        "fn f()\n\n  call if signed\n",
+        "fn f()\n  call if signed\nfn g()\n  print(1)\n",
+    ] {
+        let (m, _, diags) = run(src, ParseLimits::DEFAULT);
+        assert!(diags.is_empty(), "{src}: {diags:?}");
+        let Some(Item::PlacedFn(decl)) = m.items().first() else {
+            return Err(format!("{src}: no placed function"));
+        };
+        let rule = decl.call_rule.as_ref().must()?;
+        assert_eq!(text(src, rule.range), "call if signed", "{src}");
+        let end = at(src, "signed", 0) + 6;
+        assert_eq!(decl.range.end(), end, "{src}");
+        assert_eq!(decl.range.start(), 0, "{src}");
+    }
+    // With statements after the rule the block still decides the end.
+    let src = "fn f()\n  call if signed\n  print(1)\n";
+    let (m, _, _) = run(src, ParseLimits::DEFAULT);
+    let Some(Item::PlacedFn(decl)) = m.items().first() else {
+        return Err("no placed function".into());
+    };
+    assert_eq!(text(src, decl.range), src.trim_end());
+    Ok(())
+}
+
 #[test]
 fn faults_in_function_heads() {
     let src = "fn f() as\n  call if signed\n  print(1)\n";
@@ -579,6 +621,18 @@ fn query_heads_and_clauses() {
         );
     }
     let src = "fn f()\n  drop r.items where x\n";
+    assert_eq!(
+        diags(src),
+        [(
+            28,
+            at(src, "where", 0),
+            "expected the end of the line (query clauses follow only a bare type name), \
+             found `where`"
+                .into()
+        )]
+    );
+    // D133 (2): a clause after any expression other than a bare name.
+    let src = "fn f()\n  for x in r.members where x\n    print(x)\n";
     assert_eq!(
         diags(src),
         [(

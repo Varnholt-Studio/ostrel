@@ -167,10 +167,15 @@ impl<'a> Parser<'a> {
         call_rule: Option<CallRule>,
         body: BlockId,
     ) -> Result<(), Stop> {
-        let end = self
+        // A body may consist of the `call` rule alone; its block range is
+        // then empty, so the rule must count towards the end as well.
+        let block_end = self
             .module
             .block(body)
             .map_or(self.prev_end(), |b| b.range.end());
+        let end = call_rule
+            .as_ref()
+            .map_or(block_end, |rule| block_end.max(rule.range.end()));
         let range = text_range(head.start, end);
         let plain = head.placement == Placement::Inferred
             && head.elevated.is_none()
