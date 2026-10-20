@@ -1,0 +1,21 @@
+{
+  "app": "examples/v0_2/chat/membership.ostl",
+  "users": [
+    "alice",
+    "bob",
+    "carol"
+  ],
+  "given": [
+    {
+      "as": "alice",
+      "make": "Room",
+      "alias": "general",
+      "fields": {
+        "name": "general",
+        "members": [
+          "$user:alice"
+        ]
+      }
+    }
+  ]
+}

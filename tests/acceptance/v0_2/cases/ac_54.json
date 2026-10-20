@@ -1,0 +1,126 @@
+{
+  "ac": "AC-54",
+  "fixture": "teams",
+  "cases": [
+    {
+      "name": "ac_54_elevated_call_by_admin",
+      "covers": "control",
+      "kind": "call",
+      "verdict": "allow",
+      "as": "carol",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "archiveTeam",
+            "args": [
+              "$row:gamma"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "ok": null
+              }
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "g1 is deleted; one audit entry for archiveTeam by carol"
+      }
+    },
+    {
+      "name": "ac_54_elevated_call_rule_false",
+      "covers": "crafted_call",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D140: the audit entry follows the call rule, so a denied call writes none; the audit log is part of the diff",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "archiveTeam",
+            "args": [
+              "$row:alpha"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "Denied"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_54_elevated_call_by_admin"
+    },
+    {
+      "name": "ac_54_elevated_call_on_unreadable_row",
+      "covers": "crafted_call",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "D99, D140: arguments are resolved through the caller's see before the call rule, also for as system",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "archiveTeam",
+            "args": [
+              "$row:alpha"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "NotFound"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_54_elevated_call_by_admin"
+    },
+    {
+      "name": "ac_54_elevated_call_without_identity",
+      "covers": "crafted_call",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "anonymous",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "archiveTeam",
+            "args": [
+              "$row:alpha"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "NotFound"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_54_elevated_call_by_admin",
+      "assumption": "Without a principal no Team row is readable (see if me in roles), so the argument resolves to NotFound. Same open point as ac_11_wrong_principal_no_identity."
+    }
+  ]
+}

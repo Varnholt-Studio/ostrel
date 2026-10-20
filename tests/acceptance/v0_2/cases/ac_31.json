@@ -1,0 +1,598 @@
+{
+  "ac": "AC-31",
+  "fixture": "teams",
+  "cases": [
+    {
+      "name": "ac_31_make_with_fresh_id",
+      "covers": "control",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob",
+      "given": [
+        {
+          "as": "bob",
+          "make": "Team",
+          "alias": "beta",
+          "fields": {
+            "name": "Beta",
+            "roles": [
+              [
+                "$user:bob",
+                "admin"
+              ]
+            ]
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b1",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta one",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b2",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta two",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "drop": "b2"
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:b3",
+                "body": {
+                  "make": {
+                    "team": "$row:beta",
+                    "title": "Again",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "one new Task b3"
+      }
+    },
+    {
+      "name": "ac_31_make_on_existing_id_same_model",
+      "covers": "existing_id",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "given": [
+        {
+          "as": "bob",
+          "make": "Team",
+          "alias": "beta",
+          "fields": {
+            "name": "Beta",
+            "roles": [
+              [
+                "$user:bob",
+                "admin"
+              ]
+            ]
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b1",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta one",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b2",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta two",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "drop": "b2"
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:b1",
+                "body": {
+                  "make": {
+                    "team": "$row:beta",
+                    "title": "Again",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Conflict",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_31_make_with_fresh_id"
+    },
+    {
+      "name": "ac_31_make_on_existing_id_other_model",
+      "covers": "existing_id",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "given": [
+        {
+          "as": "bob",
+          "make": "Team",
+          "alias": "beta",
+          "fields": {
+            "name": "Beta",
+            "roles": [
+              [
+                "$user:bob",
+                "admin"
+              ]
+            ]
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b1",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta one",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b2",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta two",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "drop": "b2"
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:beta",
+                "body": {
+                  "make": {
+                    "team": "$row:beta",
+                    "title": "Again",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Conflict",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_31_make_with_fresh_id"
+    },
+    {
+      "name": "ac_31_make_on_tombstoned_id",
+      "covers": "tombstoned_id",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "b2 stays deleted and is not resurrected",
+      "given": [
+        {
+          "as": "bob",
+          "make": "Team",
+          "alias": "beta",
+          "fields": {
+            "name": "Beta",
+            "roles": [
+              [
+                "$user:bob",
+                "admin"
+              ]
+            ]
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b1",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta one",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b2",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta two",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "drop": "b2"
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:b2",
+                "body": {
+                  "make": {
+                    "team": "$row:beta",
+                    "title": "Again",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Conflict",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_31_make_with_fresh_id"
+    },
+    {
+      "name": "ac_31_make_on_tombstoned_id_other_model",
+      "covers": "tombstoned_id",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "given": [
+        {
+          "as": "bob",
+          "make": "Team",
+          "alias": "beta",
+          "fields": {
+            "name": "Beta",
+            "roles": [
+              [
+                "$user:bob",
+                "admin"
+              ]
+            ]
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b1",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta one",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b2",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta two",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "drop": "b2"
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Team",
+                "row": "$row:b2",
+                "body": {
+                  "make": {
+                    "name": "Zombie",
+                    "roles": [
+                      [
+                        "$user:bob",
+                        "admin"
+                      ]
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Conflict",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_31_make_with_fresh_id"
+    },
+    {
+      "name": "ac_31_make_on_foreign_existing_id",
+      "covers": "existing_id",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ARCHITECTURE 5.5: step 1 (row replica) runs before step 4 (Conflict); t1 is unchanged either way",
+      "given": [
+        {
+          "as": "bob",
+          "make": "Team",
+          "alias": "beta",
+          "fields": {
+            "name": "Beta",
+            "roles": [
+              [
+                "$user:bob",
+                "admin"
+              ]
+            ]
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b1",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta one",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b2",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta two",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "drop": "b2"
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t1",
+                "body": {
+                  "make": {
+                    "team": "$row:alpha",
+                    "title": "Upsert",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Forged",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_31_make_with_fresh_id"
+    },
+    {
+      "name": "ac_31_make_same_id_twice_in_one_batch",
+      "covers": "existing_id",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "given": [
+        {
+          "as": "bob",
+          "make": "Team",
+          "alias": "beta",
+          "fields": {
+            "name": "Beta",
+            "roles": [
+              [
+                "$user:bob",
+                "admin"
+              ]
+            ]
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b1",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta one",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "b2",
+          "fields": {
+            "team": "$row:beta",
+            "title": "Beta two",
+            "owner": "$user:bob",
+            "locked": false
+          }
+        },
+        {
+          "as": "bob",
+          "drop": "b2"
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:b4",
+                "body": {
+                  "make": {
+                    "team": "$row:beta",
+                    "title": "Again",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              },
+              {
+                "id": "$op+1",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:b4",
+                "body": {
+                  "make": {
+                    "team": "$row:beta",
+                    "title": "Twice",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            },
+            {
+              "reject": "Conflict",
+              "op": "$op+1"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "exactly one new Task b4 with title \"Again\""
+      },
+      "partial": true,
+      "control": "ac_31_make_with_fresh_id"
+    }
+  ]
+}

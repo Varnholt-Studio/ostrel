@@ -1,0 +1,312 @@
+{
+  "ac": "AC-32",
+  "fixture": "teams",
+  "cases": [
+    {
+      "name": "ac_32_admin_clears_own_team",
+      "covers": "control",
+      "kind": "call",
+      "verdict": "allow",
+      "as": "carol",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "clearTasks",
+            "args": [
+              "$row:gamma"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "ok": null
+              }
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "g1 is deleted"
+      }
+    },
+    {
+      "name": "ac_32_call_with_foreign_team",
+      "covers": "foreign_data",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "D99: an unreadable model argument is NotFound, same kind and text as a missing row",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "clearTasks",
+            "args": [
+              "$row:alpha"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "NotFound"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_32_admin_clears_own_team"
+    },
+    {
+      "name": "ac_32_call_with_missing_row",
+      "covers": "foreign_data",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "D99: the error text equals the one of ac_32_call_with_foreign_team",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "clearTasks",
+            "args": [
+              "$foreignrow:alice"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "NotFound"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_32_admin_clears_own_team"
+    },
+    {
+      "name": "ac_32_call_rule_denies_member",
+      "covers": "foreign_data",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "clearTasks",
+            "args": [
+              "$row:alpha"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "Denied"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_32_admin_clears_own_team"
+    },
+    {
+      "name": "ac_32_call_without_call_rule",
+      "covers": "no_call_rule",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "alice",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "purgeTasks",
+            "args": [
+              "$row:alpha"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "Denied"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_32_admin_clears_own_team",
+      "assumption": "SPEC AC-32 says default deny; the kind (Denied, not NotFound) is not stated. QUESTION to #spec."
+    },
+    {
+      "name": "ac_32_bulk_drop_with_one_denied_row",
+      "covers": "bulk_denied",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "alice",
+      "source": "ARCHITECTURE 5.7 D100: t3 is locked, so the drop rule denies it and t1, t2 stay",
+      "given": [
+        {
+          "as": "bob",
+          "make": "Task",
+          "alias": "t3",
+          "fields": {
+            "team": "$row:alpha",
+            "title": "Locked",
+            "owner": "$user:bob",
+            "locked": true
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "clearTasks",
+            "args": [
+              "$row:alpha"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "Denied"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_32_admin_clears_own_team"
+    },
+    {
+      "name": "ac_32_call_unknown_function",
+      "covers": "foreign_data",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "alice",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "dropEverything",
+            "args": []
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "NotFound"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_32_admin_clears_own_team"
+    },
+    {
+      "name": "ac_32_call_with_wrong_argument_type",
+      "covers": "foreign_data",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "alice",
+      "source": "ARCHITECTURE 5.4 D132",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "clearTasks",
+            "args": [
+              "alpha"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "Invalid"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_32_admin_clears_own_team"
+    },
+    {
+      "name": "ac_32_call_with_missing_argument",
+      "covers": "foreign_data",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "alice",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "clearTasks",
+            "args": []
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "Invalid"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_32_admin_clears_own_team"
+    },
+    {
+      "name": "ac_32_call_with_extra_argument",
+      "covers": "foreign_data",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "alice",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "clearTasks",
+            "args": [
+              "$row:alpha",
+              "$row:gamma"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "Invalid"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_32_admin_clears_own_team"
+    }
+  ]
+}

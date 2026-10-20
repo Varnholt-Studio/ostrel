@@ -1,0 +1,1101 @@
+{
+  "ac": "AC-55",
+  "fixture": "membership",
+  "cases": [
+    {
+      "name": "ac_55_join",
+      "covers": "join",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob",
+      "source": "EXPECTED.md M-01",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": "$user:bob"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "members is {alice, bob}"
+      }
+    },
+    {
+      "name": "ac_55_leave",
+      "covers": "leave",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob",
+      "source": "EXPECTED.md M-02",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:bob",
+                    "tags": [
+                      "$tag:general.members.bob"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "members is {alice}"
+      }
+    },
+    {
+      "name": "ac_55_add_other",
+      "covers": "add_other",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "alice",
+      "source": "EXPECTED.md M-03",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": "$user:carol"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_join"
+    },
+    {
+      "name": "ac_55_hijack_several_ops",
+      "covers": "hijack",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "EXPECTED.md M-04",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": "$user:carol"
+                  }
+                }
+              },
+              {
+                "id": "$op+1",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:alice",
+                    "tags": [
+                      "$tag:general.members.alice"
+                    ]
+                  }
+                }
+              },
+              {
+                "id": "$op+2",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:bob",
+                    "tags": [
+                      "$tag:general.members.bob"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            },
+            {
+              "reject": "Denied",
+              "op": "$op+1"
+            },
+            {
+              "reject": "Denied",
+              "op": "$op+2"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "members is {alice, bob, carol}; no removal is stored"
+      },
+      "partial": true,
+      "control": "ac_55_leave"
+    },
+    {
+      "name": "ac_55_hijack_one_op_both_directions",
+      "covers": "hijack",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "EXPECTED.md M-05; ARCHITECTURE 5.4 D132: a body with two kinds is a form fault",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": "$user:carol"
+                  },
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:alice",
+                    "tags": [
+                      "$tag:general.members.alice"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_join",
+      "assumption": "AC-55 says Invalid for both directions in one op; under D132 a body object with two keys is a malformed op, a fatal Error Protocol. Either way nothing is applied, carol is not added. QUESTION to #spec."
+    },
+    {
+      "name": "ac_55_hijack_one_op_several_elements",
+      "covers": "hijack",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "EXPECTED.md M-05, S-01",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": [
+                      "$user:carol",
+                      "$user:alice"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_join"
+    },
+    {
+      "name": "ac_55_hijack_removals_only",
+      "covers": "hijack",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "EXPECTED.md M-06",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:alice",
+                    "tags": [
+                      "$tag:general.members.alice"
+                    ]
+                  }
+                }
+              },
+              {
+                "id": "$op+1",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:bob",
+                    "tags": [
+                      "$tag:general.members.bob"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            },
+            {
+              "reject": "Denied",
+              "op": "$op+1"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_leave"
+    },
+    {
+      "name": "ac_55_hijack_by_set_of_whole_field",
+      "covers": "hijack",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "wire OpFault::WrongBody: set on a Set field is not a set operation",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "set": {
+                    "field": "members",
+                    "value": [
+                      "$user:carol"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_join"
+    },
+    {
+      "name": "ac_55_remove_other_as_member",
+      "covers": "hijack",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "EXPECTED.md M-07",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:alice",
+                    "tags": [
+                      "$tag:general.members.alice"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_leave"
+    },
+    {
+      "name": "ac_55_leave_with_foreign_tag",
+      "covers": "hijack",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob",
+      "source": "EXPECTED.md M-08",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:bob",
+                    "tags": [
+                      "$tag:general.members.alice"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "members stays {alice, bob}; the tag of alice is bound to element alice and ignored (D96)"
+      }
+    },
+    {
+      "name": "ac_55_join_twice",
+      "covers": "join",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob",
+      "source": "EXPECTED.md M-09",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": "$user:bob"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "members is {alice, bob}; one live tag of bob from this replica"
+      }
+    },
+    {
+      "name": "ac_55_no_principal",
+      "covers": "add_other",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "anonymous",
+      "source": "EXPECTED.md M-10",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": "$user:carol"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_join",
+      "assumption": "Same open point as ac_11_wrong_principal_no_identity."
+    },
+    {
+      "name": "ac_55_leave_from_one_of_two_replicas",
+      "covers": "leave",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob@b1",
+      "source": "EXPECTED.md M-11",
+      "given": [
+        {
+          "as": "bob@b1",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        },
+        {
+          "as": "bob@b2",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:bob",
+                    "tags": [
+                      "$tag:general.members.bob@b1"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "members stays {alice, bob}: the add of bob@b2 is still live (add wins)"
+      }
+    },
+    {
+      "name": "ac_55_shape_add_two_elements",
+      "covers": "shape",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "EXPECTED.md S-01",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": [
+                      "$user:carol",
+                      "$user:bob"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_join"
+    },
+    {
+      "name": "ac_55_shape_remove_two_elements",
+      "covers": "shape",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "EXPECTED.md S-02",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": [
+                      "$user:bob",
+                      "$user:alice"
+                    ],
+                    "tags": [
+                      "$tag:general.members.bob",
+                      "$tag:general.members.alice"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_leave"
+    },
+    {
+      "name": "ac_55_shape_add_and_remove_self",
+      "covers": "shape",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "EXPECTED.md S-03",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": "$user:bob"
+                  },
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:bob",
+                    "tags": [
+                      "$tag:general.members.bob"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_leave",
+      "assumption": "As ac_55_hijack_one_op_both_directions."
+    },
+    {
+      "name": "ac_55_shape_null_element",
+      "covers": "shape",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "EXPECTED.md S-04",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members",
+                    "elem": null
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_join"
+    },
+    {
+      "name": "ac_55_shape_missing_element_key",
+      "covers": "shape",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "EXPECTED.md S-04; a missing key is a form fault (D132)",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "add": {
+                    "field": "members"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_join"
+    },
+    {
+      "name": "ac_55_shape_remove_without_tags",
+      "covers": "shape",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D135: empty tags make the op Invalid",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$row:general",
+                "body": {
+                  "remove": {
+                    "field": "members",
+                    "elem": "$user:bob",
+                    "tags": []
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_leave"
+    },
+    {
+      "name": "ac_55_shape_remove_too_many_tags",
+      "covers": "shape",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ARCHITECTURE 5.9: at most 64 tags",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "general",
+            "field": "members",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send_generated": {
+            "kind": "remove_with_tags",
+            "model": "Room",
+            "row": "$row:general",
+            "field": "members",
+            "elem": "$user:bob",
+            "tags": 65
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_leave"
+    },
+    {
+      "name": "ac_55_make_with_foreign_members",
+      "covers": "add_other",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "EXPECTED.md R-03",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "name": "x",
+                    "members": [
+                      "$user:alice",
+                      "$user:bob"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_55_make_with_self_only"
+    },
+    {
+      "name": "ac_55_make_with_self_only",
+      "covers": "control",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob",
+      "source": "EXPECTED.md R-02",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Room",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "name": "x",
+                    "members": [
+                      "$user:bob"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "one new Room x with members {bob}"
+      }
+    }
+  ]
+}

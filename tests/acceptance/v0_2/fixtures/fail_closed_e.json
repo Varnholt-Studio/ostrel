@@ -1,0 +1,109 @@
+{
+  "app": "examples/v0_2/rules_fail_closed/e_limit_after_see.ostl",
+  "users": [
+    "alice",
+    "bob"
+  ],
+  "given": [
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "p1",
+      "fields": {
+        "pos": 1,
+        "body": "p1",
+        "shared": false
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "p2",
+      "fields": {
+        "pos": 2,
+        "body": "p2",
+        "shared": false
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "s3",
+      "fields": {
+        "pos": 3,
+        "body": "s3",
+        "shared": true
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "p4",
+      "fields": {
+        "pos": 4,
+        "body": "p4",
+        "shared": false
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "s5",
+      "fields": {
+        "pos": 5,
+        "body": "s5",
+        "shared": true
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "s6",
+      "fields": {
+        "pos": 6,
+        "body": "s6",
+        "shared": true
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "p7",
+      "fields": {
+        "pos": 7,
+        "body": "p7",
+        "shared": false
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "s8",
+      "fields": {
+        "pos": 8,
+        "body": "s8",
+        "shared": true
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "p9",
+      "fields": {
+        "pos": 9,
+        "body": "p9",
+        "shared": false
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Note",
+      "alias": "p10",
+      "fields": {
+        "pos": 10,
+        "body": "p10",
+        "shared": false
+      }
+    }
+  ]
+}
