@@ -1,0 +1,39 @@
+enum Role = guest | member | admin
+enum Status = backlog | todo | doing | done | canceled
+data Team
+  (field name Text)
+  (field prefix Text fixed)
+  (field roles Map[User, Role] (= (map (me admin))))
+  (see (in me roles))
+  (make (== roles (map (me admin))))
+  (edit name (== (index roles me) admin))
+  (edit roles (and (== (index roles me) admin) (in admin (. (. new roles) values))))
+data Issue
+  (field team Team fixed)
+  (field number Int? (serial per team))
+  (field title Text)
+  (field body Text (merge text))
+  (field status Status (= backlog))
+  (field assignee User?)
+  (field rank Rank)
+  (check (in (. title len) (.. 1 200)))
+  (check (or (== assignee none) (in assignee (. team roles))))
+  (see (in me (. team roles)))
+  (make (>= (paren (?? (index (. team roles) me) guest)) member))
+  (edit (>= (paren (?? (index (. team roles) me) guest)) member))
+  (edit status (or (!= status done) (== (index (. team roles) me) admin)))
+  (drop (== (index (. team roles) me) admin))
+placed-fn [server] closeDone(t: Team, days: Int)
+  (call-rule (== (index (. t roles) me) admin))
+  (drop (query Issue (where (and (and (== team t) (== status done)) (< changed (- now (. days days)))))))
+view Board(t: Team)
+  <row ~board>
+    for s (query Status)
+      <col ~lane>
+        <text (. s label) (look: strong)>
+        for i (query Issue (where (and (== team t) (== status s))) (sort rank))
+          <col ~card>
+            if let n (. i number)
+              <text (str {(. t prefix)} "-" {n}) (look: muted)>
+            <text (. i title)>
+            <pick (bind: (. i assignee)) (options: (. (. t roles) keys))>
