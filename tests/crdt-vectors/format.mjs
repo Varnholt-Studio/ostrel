@@ -129,9 +129,9 @@ function checkSetCausality(ops, deliveries) {
     for (const tag of op.tags) {
       const added = indexById.get(tag);
       if (added === undefined) continue; // a tag the replica never saw is ignored
-      if (encode(ops[added].op.add) !== encode(op.remove)) {
-        throw new Error(`ops[${index}] names tag ${tag}, which does not add the removed element`);
-      }
+      // A tag that adds another element is ignored like an unknown one (D96), so its add may
+      // also come later or again.
+      if (!('add' in ops[added].op) || encode(ops[added].op.add) !== encode(op.remove)) continue;
       deliveries.forEach((order, number) => {
         if (order.lastIndexOf(added) > order.indexOf(index)) {
           const late = `ops[${added}] after its remove ops[${index}]`;
