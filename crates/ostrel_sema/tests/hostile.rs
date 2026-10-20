@@ -73,8 +73,9 @@ fn corpus() -> Vec<(String, Vec<u8>)> {
 enum Front {
     /// The lexer or parser reported an error: the checker does not run (SPEC 12.1).
     Rejected,
-    /// The checker runs on this tree.
-    Parsed(Module),
+    /// The checker runs on this tree. Boxed because the tree is large and
+    /// `Rejected` carries nothing (clippy::large_enum_variant).
+    Parsed(Box<Module>),
 }
 
 fn front(src: &str, file: FileId) -> Front {
@@ -84,7 +85,7 @@ fn front(src: &str, file: FileId) -> Front {
     if diags.iter().any(Diagnostic::is_error) {
         Front::Rejected
     } else {
-        Front::Parsed(module)
+        Front::Parsed(Box::new(module))
     }
 }
 
