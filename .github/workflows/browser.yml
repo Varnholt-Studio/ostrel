@@ -1,0 +1,48 @@
+name: Browser
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Same rule as ci.yml: only superseded pull request runs from team branches are cancelled.
+concurrency:
+  group: browser-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && !contains(fromJSON('["main","dev","gh-pages","packaging"]'), github.head_ref) }}
+
+jobs:
+  # Browser job (SPEC 2, D15): browser tests named ac_NN_<topic> in headless Chromium.
+  # The test contract is in .github/scripts/browser-tests.sh.
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (pinned in rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version && cargo --version
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-browser-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Build the compiler
+        run: cargo build --locked --release -p ostrel_cli
+      - name: Browser tests
+        run: OSTREL_BIN="$PWD/target/release/ostrel" bash .github/scripts/browser-tests.sh
