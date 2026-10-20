@@ -5,5 +5,6 @@
 //! re-check of ARCHITECTURE 5.3 to 5.6; the sync engine is not written yet. [`wire`] reads and
 //! writes those messages as JSON frames.
 
+pub mod filter_check;
 pub mod protocol;
 pub mod wire;
