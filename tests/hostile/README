@@ -40,6 +40,14 @@ runs): CPU user 2.34 to 2.60 s, sys at most 0.12 s, total at most 2.72 s, a marg
 at a load of about 1.5 and 12.68 to 13.73 s with four extra busy loops. If the CPU time of
 this case rises above 4 s (margin under 1.25), that is a FINDING to T2 and the chief.
 
+`run_interpolate_int.ostl` checks that the step limit also bounds programs made of
+interpolations, whose instructions allocate (ARCHITECTURE 3.4 v1.15, D112, D114). Measured
+on dev 74e0737 plus T152, release binary, 2 cores at a load of 7 to 14: `StepLimit`, exit 1,
+CPU 1.75 to 1.97 s in 5 runs, a margin of factor 2.5 to the 5 s limit. Without the
+allocation surcharge the same case took 6.0 to 6.1 s and failed the limit. In the same
+interleaved runs its CPU time was 1.02 to 1.45 times that of `step_limit_default` (median
+1.23, criterion at most 1.5). The same FINDING threshold of 4 s applies.
+
 How `run.sh` applies the limits (D93): every `check`, `run` and `fmt` call and the
 `--max-steps` second run below gets a soft CPU limit of the README value (`ulimit -t`; the
 process gets SIGXCPU) and a hard limit one second later (SIGKILL). Either signal is a
@@ -149,7 +157,8 @@ well under the hang guard stays green, and that the hang guard reports a hanging
   `\u{...}` edge values, unterminated strings and interpolations.
 * `ostrel run` (A2-16, G15, D44): unbounded and mutual recursion (`CallDepth`), integer
   overflow on add, subtract, multiply and by recursion (`IntOverflow`), division and
-  modulo by zero (`DivisionByZero`), a long loop by recursion (`StepLimit`), text growth
+  modulo by zero (`DivisionByZero`), a long loop by recursion (`StepLimit`), a long run
+  of interpolations (`StepLimit`, CPU margin, D114), text growth
   past the text limit (`TextLimit`), many live texts past the heap limit (`HeapLimit`,
   D44), and many output lines.
 * Seeded cases `seed_bytes_*`, `seed_soup_*` (v0.1 token soup) and `seed_mutant_*`
