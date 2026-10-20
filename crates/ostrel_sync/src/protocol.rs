@@ -1,4 +1,5 @@
-//! Sync protocol v0: messages, op bodies, reject reasons and limits (ARCHITECTURE 5.4, 5.5, 5.9).
+//! Sync protocol v0: messages, op bodies, reject reasons and limits (ARCHITECTURE 5.3 to 5.5,
+//! 5.9).
 //!
 //! Draft until the RED re-check of ARCHITECTURE 5.3 to 5.6; after that it is a frozen contract
 //! (ARCHITECTURE 13) and changes only by an architect decision.
@@ -7,7 +8,7 @@
 //!
 //! One WebSocket per browser carries JSON frames, one message per frame. Every frame is an
 //! object with the protocol version `"v"` ([`PROTOCOL_VERSION`]) and the message name `"t"`
-//! ([`ClientMsg::name`], [`ServerMsg::name`]); the other keys are the fields of the message in
+//! ([`ClientMsg::name`], [`ServerMsg::name`]); the version lives only there (D106). The other keys are the fields of the message in
 //! snake case. Ids, [`Hlc`] and [`ServerSeq`] travel as fixed width lowercase hex strings,
 //! values as in the type table (ARCHITECTURE 5.1, 5.3). A frame with an unknown version, an
 //! unknown name, a missing or extra key is a fatal [`ErrorCode::Protocol`].
@@ -16,7 +17,17 @@
 //!
 //! A [`Hello`] without a replica always gets a new random [`ReplicaId`] in [`Welcome`], also
 //! when the pair (user, device key) already owns replicas. A [`Hello`] with a replica is
-//! confirmed only when the token's user and device key match the record of that replica.
+//! confirmed only when the token's user and device key match the record of that replica. In an
+//! app without `auth` there is no token, so [`Welcome`] issues a `replica_secret` with every new
+//! replica, and a [`Hello`] that names a replica must repeat it, otherwise fatal
+//! [`ErrorCode::Unauthorized`] (D111).
+//!
+//! # Order and replay (D110)
+//!
+//! The `seq` of a replica's ops is contiguous. The server keeps `last_seq`, the highest `seq` with
+//! a final outcome ([`Ack`] or [`ServerMsg::Reject`], never [`ServerMsg::Defer`]). An op with
+//! `seq = last_seq + 1` is processed; `seq <= last_seq` is a replay and gets its original outcome
+//! again without effect; `seq > last_seq + 1` is `Forged` and leaves `last_seq` unchanged.
 
 pub use ostrel_core::ids::{Hlc, OpId, ReplicaId, RowId, ServerSeq};
 pub use ostrel_core::value::Value;
@@ -56,7 +67,9 @@ pub enum ClientMsg {
         rows: Vec<RowId>,
         last: bool,
     },
-    /// A batch of local ops, at most [`Limits::ops_per_batch`], in `seq` order of the replica.
+    /// A batch of local ops in `seq` order of the replica. A batch over [`Limits::ops_per_batch`]
+    /// gets one `Reject Limit` per op, in batch order (D106). The client packs batches so that
+    /// the frame stays within [`Limits::frame_bytes`] (D109).
     Ops(Vec<Op>),
     Call {
         call: CallId,
@@ -71,7 +84,8 @@ pub enum ServerMsg {
     Welcome(Welcome),
     /// One page of rows of a subscription, at most [`Limits::rows_per_snapshot`], at log
     /// position `seq`. `last` marks the final page. A snapshot page sets the client's
-    /// `applied_server_seq` to `seq` (D62).
+    /// `applied_server_seq` to `seq` (D62). A [`Row`] of the DB interface carries its version
+    /// and every field; the server sends only the fields the client may read (D101).
     Snapshot {
         sub: SubId,
         rows: Vec<Row>,
@@ -84,6 +98,13 @@ pub enum ServerMsg {
     Reject {
         op: OpId,
         reason: RejectReason,
+    },
+    /// A rate limit was reached (D108). `op` and every later op of the replica in the batch
+    /// were not decided and keep their `seq`; the client keeps them in the outbox, does not
+    /// roll back and resends from `op` after `retry_after_ms`.
+    Defer {
+        op: OpId,
+        retry_after_ms: u32,
     },
     /// One page of row ids, at most [`Limits::ids_per_page`], that left the reader's scope or
     /// were deleted.
@@ -106,11 +127,13 @@ pub enum ServerMsg {
 /// First message of every connection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hello {
-    pub version: u32,
     /// PASETO v4.public token; `None` only in apps without `auth`.
     pub token: Option<String>,
     /// The replica the client stored next to its device key; `None` asks for a new one (D103).
     pub replica: Option<ReplicaId>,
+    /// The secret [`Welcome`] issued with `replica`, 32 lowercase hex digits; only in apps
+    /// without `auth` and only together with `replica` (D111).
+    pub replica_secret: Option<String>,
     /// Highest log position the client applied; `None` on a fresh replica.
     pub last_server_seq: Option<ServerSeq>,
 }
@@ -120,6 +143,9 @@ pub struct Hello {
 pub struct Welcome {
     /// The confirmed or newly issued replica.
     pub replica: ReplicaId,
+    /// Random 128 bit secret, 32 lowercase hex digits, issued with a new replica in an app
+    /// without `auth`; the server keeps only its SHA-256 (D111). `None` otherwise.
+    pub replica_secret: Option<String>,
     /// Server time in ms since the epoch, for the client's clock offset.
     pub server_ms: u64,
     pub limits: Limits,
@@ -147,10 +173,11 @@ pub struct LoggedOp {
 /// `tests/crdt-vectors` (D49, G6, G12).
 #[derive(Clone, Debug, PartialEq)]
 pub enum OpBody {
-    /// Create the row with its initial column values. The row id carries the op's replica,
-    /// otherwise `Forged`; an id that exists or existed in any model is `Conflict`.
-    /// ASSUMPTION: one `make` op carries all initial column values, because the `make` rule
-    /// needs the whole row.
+    /// Create the row with all its initial column values, because the `make` rule sees the
+    /// whole row (D106). Every element of an initial `Set` value gets the op id of the `make`
+    /// as its add tag, as if added by its own op; initial `Map` entries carry the stamp of the
+    /// `make`. The row id carries the op's replica, otherwise `Forged`; an id that exists or
+    /// existed in any model is `Conflict`.
     Make { fields: Vec<(FieldId, Value)> },
     /// Delete the row.
     Drop,
@@ -175,14 +202,17 @@ pub enum OpBody {
     MapRemove { field: FieldId, key: Value },
 }
 
-/// Acknowledgement of one client [`ClientMsg::Ops`] batch.
+/// Acknowledgement of one client [`ClientMsg::Ops`] batch. A batch in which no op was accepted
+/// gets no `Ack`. A replayed op (`seq <= last_seq`, D110) that was accepted gets its `Ack`
+/// again with the logged [`ServerSeq`] and its accepted stamp in `restamped`, always.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ack {
     /// Highest accepted op of the batch.
     pub op: OpId,
     /// Log position assigned to that op.
     pub seq: ServerSeq,
-    /// New stamps of ops the server re-stamped (ARCHITECTURE 5.5 step 3).
+    /// New stamps of ops the server re-stamped (ARCHITECTURE 5.5 step 3), and the accepted
+    /// stamp of a replayed op (D110).
     pub restamped: Vec<(OpId, Hlc)>,
 }
 
@@ -249,9 +279,13 @@ pub enum ErrorCode {
     Protocol,
     /// Frame larger than [`Limits::frame_bytes`].
     FrameTooLarge,
-    /// Token missing, invalid or of a revoked device key (D102), or replica not owned by the
-    /// token's user and device key.
+    /// Token missing, invalid or of a revoked device key (D102), replica not owned by the
+    /// token's user and device key, or in an app without `auth` a missing or wrong
+    /// `replica_secret` (D111).
     Unauthorized,
+    /// The replica was unused for 30 days and expired; its outbox is rejected (ARCHITECTURE
+    /// 5.5, D111).
+    ReplicaExpired,
     /// More than [`Limits::subscriptions_per_session`] subscriptions.
     TooManySubscriptions,
     /// Filter larger than [`Limits::filter_nodes`].
@@ -283,6 +317,7 @@ impl ServerMsg {
             ServerMsg::Ops(_) => "ops",
             ServerMsg::Ack(_) => "ack",
             ServerMsg::Reject { .. } => "reject",
+            ServerMsg::Defer { .. } => "defer",
             ServerMsg::Evict { .. } => "evict",
             ServerMsg::Reset { .. } => "reset",
             ServerMsg::Return { .. } => "return",
@@ -299,16 +334,19 @@ pub struct Limits {
     pub frame_bytes: u32,
     /// HTTP request body; beyond it 413.
     pub http_body_bytes: u32,
-    /// Ops per batch; beyond it `Reject Limit` for the batch.
+    /// Ops per batch, at most [`Limits::ops_burst`]; beyond it one `Reject Limit` per op (D108).
     pub ops_per_batch: u32,
-    /// Ops per principal per second, sustained and burst; beyond it `Reject Limit`.
+    /// Ops per principal per second, sustained and burst; beyond it `Defer` (D108).
     pub ops_per_second: u32,
     pub ops_burst: u32,
-    /// Rows created per principal and model per hour; beyond it `Reject Limit`.
+    /// Rows created per principal and model per hour; beyond it `Defer` (D108).
     pub rows_per_hour: u32,
+    /// Canonical encoding of one op, envelope included (D109). The client does not apply a
+    /// larger write and sends no op; the server answers `Reject Invalid`.
+    pub op_bytes: u32,
     /// Value nesting depth; beyond it `Invalid`.
     pub nesting_depth: u32,
-    /// Size of one `Text` field in bytes; beyond it `Invalid`.
+    /// Size of one `Text` field in UTF-8 bytes of the value (D109); beyond it `Invalid`.
     pub text_bytes: u32,
     pub subscriptions_per_session: u32,
     /// Query IR nodes per filter, equal to `ostrel_db::api::MAX_FILTER_NODES`.
@@ -340,10 +378,11 @@ pub struct Limits {
 pub const LIMITS: Limits = Limits {
     frame_bytes: 1 << 20,
     http_body_bytes: 1 << 20,
-    ops_per_batch: 500,
+    ops_per_batch: 200,
     ops_per_second: 50,
     ops_burst: 200,
     rows_per_hour: 1_000,
+    op_bytes: 512 << 10,
     nesting_depth: 32,
     text_bytes: 256 << 10,
     subscriptions_per_session: 64,
@@ -371,12 +410,16 @@ mod tests {
         assert_eq!(LIMITS.frame_bytes, 1_048_576);
         assert_eq!(LIMITS.http_body_bytes, 1_048_576);
         assert_eq!(LIMITS.text_bytes, 262_144);
+        assert_eq!(LIMITS.op_bytes, 524_288);
+        assert_eq!(LIMITS.ops_per_batch, 200);
         assert_eq!(
             LIMITS.filter_nodes as usize,
             ostrel_db::api::MAX_FILTER_NODES
         );
         const {
             assert!(LIMITS.ops_burst >= LIMITS.ops_per_second);
+            assert!(LIMITS.ops_per_batch <= LIMITS.ops_burst);
+            assert!(LIMITS.op_bytes <= LIMITS.frame_bytes);
             assert!(LIMITS.calls_burst >= LIMITS.calls_per_second);
             assert!(LIMITS.held_per_subscription >= LIMITS.ids_per_page);
         }
@@ -400,9 +443,9 @@ mod tests {
         };
         let client = [
             ClientMsg::Hello(Hello {
-                version: PROTOCOL_VERSION,
                 token: None,
                 replica: None,
+                replica_secret: None,
                 last_server_seq: None,
             }),
             ClientMsg::Subscribe { sub: 1, query },
@@ -422,6 +465,7 @@ mod tests {
         let server = [
             ServerMsg::Welcome(Welcome {
                 replica: r,
+                replica_secret: None,
                 server_ms: 0,
                 limits: LIMITS,
             }),
@@ -440,6 +484,10 @@ mod tests {
             ServerMsg::Reject {
                 op: OpId { replica: r, seq: 1 },
                 reason: RejectReason::Denied,
+            },
+            ServerMsg::Defer {
+                op: OpId { replica: r, seq: 1 },
+                retry_after_ms: 1_000,
             },
             ServerMsg::Evict {
                 sub: 1,
