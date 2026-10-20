@@ -6,4 +6,5 @@
 //! writes those messages as JSON frames.
 
 pub mod protocol;
+pub mod replica_id;
 pub mod wire;
