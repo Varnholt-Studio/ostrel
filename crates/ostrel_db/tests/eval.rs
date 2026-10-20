@@ -237,3 +237,61 @@ fn a_collection_field_that_changes_kind_starts_over() {
     eval::apply_collection(&mut c, F, &CollectionChange::Set(vec![]));
     assert_eq!(c.get(&F), Some(&CollectionState::Set(vec![])));
 }
+
+#[test]
+fn an_inserted_row_has_version_one_and_its_changes_applied() {
+    let tag = OpId {
+        replica: ReplicaId(1),
+        seq: 1,
+    };
+    let add = |n| SetChange::Add { elem: int(n), tag };
+    let set = CollectionChange::Set(vec![add(2), add(1)]);
+    let r = LiveRow::inserted(M, &[(F, int(5))], &[(REF, set.clone())]);
+    let mut expected = BTreeMap::new();
+    eval::apply_collection(&mut expected, REF, &set);
+    assert_eq!(
+        r,
+        LiveRow {
+            model: M,
+            version: 1,
+            fields: BTreeMap::from([(F, int(5))]),
+            collections: expected,
+        }
+    );
+    // No fields and no collections: an empty row, still version 1.
+    let empty = LiveRow::inserted(OTHER, &[], &[]);
+    assert_eq!((empty.version, empty.fields.len()), (1, 0));
+    assert!(empty.collections.is_empty());
+}
+
+#[test]
+fn check_refuses_another_model_before_another_version() {
+    let r = row(M, vec![]);
+    assert!(r.check(M, 1).is_ok());
+    assert!(matches!(r.check(M, 0), Err(DbError::VersionMismatch)));
+    assert!(matches!(r.check(M, 2), Err(DbError::VersionMismatch)));
+    assert!(matches!(
+        r.check(M, u64::MAX),
+        Err(DbError::VersionMismatch)
+    ));
+    // Wrong model and wrong version together: the row is not found in that model.
+    assert!(matches!(r.check(OTHER, 1), Err(DbError::NotFound)));
+    assert!(matches!(r.check(OTHER, 7), Err(DbError::NotFound)));
+}
+
+#[test]
+fn update_raises_the_version_and_keeps_untouched_fields() {
+    let mut r = LiveRow::inserted(M, &[(F, int(1)), (REF, int(2))], &[]);
+    // An update without fields or collections still counts as a write.
+    r.update(&[], &[]);
+    assert_eq!(r.version, 2);
+    r.update(&[(F, Value::Null)], &[]);
+    assert_eq!(r.version, 3);
+    assert_eq!(r.fields.get(&F), Some(&Value::Null));
+    assert_eq!(r.fields.get(&REF), Some(&int(2)));
+    // The same field twice in one update: the last value wins, as in the insert.
+    r.update(&[(F, int(8)), (F, int(9))], &[]);
+    assert_eq!(r.fields.get(&F), Some(&int(9)));
+    let twice = LiveRow::inserted(M, &[(F, int(8)), (F, int(9))], &[]);
+    assert_eq!(twice.fields.get(&F), Some(&int(9)));
+}

@@ -5,8 +5,9 @@
 //! hops, and gets the result rows back. The rules are those of the contract (`api` query
 //! module): two valued logic, fail closed on a hop that does not reach a live row, enum columns
 //! by declaration order, `Bytes` byte by byte, everything else by [`compare_key`], keyset
-//! cursor and limit. [`check_enums`] and [`apply_collection`] are the matching write rules, so
-//! such a driver keeps only its state, the trait implementations and its op log.
+//! cursor and limit. [`check_enums`], [`apply_collection`] and the row transitions of
+//! [`LiveRow`] (D139) are the matching write rules, so such a driver keeps only its storage
+//! (including which ids are taken), the trait implementations and its op log.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -25,6 +26,57 @@ pub struct LiveRow {
     pub fields: BTreeMap<FieldId, Value>,
     /// `Set` tags and `Map` entries in [`compare_key`] order of elements and keys (D61, D79).
     pub collections: BTreeMap<FieldId, CollectionState>,
+}
+
+/// The rules of [`Write`] on one row that do not depend on where a driver stores its rows
+/// (D139). Whether an id is taken, by a live row or by a deleted one, and removing a deleted row
+/// are rules of the driver's storage and stay in the driver.
+impl LiveRow {
+    /// The row a [`Write::Insert`] creates: version 1, its fields and its collection changes
+    /// applied to empty collections.
+    pub fn inserted(
+        model: ModelId,
+        fields: &[(FieldId, Value)],
+        collections: &[(FieldId, CollectionChange)],
+    ) -> Self {
+        let mut row = LiveRow {
+            model,
+            version: 1,
+            fields: fields.iter().cloned().collect(),
+            collections: BTreeMap::new(),
+        };
+        for (f, c) in collections {
+            apply_collection(&mut row.collections, *f, c);
+        }
+        row
+    }
+
+    /// Checks the live row stored under the id of a [`Write::Update`] or [`Write::Delete`]: a
+    /// row of another model is [`DbError::NotFound`], like a missing one, and a row whose
+    /// version is not `expect_version` is [`DbError::VersionMismatch`].
+    pub fn check(&self, model: ModelId, expect_version: u64) -> Result<(), DbError> {
+        if self.model != model {
+            return Err(DbError::NotFound);
+        }
+        if self.version != expect_version {
+            return Err(DbError::VersionMismatch);
+        }
+        Ok(())
+    }
+
+    /// Applies a [`Write::Update`] that passed [`LiveRow::check`]: the version grows by one,
+    /// the given fields replace the stored ones and the collection changes are applied.
+    pub fn update(
+        &mut self,
+        fields: &[(FieldId, Value)],
+        collections: &[(FieldId, CollectionChange)],
+    ) {
+        self.version += 1;
+        self.fields.extend(fields.iter().cloned());
+        for (f, c) in collections {
+            apply_collection(&mut self.collections, *f, c);
+        }
+    }
 }
 
 /// Where hops read rows from.

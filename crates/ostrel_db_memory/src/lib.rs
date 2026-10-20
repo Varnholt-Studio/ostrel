@@ -23,9 +23,12 @@
 //! * Live rows are shared [`LiveRow`]s, so copying the state for a transaction copies no row;
 //!   a write copies the one row it changes. Deleted rows leave only their id behind.
 //!
-//! Filters, ordering, cursor and limit of queries, the enum check of writes and the rules of
-//! `Set` and `Map` changes are those of [`ostrel_db::eval`], shared with every driver that keeps
-//! rows outside SQL (D129). A new driver of that kind can use them the same way.
+//! Filters, ordering, cursor and limit of queries, the enum check of writes, the rules of `Set`
+//! and `Map` changes and the transitions of one row ([`LiveRow::inserted`], [`LiveRow::check`],
+//! [`LiveRow::update`]) are those of [`ostrel_db::eval`], shared with every driver that keeps
+//! rows outside SQL (D129, D139). What stays here is the storage: the map of live rows, the ids
+//! of deleted rows and the rule that an id stays taken, the op log and the transactions. A new
+//! driver of that kind keeps its rows its own way and uses the shared rules the same way.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,8 +36,8 @@ use std::rc::Rc;
 
 use ostrel_db::api::{
     AppliedSchema, BoxFuture, Capabilities, Connection, DbError, Driver, EnumColumn, MigrationPlan,
-    ModelId, NewOp, OpId, Query, ReplayOutcome, ReplicaId, RowId, Rows, ServerSeq, StoredOp,
-    Transaction, Write, check_reject_reason, check_writes,
+    NewOp, OpId, Query, ReplayOutcome, ReplicaId, RowId, Rows, ServerSeq, StoredOp, Transaction,
+    Write, check_reject_reason, check_writes,
 };
 use ostrel_db::eval::{self, LiveRow, Lookup};
 
@@ -355,15 +358,7 @@ fn apply_write(s: &mut State, w: &Write) -> Result<(), DbError> {
             if s.rows.contains_key(row) || s.deleted.contains(row) {
                 return Err(DbError::Conflict);
             }
-            let mut new = LiveRow {
-                model: *model,
-                version: 1,
-                fields: fields.iter().cloned().collect(),
-                collections: BTreeMap::new(),
-            };
-            for (f, c) in collections {
-                eval::apply_collection(&mut new.collections, *f, c);
-            }
+            let new = LiveRow::inserted(*model, fields, collections);
             s.rows.insert(*row, Rc::new(new));
         }
         Write::Update {
@@ -373,42 +368,24 @@ fn apply_write(s: &mut State, w: &Write) -> Result<(), DbError> {
             fields,
             collections,
         } => {
-            let r = Rc::make_mut(live_row(s, *model, *row, *expect_version)?);
-            r.version += 1;
-            r.fields.extend(fields.iter().cloned());
-            for (f, c) in collections {
-                eval::apply_collection(&mut r.collections, *f, c);
-            }
+            // A deleted row is no longer in `rows`, so it is not found like a missing one.
+            let r = s.rows.get_mut(row).ok_or(DbError::NotFound)?;
+            r.check(*model, *expect_version)?;
+            // Copies the row only if a copy of the state still shares it.
+            Rc::make_mut(r).update(fields, collections);
         }
         Write::Delete {
             model,
             row,
             expect_version,
         } => {
-            live_row(s, *model, *row, *expect_version)?;
+            let r = s.rows.get(row).ok_or(DbError::NotFound)?;
+            r.check(*model, *expect_version)?;
             s.rows.remove(row);
             s.deleted.insert(*row);
         }
     }
     Ok(())
-}
-
-/// The live row `row` of `model`, checked against `expect_version`.
-fn live_row(
-    s: &mut State,
-    model: ModelId,
-    row: RowId,
-    expect_version: u64,
-) -> Result<&mut Rc<LiveRow>, DbError> {
-    let r = s
-        .rows
-        .get_mut(&row)
-        .filter(|r| r.model == model)
-        .ok_or(DbError::NotFound)?;
-    if r.version != expect_version {
-        return Err(DbError::VersionMismatch);
-    }
-    Ok(r)
 }
 
 /// Runs a query on the state through [`eval::run`].
