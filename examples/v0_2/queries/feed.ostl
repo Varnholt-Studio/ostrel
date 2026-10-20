@@ -1,0 +1,29 @@
+app Feed
+
+data Post
+  text: Text
+  pos: Int
+  hidden: Bool = false
+  check text.len in 1..200
+  see if not hidden
+  make if true
+  edit if true
+
+view Main
+  col
+    text "Last three" look: title
+    col
+      for p in Post sort pos last 3
+        text p.text
+    text "Last two descending" look: title
+    col
+      for p in Post sort pos desc last 2
+        text p.text
+    text "First two" look: title
+    col
+      for p in Post sort pos limit 2
+        text p.text
+    text "Last two up to five" look: title
+    col
+      for p in Post where pos <= 5 sort pos last 2
+        text p.text
