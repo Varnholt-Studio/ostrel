@@ -35,20 +35,25 @@ const VALUE_BYTES: u64 = size_of::<Value>() as u64;
 const WORK_BYTES: u64 = 64;
 
 /// Steps charged for each heap allocation an instruction makes (a text, a frame, an
-/// argument vector), on top of its bytes of work (ARCHITECTURE 3.4, D112). An
+/// argument vector), on top of its bytes of work (ARCHITECTURE 3.4, D112, D114). An
 /// allocation takes several times as long as a plain instruction, so without this
 /// surcharge a program made of interpolations ran about four times as long per step
 /// as one made of plain calls.
 const ALLOC_STEPS: u64 = 2;
 
-/// Heap allocations of `ToText`: the text.
-const TO_TEXT_ALLOCS: u64 = 1;
+/// Heap allocations charged to `ToText`: the real allocations of turning a value
+/// into text (ARCHITECTURE 3.4 v1.15, D114).
+const TO_TEXT_ALLOCS: u64 = 3;
 
-/// Heap allocations of `Concat`: the vector of its parts and the text.
-const CONCAT_ALLOCS: u64 = 2;
+/// Heap allocations charged to `Concat`: the real allocations of collecting its
+/// parts and building the text (ARCHITECTURE 3.4 v1.15, D114).
+const CONCAT_ALLOCS: u64 = 3;
 
-/// Heap allocations of `Call`: the argument vector and the frame.
-const CALL_ALLOCS: u64 = 2;
+/// Heap allocations charged to `Call`: none. A call is the calibration instruction
+/// (the default step limit is measured with a program of calls), so a surcharge on
+/// it would scale the reference as well (ARCHITECTURE 3.4 v1.15, D114). Its bytes of
+/// work and the heap check before a new frame still apply.
+const CALL_ALLOCS: u64 = 0;
 
 /// Work of one instruction beyond a plain instruction, computed before it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -801,11 +806,10 @@ mod tests {
         let image = image(vec![main, a, b, spinner("c", 300)]);
         assert!(image.is_some(), "program compiles");
         let Some(image) = image else { return };
-        // Steps: call a (5, D112), return in a (1), call b (5), then b and c.
-        for max_steps in [1, 4, 5] {
-            assert_eq!(step_limit_at(&image, max_steps), Some(20), "{max_steps}");
-        }
-        for max_steps in [6, 10, 11, 12, 50, 51] {
+        // Steps: call a, return in a, call b, then b and c. A call has no allocation
+        // surcharge (D114).
+        assert_eq!(step_limit_at(&image, 1), Some(20));
+        for max_steps in [2, 3, 4, 5, 6, 50, 51] {
             assert_eq!(step_limit_at(&image, max_steps), Some(30), "{max_steps}");
         }
     }
@@ -852,8 +856,8 @@ mod tests {
     #[test]
     fn interpolation_charges_its_allocations() {
         // `fn main() { let m = 7; let t = "{m}" }`: the constant costs 1 step, `ToText`
-        // 1 + 2 (one text), the one part `Concat` 1 + ceil((1 + 16) / 64) + 4 (parts
-        // vector and text), the return 1: 11 steps in all.
+        // 1 + 6 (three allocations), the one part `Concat` 1 + ceil((1 + 16) / 64) + 6
+        // (three allocations), the return 1: 17 steps in all (D114).
         let main = func(
             "main",
             0,
@@ -884,22 +888,24 @@ mod tests {
         let image = image(vec![main]);
         assert!(image.is_some(), "program compiles");
         let Some(image) = image else { return };
-        assert_eq!(step_limit_at(&image, 3), Some(2));
-        assert_eq!(step_limit_at(&image, 4), Some(3));
-        assert_eq!(step_limit_at(&image, 9), Some(3));
+        assert_eq!(step_limit_at(&image, 1), Some(2));
+        assert_eq!(step_limit_at(&image, 7), Some(2));
+        assert_eq!(step_limit_at(&image, 8), Some(3));
+        assert_eq!(step_limit_at(&image, 15), Some(3));
         // The return carries the span of the last instruction of its block.
-        assert_eq!(step_limit_at(&image, 10), Some(3));
+        assert_eq!(step_limit_at(&image, 16), Some(3));
         let limits = Limits {
-            max_steps: 11,
+            max_steps: 17,
             ..Limits::default()
         };
         assert_eq!(run_kind(&image, limits), Ok(()));
     }
 
     #[test]
-    fn call_charges_its_frame_and_argument_vector() {
-        // `fn main() { a() }`, `fn a() { }`: call 1 + 4, return in `a` 1, return in
-        // `main` 1: 7 steps in all.
+    fn call_has_no_allocation_surcharge() {
+        // `fn main() { a() }`, `fn a() { }`: the call is the calibration instruction
+        // and costs 1 (no registers, no surcharge, D114), return in `a` 1, return in
+        // `main` 1: 3 steps in all.
         let main = func(
             "main",
             0,
@@ -923,10 +929,10 @@ mod tests {
         let image = image(vec![main, a]);
         assert!(image.is_some(), "program compiles");
         let Some(image) = image else { return };
-        assert_eq!(step_limit_at(&image, 4), Some(5));
-        assert_eq!(step_limit_at(&image, 6), Some(5));
+        assert_eq!(step_limit_at(&image, 1), Some(5));
+        assert_eq!(step_limit_at(&image, 2), Some(5));
         let limits = Limits {
-            max_steps: 7,
+            max_steps: 3,
             ..Limits::default()
         };
         assert_eq!(run_kind(&image, limits), Ok(()));
@@ -935,7 +941,7 @@ mod tests {
     #[test]
     fn concat_refused_by_the_heap_reports_heap_limit() {
         // `fn main() { let s = "<64 bytes>"; let t = "{s}{s}" }` with a heap that holds
-        // `s` but not `t`. Charged in full, the `Concat` would cost 1 + 3 + 4 steps; it
+        // `s` but not `t`. Charged in full, the `Concat` would cost 1 + 3 + 6 steps; it
         // is charged only its two references (1 + 1), so every step limit that lets it
         // start reports `HeapLimit` (red #1419 F3).
         let s = "a".repeat(64);
@@ -972,24 +978,24 @@ mod tests {
             run_kind(&image, limits(2)),
             Err(RuntimeErrorKind::StepLimit)
         );
-        for max_steps in [3, 4, 5, 6, 7, 8, 9, 1000] {
+        for max_steps in [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1000] {
             assert_eq!(
                 run_kind(&image, limits(max_steps)),
                 Err(RuntimeErrorKind::HeapLimit),
                 "{max_steps}"
             );
         }
-        // With one byte more the text fits and the full cost applies: 1 + 8 + 1 steps.
+        // With one byte more the text fits and the full cost applies: 1 + 10 + 1 steps.
         let fits = Limits {
             max_heap_bytes: held + 128 + TEXT_OVERHEAD,
-            ..limits(1 + 8 + 1)
+            ..limits(1 + 10 + 1)
         };
         assert_eq!(run_kind(&image, fits), Ok(()));
         assert_eq!(
             run_kind(
                 &image,
                 Limits {
-                    max_steps: 9,
+                    max_steps: 11,
                     ..fits
                 }
             ),
@@ -1000,8 +1006,9 @@ mod tests {
     #[test]
     fn call_refused_by_the_heap_reports_heap_limit() {
         // `fn main() { big() }` where the frame of `big` (200 registers) does not fit
-        // the heap. Charged in full, the call would cost 1 + 50 + 4 steps; it is
-        // charged only its references (none), so it reports `HeapLimit`.
+        // the heap. Charged in full, the call would cost 1 + 50 steps (its registers,
+        // no allocation surcharge, D114); it is charged only its references (none),
+        // so every step limit that lets it start reports `HeapLimit`.
         let main = func(
             "main",
             0,
@@ -1034,7 +1041,7 @@ mod tests {
             run_kind(&image, limits(0)),
             Err(RuntimeErrorKind::StepLimit)
         );
-        for max_steps in [1, 2, 5, 54, 55, 1000] {
+        for max_steps in [1, 2, 5, 49, 50, 51, 52, 1000] {
             assert_eq!(
                 run_kind(&image, limits(max_steps)),
                 Err(RuntimeErrorKind::HeapLimit),

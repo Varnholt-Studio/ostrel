@@ -807,20 +807,21 @@ fn concatenation_costs_steps_per_byte_but_text_limit_wins() {
         (vec![], err(RuntimeErrorKind::StepLimit, 50))
     );
     // A concatenation refused by `TextLimit` does no work and is not charged for it:
-    // 140 steps (100 plus 4 for the two allocations of each of the ten concatenations
-    // before it, D112) reach the eleventh concatenation with enough left to report
-    // `TextLimit`, although writing 2 048 bytes and allocating would cost 36 more.
+    // 160 steps (100 plus 6 for the three allocations of each of the ten
+    // concatenations before it, D112, D114) reach the eleventh concatenation with
+    // enough left to report `TextLimit`, although writing 2 048 bytes and allocating
+    // would cost 38 more.
     let limits = |max_steps| Limits {
         max_steps,
         max_text_bytes: 1024,
         ..Limits::default()
     };
     assert_eq!(
-        exec_with(&doubling(11), limits(140)),
+        exec_with(&doubling(11), limits(160)),
         (vec![], err(RuntimeErrorKind::TextLimit, 50))
     );
     assert_eq!(
-        exec_with(&doubling(11), limits(139)),
+        exec_with(&doubling(11), limits(159)),
         (vec![], err(RuntimeErrorKind::StepLimit, 50))
     );
 }
