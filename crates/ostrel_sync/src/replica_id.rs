@@ -14,10 +14,18 @@
 //!   knows the `replica_secret` that came with the replica; the server keeps only its SHA-256
 //!   (D111). Every mismatch is a fatal [`ErrorCode::Unauthorized`].
 //! * A `replica_secret` in an app with `auth`, or one without a replica, is a fatal
-//!   [`ErrorCode::Protocol`] (D122).
+//!   [`ErrorCode::Protocol`] (D122). So is a `token` in an app without `auth`, also an empty
+//!   one (D150). Both are checked before every replica rule, so such a [`Hello`] never learns
+//!   whether a replica exists.
 //! * A replica unused for [`REPLICA_LIFETIME_MS`] has expired: [`ErrorCode::ReplicaExpired`]
 //!   (ARCHITECTURE 5.5, D111). It is reported only to the owner, so nobody learns from it that
 //!   a foreign replica exists.
+//! * A confirmed replica whose `last_server_seq` lies above the end of the op log is
+//!   [`ErrorCode::ReplicaExpired`] as well (ARCHITECTURE 5.4, D161): the log it was applied
+//!   against is gone, for example a memory database after a restart. The client then drops the
+//!   replica's state and outbox instead of dropping new ops below its mark. This check sees only
+//!   a mark above the log end; a restart with new ops above the mark is not detected (D162).
+//!   [`check_resume_mark`] applies it after [`answer_hello`].
 //!
 //! # What this module leaves to its caller
 //!
@@ -32,7 +40,7 @@
 //! content. D103 (b) put that off until after v0.3; within v0.3, fresh ids per [`Hello`] keep
 //! honest clients from ever reusing an op id.
 
-use crate::protocol::{ErrorCode, Hello, ReplicaId, RowId};
+use crate::protocol::{ErrorCode, Hello, ReplicaId, RowId, ServerSeq};
 
 /// A replica unused this long has expired: 30 days in milliseconds (ARCHITECTURE 5.5).
 pub const REPLICA_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -143,6 +151,9 @@ pub fn answer_hello(
     digest: impl Fn(&[u8]) -> [u8; 32],
     now_ms: u64,
 ) -> Result<Answer, Refusal> {
+    if hello.token.is_some() && caller == Caller::NoAuth {
+        return Err(Refusal::Error(ErrorCode::Protocol));
+    }
     if hello.replica_secret.is_some() && (hello.replica.is_none() || caller != Caller::NoAuth) {
         return Err(Refusal::Error(ErrorCode::Protocol));
     }
@@ -152,6 +163,24 @@ pub fn answer_hello(
     match hello.replica {
         Some(replica) => confirm(hello, replica, caller, records, digest, now_ms),
         None => issue(caller, records, entropy, digest, now_ms),
+    }
+}
+
+/// Checks the `last_server_seq` of `hello` against `log_end`, the highest position of the op
+/// log, after [`answer_hello`] gave `answer`.
+///
+/// Only a [`Answer::Confirmed`] replica is checked: its owner is established, so the refusal
+/// tells nobody else anything. A new replica has applied nothing, so its mark is ignored.
+pub fn check_resume_mark(
+    answer: &Answer,
+    hello: &Hello,
+    log_end: ServerSeq,
+) -> Result<(), Refusal> {
+    match (answer, hello.last_server_seq) {
+        (Answer::Confirmed(_), Some(mark)) if mark > log_end => {
+            Err(Refusal::Error(ErrorCode::ReplicaExpired))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -698,6 +727,97 @@ mod tests {
             NOW + 60 * DAY_MS,
         );
         assert_eq!(stranger, refused(ErrorCode::Unauthorized));
+    }
+
+    /// D150: a token in an app without `auth`, also an empty one, is a protocol error before
+    /// any replica rule, so the answer is the same whether the named replica exists or not.
+    #[test]
+    fn a_token_in_an_app_without_auth_is_a_protocol_error() {
+        let mut store = Store::default();
+        let mut entropy = Script::ids(&[5]);
+        let issued = answer(
+            &hello(None, None),
+            Caller::NoAuth,
+            &store,
+            &mut entropy,
+            NOW,
+        );
+        let Answer::Issued {
+            secret: Some(secret),
+            ..
+        } = store_and_return(&mut store, issued)
+        else {
+            panic!("expected a secret");
+        };
+        let mut entropy = Script::ids(&[]);
+        let with_token = |replica: Option<u64>, secret: Option<&str>, token: &str| Hello {
+            token: Some(token.to_owned()),
+            ..hello(replica, secret)
+        };
+        let cases = [
+            with_token(None, None, "v4.public.x"),
+            with_token(None, None, ""),
+            with_token(Some(5), Some(&secret), "v4.public.x"),
+            with_token(Some(5), Some(&secret), ""),
+            with_token(Some(6), Some(&secret), ""),
+            with_token(Some(5), None, ""),
+        ];
+        for h in cases {
+            let result = answer(&h, Caller::NoAuth, &store, &mut entropy, NOW);
+            assert_eq!(result, refused(ErrorCode::Protocol), "{h:?}");
+        }
+        // The same Hello without the token is fine, so the token alone decided.
+        let plain = answer(
+            &hello(Some(5), Some(&secret)),
+            Caller::NoAuth,
+            &store,
+            &mut entropy,
+            NOW,
+        );
+        assert_eq!(plain, Ok(Answer::Confirmed(ReplicaId(5))));
+    }
+
+    /// D161: a confirmed replica whose mark lies above the log end has expired; a mark at or
+    /// below it, a missing mark and a new replica pass.
+    #[test]
+    fn a_mark_above_the_log_end_expires_the_replica() {
+        let with_mark = |mark: Option<u64>| Hello {
+            last_server_seq: mark.map(ServerSeq),
+            ..hello(Some(5), None)
+        };
+        let confirmed = Answer::Confirmed(ReplicaId(5));
+        let end = ServerSeq(10);
+        assert_eq!(
+            check_resume_mark(&confirmed, &with_mark(Some(10)), end),
+            Ok(())
+        );
+        assert_eq!(
+            check_resume_mark(&confirmed, &with_mark(Some(0)), end),
+            Ok(())
+        );
+        assert_eq!(check_resume_mark(&confirmed, &with_mark(None), end), Ok(()));
+        assert_eq!(
+            check_resume_mark(&confirmed, &with_mark(Some(11)), end),
+            Err(Refusal::Error(ErrorCode::ReplicaExpired))
+        );
+        // A memory database after a restart: the log is empty, every mark lies above it.
+        assert_eq!(
+            check_resume_mark(&confirmed, &with_mark(Some(1)), ServerSeq(0)),
+            Err(Refusal::Error(ErrorCode::ReplicaExpired))
+        );
+        let issued = Answer::Issued {
+            record: ReplicaRecord {
+                replica: ReplicaId(6),
+                owner: Owner::Secret { digest: [0; 32] },
+                issued_ms: NOW,
+                last_ack_ms: None,
+            },
+            secret: None,
+        };
+        assert_eq!(
+            check_resume_mark(&issued, &with_mark(Some(99)), end),
+            Ok(())
+        );
     }
 
     #[test]
