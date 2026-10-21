@@ -220,6 +220,8 @@ impl<'p> Cx<'p> {
             Ty::Rank => "Rank".into(),
             Ty::Url => "Url".into(),
             Ty::Enum(d) | Ty::Ref(d) => def(d),
+            // The type of `none` alone.
+            Ty::Optional(t) if **t == Ty::Error => "none".into(),
             Ty::Optional(t) => format!("{}?", self.name(t)),
             Ty::Set(t) => format!("Set[{}]", self.name(t)),
             Ty::List(t) => format!("List[{}]", self.name(t)),
@@ -583,19 +585,26 @@ impl<'p> Cx<'p> {
         }
     }
 
-    /// The common type of the elements of a literal; E0304 at each element
-    /// that does not fit the first known one.
+    /// The common type of the elements of a literal: the first known element
+    /// type, optional when any element is `none` or optional (SYNTAX 4.4),
+    /// whatever its position. E0304 at each element that does not fit it.
     fn items(&mut self, items: &[ExprId]) -> Ty {
-        let mut common = Ty::Error;
-        for &item in items {
-            let found = self.expr(item);
-            if common == Ty::Error {
-                common = found;
-            } else {
-                self.expect(item, &common, &found);
-            }
+        let found: Vec<Ty> = items.iter().map(|&item| self.expr(item)).collect();
+        let optional = found.iter().any(|t| matches!(t, Ty::Optional(_)));
+        let inner: Vec<Ty> = found.into_iter().map(unwrap_optional).collect();
+        let common = inner
+            .iter()
+            .find(|t| **t != Ty::Error)
+            .cloned()
+            .unwrap_or(Ty::Error);
+        for (&item, found) in items.iter().zip(&inner) {
+            self.expect(item, &common, found);
         }
-        common
+        if optional {
+            Ty::Optional(Box::new(common))
+        } else {
+            common
+        }
     }
 
     fn name_ty(&self, res: Res) -> Ty {

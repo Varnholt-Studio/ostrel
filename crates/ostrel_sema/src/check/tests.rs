@@ -215,6 +215,62 @@ fn none_in_set_is_valid() {
     clean("app A\nfn f(tags: Set[Text]) -> Bool\n  return none in tags\n");
 }
 
+// SYNTAX 4.4: a literal with a `none` element has optional elements, in
+// whatever order its elements stand.
+#[test]
+fn none_in_set_literal_is_valid_in_either_order() {
+    clean("app A\nvar tags: Set[Text?] = {\"a\", none}\n");
+    clean("app A\nvar tags: Set[Text?] = {none, \"a\"}\n");
+    clean("app A\nfn f() -> Set[Text?]\n  return {\"a\", none}\n");
+    clean("app A\nfn f() -> Set[Text?]\n  return {none, \"a\"}\n");
+}
+
+#[test]
+fn none_in_list_literal_is_valid_in_either_order() {
+    clean("app A\nvar xs: List[Int?] = [1, none]\n");
+    clean("app A\nvar xs: List[Int?] = [none, 1]\n");
+    clean("app A\nvar xs: List[Int?] = [1, none, 2]\n");
+}
+
+#[test]
+fn optional_element_makes_literal_optional_in_either_order() {
+    let tail = "fn f(p: Post) -> List[Text?]\n";
+    let head = "app A\ndata Post\n  tag: Text?\n  see if true\n";
+    clean(&format!("{head}{tail}  return [\"a\", p.tag]\n"));
+    clean(&format!("{head}{tail}  return [p.tag, \"a\"]\n"));
+}
+
+#[test]
+fn literal_with_none_does_not_fit_plain_elements() {
+    // Same finding at the literal, whatever the position of `none`.
+    assert_eq!(
+        diags("app A\nvar xs: List[Int] = [1, none]\n"),
+        ["E0304 2:21"]
+    );
+    assert_eq!(
+        diags("app A\nvar xs: List[Int] = [none, 1]\n"),
+        ["E0304 2:21"]
+    );
+    assert_eq!(
+        messages("app A\nvar tags: Set[Text] = {\"a\", none}\n"),
+        ["expected `Set[Text]`, found `Set[Text?]`"]
+    );
+}
+
+#[test]
+fn literal_elements_still_must_agree() {
+    assert_eq!(diags("app A\nvar xs = [1, none, \"a\"]\n"), ["E0304 2:20"]);
+    assert_eq!(diags("app A\nvar xs = [none, 1, \"a\"]\n"), ["E0304 2:20"]);
+}
+
+#[test]
+fn none_is_named_in_messages() {
+    assert_eq!(
+        messages("app A\nvar x: Int = none\n"),
+        ["expected `Int`, found `none`"]
+    );
+}
+
 #[test]
 fn optional_element_must_fit_inside() {
     assert_eq!(
