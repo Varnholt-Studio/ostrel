@@ -1,8 +1,9 @@
 # Sync: operating limits
 
-Status: draft, started with work package T197 (Refs #197). Inputs: ARCHITECTURE 5.4, 5.6, 6.1
-and 16 (risk 10), decisions D153 and D160, SPEC 12.14. Further sections on the sync protocol
-follow with their work packages.
+Status: draft, started with work package T197 (Refs #197), section 2 added with T207 (Refs
+#207). Inputs: ARCHITECTURE 5.4, 5.6, 5.7, 6.1 and 16 (risks 10, 12 and 13), decisions D153,
+D157, D159, D160, D161 and D162, SPEC 12.14. Further sections on the sync protocol follow with
+their work packages.
 
 ## 1. One server process per app database
 
@@ -80,3 +81,71 @@ restarting each other, and both write in between.
 Serving one app database from several processes or hosts needs a later decision that provides a
 revocation notice to every process, one global broadcast order, a global quiet point and a start
 lock that works across hosts (ARCHITECTURE 16, risk 10).
+
+## 2. Audit sync under the write lock
+
+Every execution of an elevated server function (`as system`) writes one entry to the audit file
+and syncs it to disk before the first instruction of the body runs (ARCHITECTURE 5.7, D117,
+D159). This section states what that costs while the call holds the write lock. The file rules
+and the operator rules for the audit file are in [`docs/security.md`](security.md), section 2.
+
+### 2.1 One sync per elevated call, inside the hold time
+
+Since D161 an elevated function is a locking call, like a server function that writes: it takes
+the write lock of the process at entry, after a pre-check without the lock that ends every
+refused call, and keeps it until its transaction ends (ARCHITECTURE 5.4, 5.7). The audit entry is
+written after the `call` rule admitted the caller and before the body, so the append and the
+sync of the audit file fall inside the time the call holds the write lock.
+
+Consequences (ARCHITECTURE 16, risk 13 (c)):
+
+* Every elevated call adds one sync of the audit file to the hold time of the write lock. Every
+  other writer of the process (op batches, writing server functions, other elevated calls) waits
+  for it.
+* Elevated calls are serial: one process completes at most one audit sync at a time, so the rate
+  of elevated calls is bounded by the sync latency of the disk that holds the audit file, also
+  when the calls touch unrelated data.
+* The cost depends on the storage, not on the program. A disk with a slow sync (network block
+  storage, a disk without a protected write cache) raises the hold time of every elevated call
+  by its sync latency.
+* Calls of server functions that are not elevated, and op batches, write no audit entry and pay
+  no audit sync.
+* Refused calls write no entry: the pre-check without the lock ends them, and a call whose `call`
+  rule does not admit the caller never reaches the audit step.
+
+### 2.2 KPI A and the hold time
+
+KPI A requires a p99 of at most 50 ms for engine plus render, with 10 000 issues, 3 editors and
+the network excluded (ARCHITECTURE 1, D2). Separately, the hold time of the write lock is
+measured in the KPI A setup, and a p99 hold time above 20 ms there is a blocker (ARCHITECTURE
+5.4, ARCHITECTURE 16 risk 12). An app whose KPI path calls elevated functions pays one audit sync
+per call in the hold time of the write lock, and so in the latency of every write that waits
+behind it.
+
+Measurement rules for this limit:
+
+* The hold time is measured with elevated calls in the mix, on SQLite or PostgreSQL with the
+  audit file on the same class of disk as the database. The memory adapter keeps the audit in
+  memory (tests) and hides the sync; a value measured on it does not count for this limit.
+* The values and the disk they were measured on are published in
+  [`BENCHMARKS.md`](../BENCHMARKS.md), section 2.
+
+### 2.3 Group sync: not in v0.3
+
+Each entry is synced on its own. A group sync, where one sync covers the entries of several
+calls that arrived together, would lower the cost per call. It is not part of v0.3; it may come
+after v0.3 by a DECISION (ARCHITECTURE 16, risk 13 (c)). Any such change keeps the order of
+ARCHITECTURE 5.7: no body runs before its entry is on disk.
+
+### 2.4 Audit file limit for operators
+
+Unlinking the audit file between the server's path check and its append writes the entry into
+the unlinked file, where it is lost (ARCHITECTURE 5.7, ARCHITECTURE 16 risk 13 (d)). This is an
+operator action, not a sync cost; the rules that avoid it are in
+[`docs/security.md`](security.md), sections 2.3 and 2.4.
+
+### 2.5 Status
+
+The file store described here is the contract of ARCHITECTURE 5.7. On the current development
+branch the server has only the in memory audit store used by tests
+(`crates/ostrel_server/src/audit.rs`), so no audit sync cost has been measured yet.

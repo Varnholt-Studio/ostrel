@@ -1,0 +1,13 @@
+// SPEC 12.10: bare names in `n` are locals, but a local named like a field is still a
+// fault when the query has `sort`; it is reported at its first bare occurrence, here in `n`.
+app Golden
+
+data Post
+  pos: Int
+  text: Text
+  see if true
+  drop if true
+
+fn f(pos: Int)
+  for p in Post sort text last pos
+    let x = 1

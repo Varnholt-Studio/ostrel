@@ -1,0 +1,2 @@
+crates/ostrel_cli/tests/ac_56/two_names_source_order.ostl:12:19: error[E0207]: local `pos` has the name of a field of `Post`; rename the local
+crates/ostrel_cli/tests/ac_56/two_names_source_order.ostl:12:32: error[E0207]: local `text` has the name of a field of `Post`; rename the local
