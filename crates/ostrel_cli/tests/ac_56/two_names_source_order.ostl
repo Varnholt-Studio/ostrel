@@ -1,0 +1,12 @@
+// SPEC 12.10: two clashing names in one query are two faults, in source order of their
+// first bare occurrence (not in the order the locals were declared).
+app Golden
+
+data Post
+  pos: Int
+  text: Text
+  see if true
+  drop if true
+
+fn f(text: Text, pos: Int)
+  drop Post where pos == 1 and text == "a"

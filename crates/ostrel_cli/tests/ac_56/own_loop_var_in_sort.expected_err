@@ -1,0 +1,1 @@
+crates/ostrel_cli/tests/ac_56/own_loop_var_in_sort.ostl:11:24: error[E0207]: local `pos` has the name of a field of `Post`; rename the local

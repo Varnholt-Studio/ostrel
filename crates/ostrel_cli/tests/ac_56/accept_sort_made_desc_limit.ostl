@@ -1,0 +1,12 @@
+// SPEC 12.6 (E0210 goldens) and 12.10: creation order is written `sort made`.
+app Golden
+
+data Post
+  pos: Int
+  text: Text
+  see if true
+  drop if true
+
+fn f()
+  for p in Post sort made desc limit 3
+    let x = 1
