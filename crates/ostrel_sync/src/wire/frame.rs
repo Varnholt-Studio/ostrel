@@ -106,10 +106,17 @@ pub fn decode_server(
         "reset" => ServerMsg::Reset {
             sub: fields.req("sub", uint32)?,
         },
-        "error" => ServerMsg::Error(ProtocolError {
-            sub: fields.opt("sub", uint32)?,
-            code: fields.req("code", error_code)?,
-        }),
+        "error" => {
+            let error = ProtocolError {
+                sub: fields.opt("sub", uint32)?,
+                code: fields.req("code", error_code)?,
+                retry_after_ms: fields.opt("retry_after_ms", uint32)?,
+            };
+            if !error.is_well_formed() {
+                return Err(WireError::IllFormedError(error.code));
+            }
+            ServerMsg::Error(error)
+        }
         "ops" => ServerMsg::Ops(fields.req("ops", |k, j| {
             list(k, j, |_, logged| logged_op(logged, schema))
         })?),
@@ -245,10 +252,17 @@ pub fn encode_server(
             ("rows", array(rows.iter().map(|r| hex(&r.to_hex())))),
         ],
         ServerMsg::Reset { sub } => vec![("sub", sub.to_string())],
-        ServerMsg::Error(e) => vec![
-            ("sub", opt(e.sub, |s| s.to_string())),
-            ("code", encode_str(error_code_name(e.code))),
-        ],
+        ServerMsg::Error(e) => {
+            if !e.is_well_formed() {
+                return Err(WireError::IllFormedError(e.code));
+            }
+            // Like `sub`, an absent `retry_after_ms` is `null`, never a missing key (D159).
+            vec![
+                ("sub", opt(e.sub, |s| s.to_string())),
+                ("code", encode_str(error_code_name(e.code))),
+                ("retry_after_ms", opt(e.retry_after_ms, |ms| ms.to_string())),
+            ]
+        }
         ServerMsg::Snapshot {
             sub,
             rows,
@@ -331,6 +345,10 @@ error_codes![
     TooManySubscriptions,
     FilterTooLarge,
     FilterNotReadable,
+    Superseded,
+    TooManySessions,
+    Overloaded,
+    RateLimited,
 ];
 
 // ---------------------------------------------------------------------------------------------
