@@ -8,4 +8,5 @@
 
 pub mod broadcast_fence;
 pub mod protocol;
+pub mod replica_id;
 pub mod wire;
