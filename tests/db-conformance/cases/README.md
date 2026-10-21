@@ -59,7 +59,14 @@ every other character is written as a JSON escape.
   2^53 - 1 in magnitude, ARCHITECTURE 7.4), `{"text": "..."}`, or
   `{"text_repeat": ["<unit>", count]}` for the unit repeated `count` times.
 
+The harness adds the built in case `ac_10_commit_error_is_final` (outcome contract of `commit`,
+D156), see `../harness/README.md`.
+
 ## Not covered yet
+
+PostgreSQL specific parts of the contract are checked by the PostgreSQL adapter's own tests
+when it exists (D156, D159): the op log sequence is declared with `CACHE 1`, and opening the
+database for a server process ends every other backend of the app's `application_name`.
 
 Equality filters on Text (D55) need `Query.filter`, which comes with the query IR; `Float`, time,
 bytes, references, `Set` and `Map` values need the `ostrel_core` value type. Both extend these
