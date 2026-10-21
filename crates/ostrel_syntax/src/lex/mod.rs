@@ -21,8 +21,12 @@
 //!   stack rules above without a further diagnostic.
 //! * Blank lines and lines holding only a comment produce no `Nl`, `Indent` or
 //!   `Dedent`, and their leading whitespace is not checked (SPEC 12.2).
-//! * While a `(` is open, line ends and indentation are ignored. From v0.2 `[`
-//!   and `{` continue lines as well (SPEC 12.2); see [`continues_line`].
+//! * While a `(`, `[` or `{` is open, line ends and indentation are ignored
+//!   (SYNTAX 3, SPEC 12.2); see [`continues_line`]. The lexer counts open
+//!   brackets of all three kinds together, so any closing bracket closes one
+//!   level and a closing bracket with nothing open changes nothing. Matching
+//!   kinds is the parser's job; a mismatched closer must not keep the rest of
+//!   the file in one logical line.
 //! * At the end of the input the lexer closes the last line with `Nl`, emits a
 //!   `Dedent` for every open block and ends with `Eof`. A last line without a
 //!   line end is valid, and an empty input gives only `Eof`.
@@ -156,9 +160,11 @@ pub fn lex_with<L: LiteralScan + ?Sized>(
 
 /// True if an open `bracket` lets a logical line continue over a line end.
 ///
-/// v0.1: only `(` (SPEC 12.2). From v0.2 `[` and `{` also continue a line.
+/// `(`, `[` and `{` continue a line (SYNTAX 3, SPEC 12.2: from v0.2, when
+/// lists, sets and maps exist). The `{` that opens an interpolation inside a
+/// string is not a bracket here; the string scanner counts it on its own.
 pub const fn continues_line(bracket: char) -> bool {
-    matches!(bracket, '(')
+    matches!(bracket, '(' | '[' | '{')
 }
 
 struct Lexer<'a, L: ?Sized> {
@@ -372,22 +378,12 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             '/' if self.peek_at(1) == Some('/') => return self.comment(),
             '0'..='9' => return self.int(),
             'a'..='z' | 'A'..='Z' => return self.ident(),
-            '(' => {
-                if continues_line('(') {
-                    self.open = self.open.saturating_add(1);
-                }
-                single(TokenKind::LParen)
-            }
-            ')' => {
-                if continues_line('(') {
-                    self.open = self.open.saturating_sub(1);
-                }
-                single(TokenKind::RParen)
-            }
-            '[' => single(TokenKind::LBracket),
-            ']' => single(TokenKind::RBracket),
-            '{' => single(TokenKind::LBrace),
-            '}' => single(TokenKind::RBrace),
+            '(' => self.open_bracket('(', TokenKind::LParen),
+            ')' => self.close_bracket('(', TokenKind::RParen),
+            '[' => self.open_bracket('[', TokenKind::LBracket),
+            ']' => self.close_bracket('[', TokenKind::RBracket),
+            '{' => self.open_bracket('{', TokenKind::LBrace),
+            '}' => self.close_bracket('{', TokenKind::RBrace),
             ',' => single(TokenKind::Comma),
             ':' => single(TokenKind::Colon),
             '|' => single(TokenKind::Pipe),
@@ -424,6 +420,24 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         };
         self.pos += len;
         self.push_code(kind, start, self.pos);
+    }
+
+    /// An opening bracket: one more open level if `bracket` continues a line.
+    fn open_bracket(&mut self, bracket: char, kind: TokenKind) -> (TokenKind, usize) {
+        if continues_line(bracket) {
+            self.open = self.open.saturating_add(1);
+        }
+        (kind, 1)
+    }
+
+    /// A closing bracket for the opening `bracket`: one open level less. With
+    /// nothing open it changes nothing, so a stray closer never ends a line
+    /// early or lets a later opener leak.
+    fn close_bracket(&mut self, bracket: char, kind: TokenKind) -> (TokenKind, usize) {
+        if continues_line(bracket) {
+            self.open = self.open.saturating_sub(1);
+        }
+        (kind, 1)
     }
 
     /// One or two character token: `two` if the next character is `next`.

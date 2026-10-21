@@ -351,11 +351,171 @@ fn open_paren_continues_the_line() {
 }
 
 #[test]
-fn brackets_and_braces_do_not_continue_a_line_in_v0_1() {
+fn brackets_and_braces_continue_a_line() {
+    // SYNTAX 3, SPEC 12.2: a line continues inside open `(`, `[` and `{`.
     assert!(continues_line('('));
-    assert!(!continues_line('['));
-    assert!(!continues_line('{'));
-    assert_eq!(kinds("a [\nb\n"), vec![Ident, LBracket, Nl, Ident, Nl, Eof]);
+    assert!(continues_line('['));
+    assert!(continues_line('{'));
+    assert!(!continues_line('<'));
+    assert_eq!(kinds("a [\nb\n"), vec![Ident, LBracket, Ident, Nl, Eof]);
+    assert_eq!(kinds("a {\nb\n"), vec![Ident, LBrace, Ident, Nl, Eof]);
+    assert_eq!(
+        kinds("a [\nb\n]\nc\n"),
+        vec![Ident, LBracket, Ident, RBracket, Nl, Ident, Nl, Eof]
+    );
+    assert_eq!(
+        kinds("a {\nb\n}\nc\n"),
+        vec![Ident, LBrace, Ident, RBrace, Nl, Ident, Nl, Eof]
+    );
+}
+
+#[test]
+fn a_multi_line_map_keeps_the_block_structure() {
+    // The lines of the literal produce no layout tokens; the line after the
+    // closing `]` is lexed as a line of the enclosing block again.
+    let src = "fn main()\n  let m = [\n    \"a\": 1,\n    \"b\": 2,\n  ]\n  m\nx\n";
+    assert_eq!(
+        kinds(src),
+        vec![
+            kw(Keyword::Fn),
+            Ident,
+            LParen,
+            RParen,
+            Nl,
+            Indent,
+            kw(Keyword::Let),
+            Ident,
+            Eq,
+            LBracket,
+            Str,
+            Colon,
+            Int,
+            Comma,
+            Str,
+            Colon,
+            Int,
+            Comma,
+            RBracket,
+            Nl,
+            Ident,
+            Nl,
+            Dedent,
+            Ident,
+            Nl,
+            Eof,
+        ]
+    );
+}
+
+#[test]
+fn indentation_inside_brackets_and_braces_is_not_checked() {
+    // Inside an open bracket indentation is ignored, as inside `(`: a tab, an
+    // odd column or a jump by several levels is no fault there.
+    for open in ["[", "{"] {
+        let close = if open == "[" { "]" } else { "}" };
+        let src = format!("a {open}\n\tb,\n   c,\n        d\n{close}\ne\n");
+        let (tokens, diags) = lex(&src);
+        assert!(diags.is_empty(), "{src:?}: {diags:?}");
+        let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+        assert!(!k.contains(&Indent), "{src:?}: {k:?}");
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 2, "{src:?}: {k:?}");
+    }
+}
+
+#[test]
+fn mixed_nesting_over_several_lines() {
+    assert_eq!(
+        kinds("f([\n{\n1\n}\n])\ng\n"),
+        vec![
+            Ident, LParen, LBracket, LBrace, Int, RBrace, RBracket, RParen, Nl, Ident, Nl, Eof,
+        ]
+    );
+}
+
+#[test]
+fn a_mismatched_closer_still_closes_one_level() {
+    // The lexer does not match bracket kinds (the parser reports the
+    // mismatch). Any closer ends one level, so a typo cannot pull the rest of
+    // the file into one logical line.
+    for src in ["a (]\nb\n", "a [)\nb\n", "a {)\nb\n", "a (}\nb\n", "a [}\nb\n"] {
+        let k = kinds(src);
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 2, "{src:?}: {k:?}");
+    }
+}
+
+#[test]
+fn stray_closers_do_not_break_layout_or_cancel_a_later_opener() {
+    assert_eq!(kinds("a]\nb\n"), vec![Ident, RBracket, Nl, Ident, Nl, Eof]);
+    assert_eq!(kinds("a}\nb\n"), vec![Ident, RBrace, Nl, Ident, Nl, Eof]);
+    // A stray closer before an opener does not make the opener a no-op.
+    assert_eq!(
+        kinds("a } ] [\nb\n]\nc\n"),
+        vec![Ident, RBrace, RBracket, LBracket, Ident, RBracket, Nl, Ident, Nl, Eof]
+    );
+}
+
+#[test]
+fn interpolation_braces_do_not_continue_a_line() {
+    // The `{` of an interpolation is not a bracket of the code around it, and
+    // brackets inside an interpolation never leak out of the string.
+    assert_eq!(
+        kinds("a \"{x}\"\nb\n"),
+        vec![Ident, StrHead, Ident, StrTail, Nl, Ident, Nl, Eof]
+    );
+    assert_eq!(
+        kinds("a \"{[x}\"\nb\n"),
+        vec![Ident, StrHead, LBracket, Ident, StrTail, Nl, Ident, Nl, Eof]
+    );
+    assert_eq!(
+        kinds("a \"{{x}}\"\nb\n"),
+        vec![Ident, StrHead, LBrace, Ident, RBrace, StrTail, Nl, Ident, Nl, Eof]
+    );
+    // A closer inside an interpolation does not close a bracket opened
+    // before the string.
+    assert_eq!(
+        kinds("a [\"{]}\"\nb]\nc\n"),
+        vec![Ident, LBracket, StrHead, RBracket, StrTail, Ident, RBracket, Nl, Ident, Nl, Eof]
+    );
+}
+
+#[test]
+fn unterminated_string_ends_an_open_bracket_or_brace() {
+    // As for `(`: the line end that cuts a string ends the logical line, so
+    // a missing quote does not pull the following lines into the literal.
+    for src in ["a [\"x\nb\n", "a {\"x\nb\n"] {
+        let (tokens, diags) = lex(src);
+        assert_eq!(first(&diags), Some((codes::UNTERMINATED_STRING, 3)), "{src:?}");
+        assert_eq!(diags.len(), 1, "{src:?}: {diags:?}");
+        let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+        assert_eq!(k.last(), Some(&Eof));
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 2, "{src:?}: {k:?}");
+    }
+}
+
+#[test]
+fn semicolon_and_comments_inside_brackets() {
+    // A `;` inside an open bracket is reported once and ends no line.
+    let (tokens, diags) = lex("a [1; 2\n]\nb\n");
+    assert_eq!(first(&diags), Some((codes::SEMICOLON, 4)));
+    assert_eq!(diags.len(), 1);
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert_eq!(k, vec![Ident, LBracket, Int, Int, RBracket, Nl, Ident, Nl, Eof]);
+    // A comment inside an open brace is trivia, the line goes on.
+    assert_eq!(
+        kinds("a { // c\n  b\n}\nd\n"),
+        vec![Ident, LBrace, Comment, Ident, RBrace, Nl, Ident, Nl, Eof]
+    );
+}
+
+#[test]
+fn a_style_line_inside_an_open_brace_starts_no_css_body() {
+    // `style` inside an open bracket is not a line of its own, so no CSS mode
+    // starts and `//` stays a code comment.
+    let (tokens, diags) = lex("a {\nstyle\n  // x\n}\nb\n");
+    assert!(diags.is_empty(), "{diags:?}");
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert!(!k.contains(&Css), "{k:?}");
+    assert!(k.contains(&Comment), "{k:?}");
 }
 
 #[test]
@@ -957,7 +1117,14 @@ fn hostile_inputs_end_with_eof_and_valid_spans() {
         " \t \t".into(),
         "{{{{}}}}".into(),
         "\"{{{{\"}}}}".into(),
+        "[[[[\n\t\n".into(),
+        "]]]]\n}}}}\n".into(),
+        "{\n  \"{]\n".into(),
+        "[\nstyle\n  /* x\n".into(),
+        "fn f()\n  a [\nb\n    ]\n      c\n".into(),
     ];
+    cases.push(format!("{}\n", "[".repeat(100_000)));
+    cases.push(format!("{}\nx\n", "]{".repeat(50_000)));
     cases.push(format!("\"{}", "{".repeat(100_000)));
     cases.push(format!("{}x", " ".repeat(100_001)));
     cases.push("a\n".repeat(10_000) + &"  ".repeat(5_000) + "b");
