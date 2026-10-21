@@ -74,6 +74,9 @@ pub(in crate::full) struct Fb<'c, 'h> {
     /// reachable.
     cur: Option<usize>,
     rule: Option<RuleCx>,
+    /// A predicate that mentions `me` returns `false` at its entry without
+    /// a principal; after that guard `me` is present.
+    me_guarded: bool,
     result: Ty,
 }
 
@@ -99,6 +102,7 @@ impl<'c, 'h> Fb<'c, 'h> {
             blocks: vec![Draft::default()],
             cur: Some(0),
             rule: None,
+            me_guarded: false,
             result: Ty::Unit,
         }
     }
@@ -168,6 +172,15 @@ impl<'c, 'h> Fb<'c, 'h> {
     ) -> Lowered<Function> {
         self.rule = Some(rule);
         self.result = Ty::Bool;
+        // A rule that mentions `me` is false as a whole without a principal
+        // (SYNTAX 4.4): `me` is never a value there, not even `none` under
+        // `!=`, `not` or `not in`.
+        if filter::mentions_me(self.cx.hir, cond) {
+            let at = filter::span(self.cx, cond);
+            let me = self.me(at)?;
+            self.deny_unless_some(me, at);
+            self.me_guarded = true;
+        }
         let value = self.value(cond, &Ty::Bool)?;
         self.terminate(Terminator::Return(Some(value)), filter::span(self.cx, cond));
         self.finish()
@@ -1087,17 +1100,25 @@ impl<'c, 'h> Fb<'c, 'h> {
         Ok(dst)
     }
 
-    /// `me` as a row. In a predicate a missing principal makes the rule
-    /// false (SYNTAX 4.4). Elsewhere the IR has no way yet to fail on a
-    /// missing `me`, so it is not lowered there.
+    /// `me` as a row. Only a predicate lowers it, and only behind the guard
+    /// at its entry, so `me` is present here (SYNTAX 4.4). Elsewhere the IR
+    /// has no way yet to fail on a missing `me`, so it is not lowered there.
     fn me_row(&mut self, at: Span) -> Lowered<Local> {
-        if self.kind != FnKind::Predicate {
+        if self.kind != FnKind::Predicate || !self.me_guarded {
             return Err(LowerError::Unsupported(at));
         }
         let me = self.me(at)?;
         let Ty::Optional(user) = self.ty(me) else {
             return Err(LowerError::Unchecked(at));
         };
+        let dst = self.local(*user);
+        self.emit(InstKind::Unwrap { dst, src: me }, at);
+        Ok(dst)
+    }
+
+    /// Returns `false` from the predicate when `me` is `none` and continues
+    /// in a new block otherwise.
+    fn deny_unless_some(&mut self, me: Local, at: Span) {
         let is = self.local(Ty::Bool);
         self.emit(InstKind::IsSome { dst: is, src: me }, at);
         let some = self.new_block();
@@ -1114,9 +1135,6 @@ impl<'c, 'h> Fb<'c, 'h> {
         let no = self.constant(Const::Bool(false), Ty::Bool, at);
         self.terminate(Terminator::Return(Some(no)), at);
         self.cur = Some(some);
-        let dst = self.local(*user);
-        self.emit(InstKind::Unwrap { dst, src: me }, at);
-        Ok(dst)
     }
 
     fn binary(

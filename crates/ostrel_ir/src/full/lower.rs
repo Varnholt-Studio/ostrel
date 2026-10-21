@@ -248,9 +248,8 @@ impl<'h> Cx<'h> {
             let mut see = None;
             for rule in model.rules.iter().filter(|r| r.op == hir::RuleOp::See) {
                 if see.is_some() {
-                    // ASSUMPTION: how several `see` rules of one model
-                    // combine is not stated; refused until it is.
-                    return Err(LowerError::Unsupported(rule.span));
+                    // At most one rule per verb (D180).
+                    return Err(LowerError::Unchecked(rule.span));
                 }
                 see = Some(filter::see_rule(self, hir::DefId(index as u32), rule.cond)?);
             }
@@ -346,7 +345,16 @@ impl<'h> Cx<'h> {
                 .models
                 .get(&def_id)
                 .ok_or(LowerError::Unchecked(def.span))?;
+            // At most one rule per verb and per field of `edit` (D180).
+            let mut seen = Vec::new();
             for rule in &model.rules {
+                if rule.op != hir::RuleOp::See {
+                    let key = (rule.op, rule.field);
+                    if seen.contains(&key) {
+                        return Err(LowerError::Unchecked(rule.span));
+                    }
+                    seen.push(key);
+                }
                 let (op, name) = match rule.op {
                     hir::RuleOp::See => continue,
                     hir::RuleOp::Make => (RuleOp::Make, "make"),

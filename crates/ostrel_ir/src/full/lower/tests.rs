@@ -73,6 +73,53 @@ fn rule_fn(p: &Program, id: RuleId) -> &Function {
     p.function(p.rule(id).unwrap().pred).unwrap()
 }
 
+/// `f` behind the `me != none` guard of a `see` rule that mentions `me`.
+fn signed_in(f: Filter) -> Filter {
+    Filter::And(vec![me_present(), f])
+}
+
+/// `me != none`.
+fn me_present() -> Filter {
+    Filter::Cmp(
+        CmpOp::Ne,
+        Box::new(Filter::Value(Operand::Me)),
+        Box::new(Filter::Value(Operand::Const(Const::None))),
+    )
+}
+
+/// True when the predicate returns `false` at its entry without a
+/// principal, before it computes anything else.
+fn denies_without_principal(f: &Function) -> bool {
+    let entry = &f.blocks[0];
+    let [
+        Inst {
+            kind: InstKind::Me { dst: me },
+            ..
+        },
+        Inst {
+            kind: InstKind::IsSome { dst: is, src },
+            ..
+        },
+    ] = entry.insts[..]
+    else {
+        return false;
+    };
+    let Terminator::Branch {
+        cond, otherwise, ..
+    } = entry.term
+    else {
+        return false;
+    };
+    let none = f.block(otherwise).unwrap();
+    src == me
+        && cond == is
+        && matches!(
+            none.insts[..],
+            [Inst { kind: InstKind::Const { dst, value: Const::Bool(false) }, .. }]
+                if none.term == Terminator::Return(Some(dst))
+        )
+}
+
 const CHAT: &str = "\
 app Chat
   auth paseto open
@@ -260,7 +307,7 @@ fn see_rules_become_filters_of_the_pushdown_subset() {
     let (_, m) = model(&p, "Message");
     assert_eq!(
         m.see,
-        Some(Filter::InSet {
+        Some(signed_in(Filter::InSet {
             elem: Box::new(Filter::Value(Operand::Me)),
             set: Path {
                 hops: vec![Hop {
@@ -269,7 +316,7 @@ fn see_rules_become_filters_of_the_pushdown_subset() {
                 }],
                 field: FieldRef::Declared(FieldId(1)),
             },
-        })
+        }))
     );
     // The std `User` keeps its own rules.
     let (_, user) = model(&p, "User");
@@ -288,7 +335,7 @@ fn see_rules_become_filters_of_the_pushdown_subset() {
     };
     assert_eq!(
         issue.see,
-        Some(Filter::Cmp(
+        Some(signed_in(Filter::Cmp(
             CmpOp::Ge,
             Box::new(Filter::Coalesce(
                 Box::new(Filter::MapGet {
@@ -298,21 +345,54 @@ fn see_rules_become_filters_of_the_pushdown_subset() {
                 Operand::Const(Const::Variant(EnumId(0), 0)),
             )),
             Box::new(Filter::Value(Operand::Const(Const::Variant(EnumId(0), 1)))),
-        ))
+        )))
     );
     let (_, t) = model(&p, "Team");
-    assert!(matches!(t.see, Some(Filter::InMap { .. })));
+    assert!(matches!(
+        &t.see,
+        Some(Filter::And(parts)) if matches!(parts[..], [_, Filter::InMap { .. }])
+    ));
 }
 
 #[test]
 fn a_see_rule_outside_the_subset_is_an_error() {
     let src = CHAT.replace("see if signed", "see if name.len > 3");
     assert_eq!(error_at(&src), ("unchecked", "name.len".to_string()));
-    let src = CHAT.replace("see if signed", "see if signed\n  see if name == \"a\"");
+}
+
+#[test]
+fn a_second_rule_of_one_verb_is_an_error() {
+    // At most one rule per verb, and one `edit f` per field (D180).
+    for (rule, second) in [
+        ("see if signed", "see if name == \"a\""),
+        ("make if members == {me}", "make if signed"),
+        (
+            "edit members if added == {me} or removed == {me}",
+            "edit members if signed",
+        ),
+    ] {
+        let src = CHAT.replace(rule, &format!("{rule}\n  {second}"));
+        assert_eq!(error_at(&src), ("unchecked", second.to_string()), "{rule}");
+    }
+    let src = TRACKER.replace(
+        "  drop if team.roles[me] == admin\n",
+        "  drop if team.roles[me] == admin\n  drop if signed\n",
+    );
+    assert_eq!(error_at(&src), ("unchecked", "drop if signed".to_string()));
+    let src = TRACKER.replace(
+        "  edit name if roles[me] == admin\n",
+        "  edit name if roles[me] == admin\n  edit name if signed\n",
+    );
     assert_eq!(
         error_at(&src),
-        ("unsupported", "see if name == \"a\"".to_string())
+        ("unchecked", "edit name if signed".to_string())
     );
+    // A record `edit` and an `edit f` guard different things.
+    let src = TRACKER.replace(
+        "  edit name if roles[me] == admin\n",
+        "  edit name if roles[me] == admin\n  edit if signed\n",
+    );
+    ok(&src);
 }
 
 #[test]
@@ -706,4 +786,88 @@ fn main()
         );
         assert_eq!(right.term, Terminator::Jump(join), "{name}");
     }
+}
+
+/// The cases of the review probe of T182 (ivo #2611): rules that mention
+/// `me` under `!=`, `not` and `not in`.
+const NEGATED: &str = "\
+app P
+  auth paseto open
+
+data Note
+  text: Text
+  blocked: Set[User]
+  see if not (me in blocked)
+  make if me not in blocked
+  edit text if me != author
+  drop if not (me in blocked)
+
+server fn f(n: Note) -> Int
+  call if not (me in n.blocked)
+  return 1
+";
+
+#[test]
+fn a_rule_that_mentions_me_is_false_without_a_principal() {
+    // SYNTAX 4.4: without a principal every rule that mentions `me` is
+    // false, also where `me` would be `none` under `!=`, `not` or `not in`.
+    let p = ok(NEGATED);
+    let (_, note) = model(&p, "Note");
+    let ops: Vec<RuleOp> = note.rules.iter().map(|&r| p.rule(r).unwrap().op).collect();
+    assert_eq!(ops, vec![RuleOp::Make, RuleOp::Edit, RuleOp::Drop]);
+    for &r in &note.rules {
+        let f = rule_fn(&p, r);
+        assert!(denies_without_principal(f), "{}: {:?}", f.name, f.blocks);
+    }
+    let (_, f) = func(&p, "f");
+    let call = p
+        .rule(f.prologue.as_ref().unwrap().call_rule.unwrap())
+        .unwrap();
+    let call = p.function(call.pred).unwrap();
+    assert!(denies_without_principal(call), "{:?}", call.blocks);
+
+    // The rule itself still runs behind the guard: `!=` compares `me` with
+    // the author, `not in` negates `Contains`.
+    let edit = rule_fn(&p, note.rules[1]);
+    assert!(insts(edit).any(|k| matches!(k, InstKind::Binary { op: BinOp::Ne, .. })));
+    let make = rule_fn(&p, note.rules[0]);
+    assert!(insts(make).any(|k| matches!(k, InstKind::Contains { .. })));
+    assert!(insts(make).any(|k| matches!(k, InstKind::Unary { op: UnOp::Not, .. })));
+
+    // The `see` filter is `And[me != none, f]` (D179).
+    let blocked = Path {
+        hops: Vec::new(),
+        field: FieldRef::Declared(FieldId(1)),
+    };
+    assert_eq!(
+        note.see,
+        Some(signed_in(Filter::Not(Box::new(Filter::InSet {
+            elem: Box::new(Filter::Value(Operand::Me)),
+            set: blocked,
+        }))))
+    );
+    let src = NEGATED.replace("see if not (me in blocked)", "see if author != me");
+    let p = ok(&src);
+    let (_, note) = model(&p, "Note");
+    assert!(matches!(
+        &note.see,
+        Some(Filter::And(parts)) if parts.len() == 2
+            && parts[0] == me_present()
+            && matches!(parts[1], Filter::Cmp(CmpOp::Ne, ..))
+    ));
+}
+
+#[test]
+fn a_rule_without_me_has_no_guard() {
+    let p = ok(CHAT);
+    let (_, room) = model(&p, "Room");
+    assert_eq!(room.see, Some(Filter::Value(Operand::Signed)));
+    let check = p.function(room.checks[0]).unwrap();
+    assert!(!insts(check).any(|k| matches!(k, InstKind::Me { .. })));
+    assert!(!denies_without_principal(check));
+    let src = NEGATED.replace("make if me not in blocked", "make if signed");
+    let p = ok(&src);
+    let (_, note) = model(&p, "Note");
+    let make = rule_fn(&p, note.rules[0]);
+    assert!(!insts(make).any(|k| matches!(k, InstKind::Me { .. })));
 }

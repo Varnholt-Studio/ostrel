@@ -21,9 +21,27 @@ pub(super) trait Operands {
     fn operand(&mut self, e: hir::ExprId) -> Lowered<Operand>;
 }
 
-/// The `see` rule of the model `row`.
+/// The `see` rule of the model `row`. A rule that mentions `me` is false
+/// as a whole without a principal (SYNTAX 4.4), also under `!=`, `not` and
+/// `not in`, so it becomes `And[me != none, f]` (D179).
 pub(super) fn see_rule(cx: &Cx<'_>, row: hir::DefId, cond: hir::ExprId) -> Lowered<Filter> {
-    filter(cx, row, cond, &mut Consts { cx })
+    let filter = Translate {
+        cx,
+        row,
+        ops: &mut Consts { cx },
+    }
+    .filter(cond)?;
+    let filter = if mentions_me(cx.hir, cond) {
+        let signed_in = Filter::Cmp(
+            CmpOp::Ne,
+            Box::new(Filter::Value(Operand::Me)),
+            Box::new(Filter::Value(Operand::Const(Const::None))),
+        );
+        Filter::And(vec![signed_in, filter])
+    } else {
+        filter
+    };
+    bounded(cx, cond, filter)
 }
 
 /// The filter of `e` over rows of the model `row`, with at most
@@ -35,10 +53,23 @@ pub(super) fn filter(
     ops: &mut dyn Operands,
 ) -> Lowered<Filter> {
     let filter = Translate { cx, row, ops }.filter(e)?;
+    bounded(cx, e, filter)
+}
+
+fn bounded(cx: &Cx<'_>, e: hir::ExprId, filter: Filter) -> Lowered<Filter> {
     if filter.nodes() > MAX_FILTER_NODES {
         return Err(LowerError::Unchecked(span(cx, e)));
     }
     Ok(filter)
+}
+
+/// True when `e` mentions `me` anywhere.
+pub(super) fn mentions_me(hir: &hir::Program, e: hir::ExprId) -> bool {
+    match hir.expr(e).map(|x| &x.kind) {
+        None => false,
+        Some(hir::ExprKind::Me) => true,
+        Some(kind) => children(kind).into_iter().any(|c| mentions_me(hir, c)),
+    }
 }
 
 /// The constant operands of a `see` rule.
