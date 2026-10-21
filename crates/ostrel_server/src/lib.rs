@@ -10,6 +10,9 @@
 //! * [`audit`] stores the audit entry of every elevated execution with the SHA-256 of the
 //!   canonical encoding of its argument list, never the arguments themselves (D117, D118).
 //! * [`secret`] holds a `replica_secret` (D111) and keeps it out of every `Debug` output.
+//! * [`outbound`] keeps every message to the client within the frame limit (D121): it
+//!   pages snapshots and server ops by bytes and turns an oversized `Return` into
+//!   `CallError` `Limit`.
 //! * [`host`] is the [`ostrel_vm::host::ServerHost`] of one VM task, and [`task`] runs a
 //!   program image with it next to the database connection of the task.
 //!
@@ -40,6 +43,7 @@ compile_error!(
 pub mod audit;
 pub mod host;
 pub mod identity;
+pub mod outbound;
 pub mod secret;
 pub mod task;
 
