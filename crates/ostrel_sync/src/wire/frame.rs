@@ -200,7 +200,9 @@ pub fn encode_client(msg: &ClientMsg, schema: &dyn WireSchema) -> Result<String,
 ///
 /// A frame over the frame limit is an error: the server never sends one (D121). The one
 /// exception is a `return` whose result does not fit: it is written with `CallError::Limit`
-/// instead of the result (D121). [`super::snapshot_pages`] and [`super::ops_pages`] split
+/// instead of the result (D121). The result of a `return` must fit the result type of the
+/// function of its call, which comes from `requests`; one that does not is
+/// [`WireError::Value`], because the client would refuse it and close the connection. [`super::snapshot_pages`] and [`super::ops_pages`] split
 /// rows and ops into frames that fit.
 pub fn encode_server(
     msg: &ServerMsg,
@@ -269,6 +271,9 @@ pub fn encode_server(
         }
         ServerMsg::Ops(ops) => vec![("ops", server_ops(ops, schema)?)],
         ServerMsg::Return { call, result } => {
+            if let Ok(value) = result {
+                check_result(*call, value, schema, requests)?;
+            }
             let frame = close(msg.name(), return_fields(*call, result)?);
             return match frame {
                 Err(WireError::FrameTooLarge { .. }) if result.is_ok() => {
@@ -735,6 +740,30 @@ fn op_within_limit(op: &Op, schema: &dyn WireSchema) -> Result<String, WireError
         });
     }
     Ok(text)
+}
+
+/// Checks that the result of a call fits the result type of its function, by reading its
+/// encoding back the way [`decode_server`] does. Reading it back, rather than checking the
+/// value on its own, keeps writer and reader from ever disagreeing on what fits.
+fn check_result(
+    call: CallId,
+    value: &Value,
+    schema: &dyn WireSchema,
+    requests: &dyn Requests,
+) -> Result<(), WireError> {
+    let function = requests
+        .call_function(call)
+        .ok_or(WireError::UnknownCall(call))?;
+    let ty = schema
+        .function_result(function)
+        .ok_or(WireError::NotInSchema("function"))?;
+    let written = json::parse(encode(value).as_bytes())?;
+    read_value(ty, written)
+        .map(drop)
+        .map_err(|fault| WireError::Value {
+            key: "result",
+            fault,
+        })
 }
 
 /// The fields of a `return`.

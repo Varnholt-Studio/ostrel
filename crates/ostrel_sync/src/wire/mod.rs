@@ -133,7 +133,8 @@ pub trait WireSchema {
 /// What one side of a session knows about its own open requests (module documentation).
 ///
 /// The client implements it from its subscriptions and the calls it sent and has not settled;
-/// the server from the subscriptions of the session.
+/// the server from the subscriptions of the session and the calls it has not answered yet,
+/// because [`encode_server`] checks the result of a `return` against its function.
 pub trait Requests {
     /// The model of an open subscription.
     fn subscription_model(&self, sub: SubId) -> Option<ModelId>;
@@ -186,8 +187,8 @@ pub enum WireError {
     /// [`MAX_ECHO_BYTES`]). Client and server share one compiled schema, so this is a fatal
     /// mismatch; an unknown model in a client op only makes that op invalid.
     UnknownModel(String),
-    /// Writing: the schema does not know this kind of id (`"model"` or `"field"`). A defect
-    /// of the caller, never caused by a peer.
+    /// Writing: the schema does not know this kind of id (`"model"`, `"field"` or
+    /// `"function"`). A defect of the caller, never caused by a peer.
     NotInSchema(&'static str),
     /// Writing: a [`DecodedOp::Invalid`] with this op id. Such an op exists only on the
     /// receiving side and is never sent (D135). A defect of the caller.
@@ -202,7 +203,8 @@ pub enum WireError {
     /// [`MAX_ECHO_BYTES`]); fatal like [`WireError::UnknownModel`].
     UnknownField(String),
     /// A value of a server message does not fit its type in the receiver's schema; fatal like
-    /// [`WireError::UnknownModel`].
+    /// [`WireError::UnknownModel`]. On writing the result of a `return`, a defect of the
+    /// caller.
     Value {
         key: &'static str,
         fault: ValueFault,
@@ -221,7 +223,8 @@ pub enum WireError {
     /// it just ended. The client drops it. On writing, a defect of the caller.
     UnknownSubscription(SubId),
     /// Not fatal: a `return` for a call that is not waiting, for example one that already
-    /// failed with `OutcomeUnknown`; the client drops it (ARCHITECTURE 5.7).
+    /// failed with `OutcomeUnknown`; the client drops it (ARCHITECTURE 5.7). On writing a
+    /// successful `return`, a defect of the caller.
     UnknownCall(CallId),
 }
 

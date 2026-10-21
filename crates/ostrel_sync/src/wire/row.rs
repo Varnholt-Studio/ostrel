@@ -12,7 +12,8 @@
 //! `fields` holds the column fields, the implicit `made`, `changed` and `author` included.
 //! `sets` lists each element once with the tags of all its live adds, and `maps` every entry
 //! ever written, removed ones with `"removed": true`; both in the order of
-//! [`CollectionState`]. A row belongs to the model of its subscription, which the wire does not
+//! [`CollectionState`], and a reader refuses any other order or a repeated element, tag or
+//! key. A row belongs to the model of its subscription, which the wire does not
 //! name ([`super::Requests`]).
 //!
 //! The row `version` is internal to the database and does not travel: a row read from the wire
@@ -199,7 +200,10 @@ impl Reader<'_> {
         value(key, ty, json)
     }
 
-    /// `[[elem, [tag, ...]], ...]`, every element with at least one tag.
+    /// `[[elem, [tag, ...]], ...]`, every element with at least one tag. Elements stand in
+    /// strictly ascending [`compare_key`] order and the tags of one element in strictly
+    /// ascending order, as [`CollectionState::Set`] stores them; a repeated or unsorted
+    /// element or tag does not fit.
     fn set(
         &self,
         key: &'static str,
@@ -210,25 +214,34 @@ impl Reader<'_> {
         let WireTy::Set(elem_ty) = ty else {
             return Err(WireError::WrongType(key));
         };
-        let mut tags = Vec::new();
+        let mut tags: Vec<SetTag> = Vec::new();
         for group in items(key, json)? {
             let [elem, group_tags] = pair(key, group)?;
             let elem = value(key, elem_ty, elem)?;
             let group_tags = items(key, group_tags)?;
-            if group_tags.is_empty() {
+            let after_previous = tags
+                .last()
+                .is_none_or(|last| compare_key(&last.elem, &elem) == Ordering::Less);
+            if group_tags.is_empty() || !after_previous {
                 return Err(WireError::WrongType(key));
             }
+            let first = tags.len();
             for tag in group_tags {
+                let tag = op_id(key, tag)?;
+                if tags[first..].last().is_some_and(|last| last.tag >= tag) {
+                    return Err(WireError::WrongType(key));
+                }
                 tags.push(SetTag {
                     elem: elem.clone(),
-                    tag: op_id(key, tag)?,
+                    tag,
                 });
             }
         }
         Ok(CollectionState::Set(tags))
     }
 
-    /// `[[key, {"hlc", "value"}] or [key, {"hlc", "removed": true}], ...]`.
+    /// `[[key, {"hlc", "value"}] or [key, {"hlc", "removed": true}], ...]`, keys in strictly
+    /// ascending [`compare_key`] order as [`CollectionState::Map`] stores them.
     fn map(
         &self,
         key: &'static str,
@@ -256,8 +269,15 @@ impl Reader<'_> {
                 Some(f.req("value", |k, json| value(k, value_ty, json))?)
             };
             f.finish()?;
+            let map_key = value(key, key_ty, map_key)?;
+            let after_previous = entries
+                .last()
+                .is_none_or(|last: &MapEntry| compare_key(&last.key, &map_key) == Ordering::Less);
+            if !after_previous {
+                return Err(WireError::WrongType(key));
+            }
             entries.push(MapEntry {
-                key: value(key, key_ty, map_key)?,
+                key: map_key,
                 value: entry_value,
                 hlc: stamp,
             });

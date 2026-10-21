@@ -54,7 +54,8 @@ fn fields(model: ModelId) -> &'static [(&'static str, WireTy)] {
     all.get(model as usize).map_or(&[], Vec::as_slice)
 }
 
-/// Functions: `rename(room: Room, name: Text) -> Bool` and `count() -> Int`.
+/// Functions: `rename(room: Room, name: Text) -> Bool`, `count() -> Int` and
+/// `names() -> List<Text>`.
 fn functions() -> &'static [(&'static str, Vec<WireTy>, WireTy)] {
     use std::sync::OnceLock;
     static FUNCTIONS: OnceLock<Vec<(&'static str, Vec<WireTy>, WireTy)>> = OnceLock::new();
@@ -62,6 +63,7 @@ fn functions() -> &'static [(&'static str, Vec<WireTy>, WireTy)] {
         vec![
             ("rename", vec![WireTy::Ref, WireTy::Text], WireTy::Bool),
             ("count", vec![], WireTy::Int),
+            ("names", vec![], WireTy::List(Box::new(WireTy::Text))),
         ]
     })
 }
@@ -119,6 +121,7 @@ impl WireSchema for Schema {
 
 const RENAME: FnId = 0;
 const COUNT: FnId = 1;
+const NAMES: FnId = 2;
 
 /// Open requests of one side: subscriptions with their model, calls with their function.
 #[derive(Default)]
@@ -140,7 +143,7 @@ impl Requests for Open {
 fn open() -> Open {
     Open {
         subs: BTreeMap::from([(1, ROOM), (2, PERSON)]),
-        calls: BTreeMap::from([(7, RENAME), (8, COUNT)]),
+        calls: BTreeMap::from([(7, RENAME), (8, COUNT), (9, NAMES)]),
     }
 }
 
@@ -669,24 +672,78 @@ fn a_malformed_return_is_fatal() {
     }
 }
 
+/// A `List<Text>` whose canonical encoding is exactly `bytes` long (at least 4), made of
+/// texts under the text limit, so that only the frame limit can refuse it.
+fn names_of_len(bytes: usize) -> Value {
+    const CHUNK: usize = 200_000;
+    // `[` and `]`, two quotes per text and a comma between texts.
+    let count = bytes.div_ceil(CHUNK);
+    let payload = bytes - (2 + 2 * count + (count - 1));
+    let names = (0..count)
+        .map(|at| text(&"x".repeat(payload / count + usize::from(at < payload % count))))
+        .collect();
+    let value = Value::List(names);
+    assert_eq!(ostrel_core::canon::encode(&value).len(), bytes);
+    value
+}
+
 #[test]
 fn a_return_over_the_frame_limit_becomes_call_error_limit() {
-    let big = |len| ServerMsg::Return {
-        call: 7,
-        result: Ok(text(&"x".repeat(len))),
+    let big = |value| ServerMsg::Return {
+        call: 9,
+        result: Ok(value),
     };
-    // `{"call":7,"result":{"ok":"..."},"t":"return","v":0}` without the text.
-    let envelope = encode_server(&big(0), &Schema, &open()).unwrap().len();
-    let fits = encode_server(&big(FRAME - envelope), &Schema, &open()).unwrap();
+    // `{"call":9,"result":{"ok":[]},"t":"return","v":0}` without the list `[]`.
+    let envelope = encode_server(&big(Value::List(Vec::new())), &Schema, &open())
+        .unwrap()
+        .len()
+        - 2;
+    let fits_msg = big(names_of_len(FRAME - envelope));
+    let fits = encode_server(&fits_msg, &Schema, &open()).unwrap();
     assert_eq!(fits.len(), FRAME);
-    let over = encode_server(&big(FRAME - envelope + 1), &Schema, &open()).unwrap();
+    assert_eq!(server(&fits), Ok(fits_msg));
+    let over = encode_server(&big(names_of_len(FRAME - envelope + 1)), &Schema, &open()).unwrap();
     assert_eq!(
         server(&over),
         Ok(ServerMsg::Return {
-            call: 7,
+            call: 9,
             result: Err(CallError::Limit)
         })
     );
+}
+
+#[test]
+fn a_return_whose_result_does_not_fit_its_function_is_never_written() {
+    let write = |call, result| encode_server(&ServerMsg::Return { call, result }, &Schema, &open());
+    // `rename` returns `Bool`, `count` returns `Int`.
+    assert_eq!(
+        write(7, Ok(int(1))),
+        Err(WireError::Value {
+            key: "result",
+            fault: ValueFault::WrongType,
+        })
+    );
+    assert_eq!(
+        write(8, Ok(Value::Null)),
+        Err(WireError::Value {
+            key: "result",
+            fault: ValueFault::WrongType,
+        })
+    );
+    // A text over the text limit would close the client's connection too.
+    let long = text(&"x".repeat(LIMITS.text_bytes as usize + 1));
+    assert_eq!(
+        write(9, Ok(Value::List(vec![long]))),
+        Err(WireError::Value {
+            key: "result",
+            fault: ValueFault::TextTooLong,
+        })
+    );
+    // A successful result needs the call's function; an error does not, so the server can
+    // refuse a call it never accepted.
+    assert_eq!(write(99, Ok(int(1))), Err(WireError::UnknownCall(99)));
+    assert!(write(99, Err(CallError::NotFound)).is_ok());
+    assert!(write(8, Ok(int(1))).is_ok());
 }
 
 // -------------------------------------------------------------------------------------------
@@ -803,6 +860,26 @@ fn a_snapshot_for_a_subscription_the_client_ended_is_dropped() {
     let error = server(frame).unwrap_err();
     assert_eq!(error, WireError::UnknownSubscription(5));
     assert!(!error.closes_connection());
+    // The rows of an ended subscription are never read (D155): rows of its model and rows that
+    // fit no model of the schema are dropped alike, and the connection stays open.
+    let rows_of = |sub: SubId| {
+        let open_frame = server_round_trip(ServerMsg::Snapshot {
+            sub,
+            rows: vec![room_row(20), room_row(21)],
+            seq: ServerSeq(9),
+            last: false,
+        });
+        open_frame.replace(&format!(r#""sub":{sub}"#), r#""sub":5"#)
+    };
+    let foreign = format!(
+        r#"{{"last":false,"rows":[{{"fields":{{"gone":1}},"id":"{}","maps":{{}},"sets":{{"name":7}}}},"#,
+        row(20).to_hex()
+    ) + r#""not a row"],"seq":"0000000000000009","sub":5,"t":"snapshot","v":0}"#;
+    for frame in [rows_of(1), foreign] {
+        let error = server(&frame).unwrap_err();
+        assert_eq!(error, WireError::UnknownSubscription(5), "{frame}");
+        assert!(!error.closes_connection());
+    }
     assert_eq!(
         encode_server(
             &ServerMsg::Snapshot {
@@ -822,7 +899,31 @@ fn a_snapshot_for_a_subscription_the_client_ended_is_dropped() {
 fn a_row_that_does_not_fit_the_schema_is_fatal() {
     let id = row(20).to_hex();
     let tag = op_id(1).to_hex();
+    let tag2 = op_id(2).to_hex();
     let member = row(2).to_hex();
+    let other = row(3).to_hex();
+    let sets = |groups: &[(&str, &[&str])]| {
+        let groups: Vec<String> = groups
+            .iter()
+            .map(|(elem, tags)| {
+                let tags: Vec<String> = tags.iter().map(|t| format!(r#""{t}""#)).collect();
+                format!(r#"["{elem}",[{}]]"#, tags.join(","))
+            })
+            .collect();
+        format!(r#"{{"members":[{}]}}"#, groups.join(","))
+    };
+    let maps = |keys: &[&str]| {
+        let entries: Vec<String> = keys
+            .iter()
+            .map(|key| {
+                format!(
+                    r#"["{key}",{{"hlc":"{}","value":"admin"}}]"#,
+                    stamp(1).to_hex()
+                )
+            })
+            .collect();
+        format!(r#"{{"roles":[{}]}}"#, entries.join(","))
+    };
     let row_frame = |row: &str| {
         format!(
             r#"{{"last":true,"rows":[{row}],"seq":"0000000000000001","sub":1,"t":"snapshot","v":0}}"#
@@ -912,6 +1013,35 @@ fn a_row_that_does_not_fit_the_schema_is_fatal() {
         (
             row_frame(&format!(r#"{{"fields":{{}},"id":"{id}","sets":{{}}}}"#)),
             WireError::MissingKey("maps"),
+        ),
+        // Set elements and their tags, and map keys, come in the stored order, each once.
+        (
+            row_with(
+                "{}",
+                &sets(&[(&member, &[&tag]), (&member, &[&tag2])]),
+                "{}",
+            ),
+            WireError::WrongType("sets"),
+        ),
+        (
+            row_with("{}", &sets(&[(&other, &[&tag]), (&member, &[&tag2])]), "{}"),
+            WireError::WrongType("sets"),
+        ),
+        (
+            row_with("{}", &sets(&[(&member, &[&tag, &tag])]), "{}"),
+            WireError::WrongType("sets"),
+        ),
+        (
+            row_with("{}", &sets(&[(&member, &[&tag2, &tag])]), "{}"),
+            WireError::WrongType("sets"),
+        ),
+        (
+            row_with("{}", "{}", &maps(&[&member, &member])),
+            WireError::WrongType("maps"),
+        ),
+        (
+            row_with("{}", "{}", &maps(&[&other, &member])),
+            WireError::WrongType("maps"),
         ),
         (
             row_frame(&format!(
