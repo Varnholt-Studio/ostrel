@@ -441,6 +441,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostrel_codegen_js"
+version = "0.1.0"
+dependencies = [
+ "ostrel_core",
+ "ostrel_ir",
+]
+
+[[package]]
 name = "ostrel_core"
 version = "0.1.0"
 

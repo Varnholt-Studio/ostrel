@@ -1,0 +1,104 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>leader tab</title>
+<script type="module">
+  // One real browser tab of the two tab check (run_chromium.mjs). It joins the election with
+  // the real Web Locks and BroadcastChannel, drains the shared outbox when it becomes leader and
+  // executes commands from the runner. Every observation is posted to the runner as an event.
+  import { createTabLeader } from '../leader.mjs';
+  import { openOutbox } from '../../outbox/outbox.mjs';
+
+  const params = new URLSearchParams(location.search);
+  const tab = params.get('tab');
+  const DB = params.get('db');
+  const USER = 'user-alice';
+  const REPLICA = '00000000000000a1';
+  // A reload keeps the tab name but must be a new tab id, as for a real page load.
+  const tabId = `${tab}-${crypto.randomUUID()}`;
+
+  function report(event) {
+    return fetch('/event', { method: 'POST', body: JSON.stringify({ tab, tabId, ...event }) });
+  }
+
+  const outbox = await openOutbox({ indexedDB, IDBKeyRange, name: DB });
+
+  // Drains the outbox once on taking over, then leads until the signal aborts. The check has
+  // no server, so "sent" means removed from the outbox and reported to the runner.
+  async function onLead({ signal }) {
+    await report({ e: 'lead' });
+    const pending = await outbox.pending({ user: USER, replica: REPLICA, limit: 1000 });
+    const opIds = pending.map((entry) => entry.opId);
+    await outbox.remove(opIds);
+    await report({ e: 'drained', opIds });
+    await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+  }
+
+  const leader = createTabLeader({
+    tabId,
+    locks: navigator.locks,
+    openChannel: (name) => new BroadcastChannel(name),
+    onLead,
+    onMessage: (msg) => report({ e: 'message', kind: msg.kind, body: msg.body }),
+    onError: (err) => report({ e: 'error', detail: String(err?.stack ?? err) }),
+    lockName: params.get('lock'),
+    channelName: params.get('lock'),
+    retryMs: 100,
+  });
+
+  async function execute(command) {
+    switch (command.do) {
+      case 'state': {
+        const locks = await navigator.locks.query();
+        const name = params.get('lock');
+        await report({
+          e: 'state',
+          isLeader: leader.isLeader(),
+          leaderId: leader.leaderId(),
+          held: locks.held.filter((lock) => lock.name === name).length,
+          waiting: locks.pending.filter((lock) => lock.name === name).length,
+        });
+        break;
+      }
+      case 'post':
+        await report({ e: 'posted', ok: leader.post(command.body) });
+        break;
+      case 'broadcast':
+        await report({ e: 'broadcasted', ok: leader.broadcast(command.body) });
+        break;
+      case 'append': {
+        const opIds = [];
+        for (let i = 0; i < command.count; i += 1) {
+          const entry = await outbox.append({
+            user: USER,
+            replica: REPLICA,
+            op: { kind: 'set', row: 'r1', field: 'title', value: `${tab}-${i}` },
+          });
+          opIds.push(entry.opId);
+        }
+        await report({ e: 'appended', opIds });
+        break;
+      }
+      case 'reload':
+        location.reload();
+        return false;
+      default:
+        await report({ e: 'error', detail: `unknown command ${command.do}` });
+    }
+    return true;
+  }
+
+  leader.start();
+  await report({ e: 'started' });
+  // Long poll for commands; the loop ends when the tab reloads or is closed.
+  for (;;) {
+    let command;
+    try {
+      const response = await fetch(`/next?tab=${encodeURIComponent(tab)}`);
+      command = await response.json();
+    } catch {
+      break;
+    }
+    if (!(await execute(command))) break;
+  }
+</script>
+<body></body>
