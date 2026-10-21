@@ -1398,10 +1398,10 @@ impl<'c, 'h> Fb<'c, 'h> {
         };
         let sort = match q.sort {
             None => None,
-            // The order without `sort` is by id ascending (SPEC 12.10).
-            Some((hir::FieldRef::Implicit(hir::ImplicitField::Id), false)) => None,
-            Some((hir::FieldRef::Implicit(hir::ImplicitField::Id), true)) => {
-                return Err(LowerError::Unsupported(at));
+            // `id` is no sort key, ascending or not (D181): `check` reports
+            // it.
+            Some((hir::FieldRef::Implicit(hir::ImplicitField::Id), _)) => {
+                return Err(LowerError::Unchecked(at));
             }
             Some((field, desc)) => Some((field_ref(field), desc)),
         };

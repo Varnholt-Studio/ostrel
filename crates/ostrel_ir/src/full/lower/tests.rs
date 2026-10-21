@@ -693,17 +693,17 @@ fn what_is_not_lowered_yet_is_an_error_never_a_silent_gap() {
         "{CHAT}\nserver fn mine() -> Room\n  make Room {{ name: \"a\", members: {{me}} }}\n"
     );
     assert_eq!(error_at(&src), ("unsupported", "me".to_string()));
-    // `sort id desc` (SPEC 12.10 does not say whether `sort id` is source).
-    let src = TRACKER.replace("sort title limit 50", "sort id desc");
-    assert_eq!(error_at(&src).0, "unsupported");
 }
 
 #[test]
-fn sort_id_ascending_is_the_order_without_sort() {
-    let src = TRACKER.replace("sort title limit 50", "sort id");
-    let p = ok(&src);
-    let (_, count) = func(&p, "count");
-    assert!(insts(count).any(|k| matches!(k, InstKind::Query { plan, .. } if plan.sort.is_none())));
+fn sort_id_is_no_sort_key() {
+    // `sort id` and `sort id desc` are compile errors (D181); a program
+    // that reaches `lower` with one is unchecked, never a query without
+    // `sort`.
+    for sort in ["sort id", "sort id desc"] {
+        let src = TRACKER.replace("sort title limit 50", sort);
+        assert_eq!(error_at(&src).0, "unchecked", "{sort}");
+    }
 }
 
 #[test]
