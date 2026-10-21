@@ -43,6 +43,14 @@ struct Faults {
     forget_last_seq: bool,
     /// `record_reject` of an op that already has an outcome replaces it.
     overwrite_outcome: bool,
+    /// `append_ops` numbers the ops of a call from 1 again, so it gives committed positions
+    /// again.
+    reuse_position: bool,
+    /// A rolled back transaction leaves a gap of ten positions, as a sequence that is not
+    /// rolled back does. The position contract allows it (D154).
+    gap_after_rollback: bool,
+    /// `ops_since` returns the log in reverse position order.
+    reverse_log: bool,
 }
 
 #[derive(Clone)]
@@ -61,6 +69,9 @@ struct Log {
     ops: Vec<StoredOp>,
     rejects: BTreeMap<OpId, String>,
     last: BTreeMap<ReplicaId, u32>,
+    /// Positions handed out so far, committed or not. Only kept apart from `ops` when
+    /// `gap_after_rollback` is set; otherwise a rolled back position is given again.
+    issued: u64,
 }
 
 impl Log {
@@ -88,8 +99,15 @@ impl Log {
                 return Err(DbError::Conflict);
             }
         }
-        for op in ops {
-            let seq = ServerSeq(self.ops.len() as u64 + 1);
+        let base = if faults.reuse_position {
+            0
+        } else if faults.gap_after_rollback {
+            self.issued
+        } else {
+            self.ops.last().map_or(0, |o| o.seq.0)
+        };
+        for (i, op) in ops.iter().enumerate() {
+            let seq = ServerSeq(base + i as u64 + 1);
             self.ops.push(StoredOp {
                 seq,
                 op: op.clone(),
@@ -98,7 +116,18 @@ impl Log {
                 self.raise(op.id);
             }
         }
-        Ok(ServerSeq(self.ops.len() as u64))
+        self.issued = self.issued.max(base + ops.len() as u64);
+        Ok(self.ops.last().map_or(ServerSeq(0), |o| o.seq))
+    }
+
+    fn since(&self, after: ServerSeq, limit: u32, faults: Faults) -> Vec<StoredOp> {
+        let mut out: Vec<StoredOp> = self.ops.iter().filter(|o| o.seq > after).cloned().collect();
+        out.sort_by_key(|o| o.seq);
+        out.truncate(limit as usize);
+        if faults.reverse_log {
+            out.reverse();
+        }
+        out
     }
 
     fn reject(&mut self, op: OpId, reason: &str, faults: Faults) -> Result<(), DbError> {
@@ -345,10 +374,11 @@ impl<'c> Transaction<'c> for RefTx<'c> {
     }
     fn ops_since<'a>(
         &'a mut self,
-        _after: ServerSeq,
-        _limit: u32,
+        after: ServerSeq,
+        limit: u32,
     ) -> BoxFuture<'a, Result<Vec<StoredOp>, DbError>> {
-        Box::pin(async { Err(DbError::Unsupported("op log")) })
+        let faults = self.conn.faults;
+        Box::pin(async move { Ok(self.work.log.since(after, limit, faults)) })
     }
     fn next_in_sequence<'a>(&'a mut self, _key: &'a str) -> BoxFuture<'a, Result<u64, DbError>> {
         Box::pin(async { Err(DbError::Unsupported("sequences")) })
@@ -365,6 +395,10 @@ impl<'c> Transaction<'c> for RefTx<'c> {
             let tx = *self;
             if tx.conn.faults.rollback_commits {
                 *tx.conn.state.borrow_mut() = tx.work;
+            } else if tx.conn.faults.gap_after_rollback {
+                // The positions stay used, as with a sequence outside the transaction.
+                let mut state = tx.conn.state.borrow_mut();
+                state.log.issued = state.log.issued.max(tx.work.log.issued);
             }
             Ok(())
         })
@@ -1057,4 +1091,168 @@ fn new_driver_per_case_passes_the_connect_error_on() {
             .message
             .contains("connect failed with Unsupported")
     );
+}
+
+/// The position faults of the reference driver break exactly the position cases (D154), and a
+/// driver that leaves gaps after a rollback, as a PostgreSQL sequence does, still conforms.
+#[test]
+fn position_faults_fail_their_cases() {
+    let text = std::fs::read_to_string(super::cases_dir().join("ac_10_positions.json")).unwrap();
+    let all: &[&str] = &[
+        "ac_10_append_positions_after_commit",
+        "ac_10_append_positions_after_failed_call",
+        "ac_10_append_positions_after_rollback",
+    ];
+    let table: [(&str, Faults, &[&str]); 4] = [
+        (
+            "reuse_position",
+            Faults {
+                reuse_position: true,
+                ..Faults::default()
+            },
+            all,
+        ),
+        (
+            "reverse_log",
+            Faults {
+                reverse_log: true,
+                ..Faults::default()
+            },
+            all,
+        ),
+        (
+            "rollback_commits",
+            Faults {
+                rollback_commits: true,
+                ..Faults::default()
+            },
+            &[
+                "ac_10_append_positions_after_failed_call",
+                "ac_10_append_positions_after_rollback",
+            ],
+        ),
+        (
+            "gap_after_rollback",
+            Faults {
+                gap_after_rollback: true,
+                ..Faults::default()
+            },
+            &[],
+        ),
+    ];
+    assert!(run_ref(&text, Faults::default()).is_ok());
+    for (label, faults, expected) in table {
+        let report = run_ref(&text, faults);
+        assert_eq!(failed(&report), expected, "fault {label}: {report}");
+    }
+}
+
+/// The gap fault really leaves gaps, so the case above proves that positions are compared by
+/// order only.
+#[test]
+fn gap_after_rollback_leaves_a_gap() {
+    let faults = Faults {
+        gap_after_rollback: true,
+        ..Faults::default()
+    };
+    let mut conn = block_on(fresh_ref(faults)).unwrap();
+    let op = |replica: u64| NewOp {
+        id: OpId {
+            replica: ReplicaId(replica),
+            seq: 1,
+        },
+        hlc: ostrel_db::api::Hlc::new(1, 0, ReplicaId(replica)).unwrap(),
+        model: 0,
+        row: RowId::from_hex(&format!("{:032x}", 1)).unwrap(),
+        body: Vec::new(),
+    };
+    block_on(async {
+        let mut tx = conn.begin().await.unwrap();
+        assert_eq!(tx.append_ops(&[op(1)]).await, Ok(ServerSeq(1)));
+        tx.rollback().await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        assert_eq!(tx.append_ops(&[op(2)]).await, Ok(ServerSeq(2)));
+        tx.commit().await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        let log = tx.ops_since(ServerSeq(0), 10).await.unwrap();
+        assert_eq!(
+            log.iter().map(|o| o.seq).collect::<Vec<_>>(),
+            [ServerSeq(2)]
+        );
+        tx.rollback().await.unwrap();
+    });
+}
+
+#[test]
+fn ops_since_and_rollback_steps_report_deviations() {
+    let op = |seq: u32| {
+        format!(
+            r#"{{"replica": "1", "seq": {seq}, "wall": 0, "model": 0, "row": "1", "body": ""}}"#
+        )
+    };
+    let (a, b) = (op(1), op(2));
+    let text = with_case(&format!(
+        r#"{{"tx": [{{"append_ops": [{a}, {b}]}}], "expect": "ok"}},
+           {{"ops_since": 0, "expect": [{b}, {a}]}},
+           {{"ops_since": 0, "expect": [{a}]}},
+           {{"ops_since": 1, "expect": [{b}]}},
+           {{"tx": [{{"delete": {{"model": 0, "row": "1", "expect_version": 1}}}}], "expect": "rollback"}},
+           {{"replay": {{"replica": "1", "seq": 1}}, "expect": {{"accepted": {{"position": 1, "op": {a}}}}}}}"#
+    ));
+    let report = run_ref(&text, Faults::default());
+    let got: Vec<(usize, &str)> = report
+        .failures
+        .iter()
+        .map(|f| (f.step, f.message.as_str()))
+        .collect();
+    assert_eq!(got.len(), 3, "{report}");
+    assert_eq!(got[0].0, 1);
+    assert!(got[0].1.contains("op 0: expected"), "{report}");
+    assert_eq!(got[1].0, 2);
+    assert!(got[1].1.contains("expected 1 ops, got 2"), "{report}");
+    assert_eq!(got[2].0, 4);
+    assert!(
+        got[2].1.contains("write 0 failed with NotFound"),
+        "{report}"
+    );
+    // A rolled back step changes nothing.
+    let rolled = with_case(&format!(
+        r#"{{"tx": [{{"append_ops": [{a}]}}], "expect": "rollback"}},
+           {{"ops_since": 0, "expect": []}},
+           {{"last_seq": "1", "expect": 0}}"#
+    ));
+    run_ref(&rolled, Faults::default()).assert_passed();
+    let report = run_ref(
+        &rolled,
+        Faults {
+            rollback_commits: true,
+            ..Faults::default()
+        },
+    );
+    assert_eq!(report.failures.len(), 2, "{report}");
+}
+
+#[test]
+fn decode_rejects_invalid_ops_since_steps() {
+    for (step, needle) in [
+        (r#"{"ops_since": -1, "expect": []}"#, "non negative"),
+        (r#"{"ops_since": "0", "expect": []}"#, "expected a number"),
+        (r#"{"ops_since": 0, "expect": {}}"#, "expected an array"),
+        (r#"{"ops_since": 0}"#, "missing key"),
+        (
+            r#"{"ops_since": 0, "expect": [], "limit": 1}"#,
+            "unknown key",
+        ),
+        (
+            r#"{"ops_since": 0, "expect": [{"replica": "1", "seq": 1}]}"#,
+            "missing key",
+        ),
+        (
+            r#"{"tx": [{"append_ops": []}], "expect": "commit"}"#,
+            "\"rollback\"",
+        ),
+    ] {
+        let err = decode_err(&with_case(step));
+        assert!(err.contains(needle), "{step}: {err}");
+    }
 }

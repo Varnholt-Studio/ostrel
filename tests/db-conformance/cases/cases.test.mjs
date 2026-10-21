@@ -222,10 +222,19 @@ function runCase(c, models) {
   let db = newDb();
   c.steps.forEach((s, i) => {
     const where = `${c.name} step ${i}`;
-    keys(s, ['tx', 'query', 'last_seq', 'replay', 'expect'], where);
+    keys(s, ['tx', 'query', 'last_seq', 'replay', 'ops_since', 'expect'], where);
     if ('last_seq' in s) {
       const replica = replicaId(s.last_seq, where);
       assert.equal(s.expect, db.last.get(String(replica)) ?? 0, `${where}: last_seq`);
+      return;
+    }
+    if ('ops_since' in s) {
+      // Positions are compared by order only: a rolled back position may be given again or be
+      // left out (D154). The model numbers the log from 1 without gaps.
+      assert.ok(Number.isInteger(s.ops_since) && s.ops_since >= 0, `${where}: ops_since`);
+      assert.ok(Array.isArray(s.expect), `${where}: ops_since expects a list`);
+      const got = db.log.slice(s.ops_since);
+      assert.deepEqual(s.expect.map((o) => logOp(o, models, where)), got, `${where}: log`);
       return;
     }
     if ('replay' in s) {
@@ -251,6 +260,8 @@ function runCase(c, models) {
       if (s.expect === 'ok') {
         assert.equal(err, null, where);
         db = work;
+      } else if (s.expect === 'rollback') {
+        assert.equal(err, null, where);
       } else {
         keys(s.expect, ['error'], where);
         assert.ok(ERRORS.has(s.expect.error), where);
