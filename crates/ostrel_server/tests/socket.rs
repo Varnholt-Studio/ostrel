@@ -8,10 +8,11 @@
 //! not locking and writes nothing.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ostrel_core::ids::{Hlc, ReplicaId, RowId, ServerSeq};
 use ostrel_core::value::{SafeInt, Value};
@@ -333,6 +334,8 @@ struct Options {
     peer: Option<IpAddr>,
     /// The writer connection fails every commit.
     fail_commits: bool,
+    /// The hello timeout of the socket, when not the default.
+    hello_timeout: Option<Duration>,
 }
 
 impl Default for Options {
@@ -343,6 +346,7 @@ impl Default for Options {
             end_early: None,
             peer: None,
             fail_commits: false,
+            hello_timeout: None,
         }
     }
 }
@@ -404,6 +408,9 @@ fn start(options: Options) -> Server {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 tx.send(listener.local_addr().unwrap()).unwrap();
                 let socket = Socket::new(Box::new(Schema), gate, calls, now);
+                if let Some(timeout) = options.hello_timeout {
+                    socket.set_hello_timeout(timeout);
+                }
                 if let Some(peer) = options.peer {
                     loop {
                         let (stream, from) = listener.accept().await.unwrap();
@@ -745,4 +752,92 @@ fn calls_of_one_session_are_answered_and_a_refused_frame_keeps_the_session() {
     // A ping is answered by the protocol layer and changes nothing.
     client.0.send(Message::Ping(vec![1, 2, 3].into())).unwrap();
     assert_eq!(client.call(4, "count"), Ok(int(7)));
+}
+
+/// A hello timeout far above the waits of the shutdown tests, so only the shutdown can end
+/// the connections they hold open.
+const NO_HELLO_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// amir #2963: a connection that only opened TCP (still in the upgrade) does not keep a
+/// failed commit from ending the server (D159).
+#[test]
+fn a_tcp_connection_in_the_upgrade_does_not_hold_up_the_shutdown() {
+    let server = start(Options {
+        fail_commits: true,
+        hello_timeout: Some(NO_HELLO_TIMEOUT),
+        ..Options::default()
+    });
+    let _idle = TcpStream::connect(server.addr).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let (mut writer, _, _) = Client::open(server.addr, Some("user:1:k1"));
+    writer.send(r#"{"v":0,"t":"call","call":1,"function":"bump","args":[]}"#);
+    writer.expect_closed();
+    let r = server.done.recv_timeout(Duration::from_secs(15));
+    assert!(
+        r.is_ok(),
+        "serve did not return within 15 s with an idle TCP connection open"
+    );
+}
+
+/// amir #2963: an upgraded connection that sends no `hello` does not keep a failed commit from
+/// ending the server (D159).
+#[test]
+fn an_upgraded_connection_without_a_hello_does_not_hold_up_the_shutdown() {
+    let server = start(Options {
+        fail_commits: true,
+        hello_timeout: Some(NO_HELLO_TIMEOUT),
+        ..Options::default()
+    });
+    let mut quiet = Client::connect(server.addr);
+    let (mut writer, _, _) = Client::open(server.addr, Some("user:1:k1"));
+    writer.send(r#"{"v":0,"t":"call","call":1,"function":"bump","args":[]}"#);
+    writer.expect_closed();
+    let r = server.done.recv_timeout(Duration::from_secs(15));
+    assert!(
+        r.is_ok(),
+        "serve did not return within 15 s with a connection waiting for its hello"
+    );
+    // The waiting connection was closed by the server, not left open.
+    let started = Instant::now();
+    quiet.expect_closed();
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// The upgrade and the `hello` must arrive within the hello timeout; a connection that sends
+/// nothing, or nothing after the upgrade, is closed (amir #2963 (1)).
+#[test]
+fn a_connection_without_a_hello_is_closed_after_the_hello_timeout() {
+    let server = start(Options {
+        hello_timeout: Some(Duration::from_millis(300)),
+        ..Options::default()
+    });
+    let started = Instant::now();
+    let mut idle = TcpStream::connect(server.addr).unwrap();
+    idle.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    match idle.read(&mut byte) {
+        Ok(0) => {}
+        Ok(_) => panic!("bytes on a connection that sent no upgrade"),
+        Err(e) => assert!(
+            !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "the idle connection was not closed: {e}"
+        ),
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let started = Instant::now();
+    let mut quiet = Client::connect(server.addr);
+    quiet.expect_closed();
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(250),
+        "closed after {waited:?}"
+    );
+    assert!(waited < Duration::from_secs(5), "closed after {waited:?}");
+
+    // A client that sends its hello in time gets its session.
+    let (mut client, _, _) = Client::open(server.addr, Some("user:1:k1"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(client.call(1, "count"), Ok(int(7)));
 }
