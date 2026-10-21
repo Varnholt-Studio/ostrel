@@ -3,7 +3,8 @@
 //! [`decode_client`] and [`decode_server`] turn one received WebSocket frame into a message of
 //! [`crate::protocol`]; [`encode_client`] and [`encode_server`] write one. Both sides use the
 //! same functions: the server decodes client frames and encodes server frames, the client the
-//! other way round.
+//! other way round. All four take the same [`WireSchema`], because models and fields travel by
+//! name while the messages in memory hold [`ModelId`] and [`FieldId`] (D135).
 //!
 //! # Frame form
 //!
@@ -38,39 +39,75 @@
 //! [`encode_op`] read and write one op in the form of ARCHITECTURE 5.4, and [`op_bytes`] measures
 //! it for the limit of D109.
 //!
-//! # Not yet covered
+//! A client `ops` frame is `{"ops": [op, ...]}`. An op that is well formed but does not fit the
+//! schema becomes a [`DecodedOp::Invalid`] of [`crate::protocol`] and leaves the rest of the
+//! batch alone; `evict` names its model. The fault types live in [`crate::protocol`], because
+//! the server reads them in step 6 of ARCHITECTURE 5.5; this module only builds them (D135).
 //!
-//! The messages that carry values, queries or rows (`subscribe`, `ops` in both directions,
-//! `call`, `snapshot`, `return`) still give [`WireError::Unsupported`] at the frame level, and
-//! `evict` still carries its model as a number. They need changes of
-//! [`crate::protocol`] that are not part of this codec: a client `ops` message must be able to
-//! hold a [`DecodedOp::Invalid`], and `evict` names its model. Queries, rows and function
-//! signatures follow with those messages.
+//! # Queries, rows, server ops and calls
+//!
+//! `subscribe` carries a query ([`query`]), `snapshot` carries rows ([`row`]), the server's
+//! `ops` carry each op with its log position, and `call` and `return` carry values typed by the
+//! signature of the function ([`WireSchema::function_params`], [`WireSchema::function_result`]).
+//!
+//! Two of these messages name no model or function on the wire: the rows of a `snapshot`
+//! belong to the model of its subscription, and the value of a `return` has the result type of
+//! the function of its call. The side that encodes or decodes them supplies what it knows about
+//! its own requests through [`Requests`].
+//!
+//! # What a fault closes
+//!
+//! Most faults of a received frame are fatal ([`WireError::closes_connection`]). Four are not,
+//! because they concern one request: a `subscribe` whose query does not fit
+//! ([`WireError::InvalidQuery`], answered by `error` with the subscription id), a `call` whose
+//! function or arguments do not fit ([`WireError::InvalidCall`], answered by `return` with the
+//! call error), and on the client a `snapshot` or `return` for a subscription or call it no
+//! longer has ([`WireError::UnknownSubscription`], [`WireError::UnknownCall`], dropped).
+//! [`WireError::reply`] gives the server's answer to a client frame that failed.
+//!
+//! # Limits
+//!
+//! [`encode_client`] refuses an op over the op limit (D109), so no client sends one.
+//! [`encode_server`] answers a `return` that would not fit one frame with `CallError::Limit`
+//! instead of the result (D121). [`snapshot_pages`] and [`ops_pages`] split rows and server ops
+//! into frames that fit (D121), and [`row_bytes`] measures a row for the row limit.
 
 pub mod json;
 
+pub mod query;
+pub mod row;
+
 mod frame;
 mod op;
+mod paging;
 mod value;
 
 use std::fmt;
 
 use ostrel_core::ids::InvalidId;
 
-use crate::protocol::{ErrorCode, FieldId, ModelId};
+use crate::protocol::{
+    CallError, CallId, ErrorCode, FieldId, FnId, ModelId, OpFault, OpId, ProtocolError, RowId,
+    ServerMsg, SubId, ValueFault,
+};
 
 pub use frame::{decode_client, decode_server, encode_client, encode_server};
 pub use json::MAX_DEPTH;
-pub use op::{DecodedOp, OpFault, decode_op, encode_op, op_bytes};
-pub use value::{ValueFault, WireTy, read_value};
+pub use op::{decode_op, encode_op, op_bytes};
+pub use paging::{ops_pages, snapshot_pages};
+pub use query::QueryFault;
+pub use row::row_bytes;
+pub use value::{WireTy, read_value};
 
 #[cfg(doc)]
-use crate::protocol::PROTOCOL_VERSION;
+use crate::protocol::{DecodedOp, PROTOCOL_VERSION};
 
 /// The names and wire types of the compiled schema, as the codec needs them (D132).
 ///
 /// The server implements it from the compiled program (T4); tests build one by hand. Ids are
-/// positions in that program and never travel; names do.
+/// positions in that program and never travel; names do. The field lookup covers the implicit
+/// fields `made`, `changed` and `author` too, because a `snapshot` row carries them by name;
+/// whether an op may write them is decided by the server (D116).
 pub trait WireSchema {
     /// The model with this name.
     fn model_id(&self, name: &str) -> Option<ModelId>;
@@ -82,13 +119,36 @@ pub trait WireSchema {
     fn field_name(&self, model: ModelId, field: FieldId) -> Option<&str>;
     /// The wire type of a field.
     fn field_ty(&self, model: ModelId, field: FieldId) -> Option<&WireTy>;
+    /// The server function with this name.
+    fn function_id(&self, name: &str) -> Option<FnId>;
+    /// The name of a server function, for writing.
+    fn function_name(&self, function: FnId) -> Option<&str>;
+    /// The wire types of the parameters of a server function, in declaration order. A model
+    /// parameter is a [`WireTy::Ref`] to that model.
+    fn function_params(&self, function: FnId) -> Option<&[WireTy]>;
+    /// The wire type of the result of a server function.
+    fn function_result(&self, function: FnId) -> Option<&WireTy>;
+}
+
+/// What one side of a session knows about its own open requests (module documentation).
+///
+/// The client implements it from its subscriptions and the calls it sent and has not settled;
+/// the server from the subscriptions of the session and the calls it has not answered yet,
+/// because [`encode_server`] checks the result of a `return` against its function.
+pub trait Requests {
+    /// The model of an open subscription.
+    fn subscription_model(&self, sub: SubId) -> Option<ModelId>;
+    /// The function of a call that waits for its `return`.
+    fn call_function(&self, call: CallId) -> Option<FnId>;
 }
 
 /// Longest key or name a [`WireError`] repeats from a received frame, in bytes.
 pub const MAX_ECHO_BYTES: usize = 64;
 
-/// Why a frame could not be read or written. Every kind except
-/// [`WireError::FrameTooLarge`] is a fatal [`ErrorCode::Protocol`] ([`WireError::code`]).
+/// Why a frame could not be read or written. Every kind except [`WireError::FrameTooLarge`]
+/// and a query over the filter limit has the code [`ErrorCode::Protocol`]
+/// ([`WireError::code`]); four kinds keep the connection open
+/// ([`WireError::closes_connection`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WireError {
     /// The frame is larger than the frame limit (ARCHITECTURE 5.9, D121).
@@ -123,17 +183,93 @@ pub enum WireError {
     InvalidId(&'static str, InvalidId),
     /// A known message this codec cannot read or write yet (module documentation).
     Unsupported(&'static str),
-    /// Writing: the schema does not know this kind of id (`"model"` or `"field"`). A defect
-    /// of the caller, never caused by a peer.
+    /// A server message names a model the receiver's schema does not have (cut to
+    /// [`MAX_ECHO_BYTES`]). Client and server share one compiled schema, so this is a fatal
+    /// mismatch; an unknown model in a client op only makes that op invalid.
+    UnknownModel(String),
+    /// Writing: the schema does not know this kind of id (`"model"`, `"field"` or
+    /// `"function"`). A defect of the caller, never caused by a peer.
     NotInSchema(&'static str),
+    /// Writing: a [`DecodedOp::Invalid`] with this op id. Such an op exists only on the
+    /// receiving side and is never sent (D135). A defect of the caller.
+    InvalidOp(OpId),
+    /// Writing: a client op whose canonical encoding is over the op limit (D109). The client
+    /// does not apply such a write and sends no op; a defect of the caller.
+    OpTooLarge { op: OpId, bytes: usize },
+    /// Writing: a row whose canonical encoding is over the row limit (D121). The server never
+    /// stores one; a defect of the caller.
+    RowTooLarge { row: RowId, bytes: usize },
+    /// A server message names a field the receiver's schema does not have (cut to
+    /// [`MAX_ECHO_BYTES`]); fatal like [`WireError::UnknownModel`].
+    UnknownField(String),
+    /// A value of a server message does not fit its type in the receiver's schema; fatal like
+    /// [`WireError::UnknownModel`]. On writing the result of a `return`, a defect of the
+    /// caller.
+    Value {
+        key: &'static str,
+        fault: ValueFault,
+    },
+    /// An op of a server `ops` message does not fit the receiver's schema; fatal like
+    /// [`WireError::UnknownModel`].
+    ServerOp { op: OpId, fault: OpFault },
+    /// Not fatal: the query of this `subscribe` does not fit; the server answers `error` with
+    /// the subscription id and keeps the connection (D106).
+    InvalidQuery { sub: SubId, fault: QueryFault },
+    /// Not fatal: the function or the arguments of this `call` do not fit; the server answers
+    /// `return` with this error and keeps the connection. An unknown function is
+    /// [`CallError::NotFound`] (D99), anything else [`CallError::Invalid`].
+    InvalidCall { call: CallId, error: CallError },
+    /// Not fatal: a `snapshot` for a subscription the receiver does not have, for example one
+    /// it just ended. The client drops it. On writing, a defect of the caller.
+    UnknownSubscription(SubId),
+    /// Not fatal: a `return` for a call that is not waiting, for example one that already
+    /// failed with `OutcomeUnknown`; the client drops it (ARCHITECTURE 5.7). On writing a
+    /// successful `return`, a defect of the caller.
+    UnknownCall(CallId),
 }
 
 impl WireError {
-    /// The protocol error the server answers with (ARCHITECTURE 5.9).
+    /// The code of the `error` the server answers with (ARCHITECTURE 5.9). A refused call is
+    /// answered by `return` instead ([`WireError::reply`]).
     pub fn code(&self) -> ErrorCode {
         match self {
             WireError::FrameTooLarge { .. } => ErrorCode::FrameTooLarge,
+            WireError::InvalidQuery {
+                fault: QueryFault::TooManyNodes,
+                ..
+            } => ErrorCode::FilterTooLarge,
             _ => ErrorCode::Protocol,
+        }
+    }
+
+    /// False for the faults that concern one request only (module documentation).
+    pub fn closes_connection(&self) -> bool {
+        !matches!(
+            self,
+            WireError::InvalidQuery { .. }
+                | WireError::InvalidCall { .. }
+                | WireError::UnknownSubscription(_)
+                | WireError::UnknownCall(_)
+        )
+    }
+
+    /// The server's answer to a client frame that [`decode_client`] refused: `error` with the
+    /// subscription id for a refused query, `return` with the call error for a refused call,
+    /// and a fatal `error` for everything else, after which the server closes the connection.
+    pub fn reply(&self) -> ServerMsg {
+        match self {
+            WireError::InvalidCall { call, error } => ServerMsg::Return {
+                call: *call,
+                result: Err(error.clone()),
+            },
+            WireError::InvalidQuery { sub, .. } => ServerMsg::Error(ProtocolError {
+                sub: Some(*sub),
+                code: self.code(),
+            }),
+            _ => ServerMsg::Error(ProtocolError {
+                sub: None,
+                code: self.code(),
+            }),
         }
     }
 }
@@ -159,7 +295,42 @@ impl fmt::Display for WireError {
             WireError::Unsupported(name) => {
                 write!(f, "message {name:?} is not supported by this codec yet")
             }
+            WireError::UnknownModel(name) => write!(f, "unknown model {name:?}"),
             WireError::NotInSchema(kind) => write!(f, "{kind} id is not in the schema"),
+            WireError::InvalidOp(id) => {
+                write!(f, "op {} is invalid and cannot be sent", id.to_hex())
+            }
+            WireError::OpTooLarge { op, bytes } => {
+                write!(
+                    f,
+                    "op {} of {bytes} bytes is over the op limit",
+                    op.to_hex()
+                )
+            }
+            WireError::RowTooLarge { row, bytes } => {
+                write!(
+                    f,
+                    "row {} of {bytes} bytes is over the row limit",
+                    row.to_hex()
+                )
+            }
+            WireError::UnknownField(name) => write!(f, "unknown field {name:?}"),
+            WireError::Value { key, fault } => write!(f, "key {key:?}: {fault}"),
+            WireError::ServerOp { op, fault } => {
+                write!(
+                    f,
+                    "server op {} does not fit the schema: {fault:?}",
+                    op.to_hex()
+                )
+            }
+            WireError::InvalidQuery { sub, fault } => {
+                write!(f, "query of subscription {sub} is invalid: {fault}")
+            }
+            WireError::InvalidCall { call, error } => {
+                write!(f, "call {call} is refused: {error:?}")
+            }
+            WireError::UnknownSubscription(sub) => write!(f, "no subscription {sub}"),
+            WireError::UnknownCall(call) => write!(f, "no call {call} is waiting"),
         }
     }
 }

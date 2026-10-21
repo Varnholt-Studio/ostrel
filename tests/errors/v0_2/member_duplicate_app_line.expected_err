@@ -1,0 +1,1 @@
+tests/errors/v0_2/member_duplicate_app_line.ostl:3:3: error[E0206]: `home` is already declared in this `app`

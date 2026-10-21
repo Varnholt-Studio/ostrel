@@ -9,8 +9,8 @@
 // freeze only by an architect DECISION with an impact list.
 //
 // Sources: ARCHITECTURE 5.1 (type table), 5.3 (ids and wire widths), 5.4 (reject reasons),
-// 5.10 (app shell), 6.2 (text order), 7.1 and 7.2 (bridge errors), 7.4 (integer range),
-// 7.5 (rendering safety), 3.4 and 5.9 (runtime error kinds and limits).
+// 5.7 (call errors), 5.10 (app shell), 6.2 (text order), 7.1 and 7.2 (bridge errors),
+// 7.4 (integer range), 7.5 (rendering safety), 3.4 and 5.9 (runtime error kinds and limits).
 
 // ---------------------------------------------------------------------------------------
 // 1. Identifiers (ARCHITECTURE 5.3)
@@ -112,14 +112,20 @@ export declare function compareKey(a: Value, b: Value): -1 | 0 | 1;
 // Every error the runtime raises is an `OstrelError` with a stable `kind`. Messages are for
 // people; tests compare kinds.
 
-/** Runtime error kinds shared with the VM (SPEC AC-52, ARCHITECTURE 3.4, D44). */
+/**
+ * Runtime error kinds shared with the VM (SPEC AC-52, ARCHITECTURE 3.4, D44). `OutputLimit`:
+ * more than 256 MiB written by `print` in one run (D113). `NegativeCount`: a negative `n` in
+ * `limit n` or `last n`, checked before any data is read (D123, from v0.2).
+ */
 export type RuntimeErrorKind =
   | "IntOverflow"
   | "DivisionByZero"
   | "CallDepth"
   | "StepLimit"
   | "HeapLimit"
-  | "TextLimit";
+  | "TextLimit"
+  | "OutputLimit"
+  | "NegativeCount";
 
 /** Reason codes of a server `Reject` (ARCHITECTURE 5.4). `ClockSkew` does not exist (AC-57 g). */
 export type RejectReason = "Denied" | "Conflict" | "Forged" | "Invalid" | "Limit";
@@ -137,8 +143,27 @@ export type ExternErrorKind =
   | "Crashed"
   | "Timeout";
 
-/** Error of a server function call, as seen by the caller (5.7, 5.9). */
-export type CallErrorKind = "Denied" | "NotFound" | "Limit" | "Invalid" | "Offline";
+/**
+ * Error of a server function call, as seen by the caller (5.7, 5.9).
+ *
+ * * `Offline`: the `Call` frame was never handed to the WebSocket; nothing was sent.
+ * * `OutcomeUnknown`: the frame was sent but no `Return` arrived (connection closed, or 30 s
+ *   with the connection open). The server may or may not have run the call; the client never
+ *   resends it (D81).
+ * * `Unavailable`: the server could not start the body (its audit entry was not written).
+ *   Nothing of the body happened, so a retry is safe (D134).
+ *
+ * `e ?? f` turns only `Offline` into `f`; every other kind reaches `f` only where it is named,
+ * as in `e catch Unavailable ?? f` (G11, AC-33 d).
+ */
+export type CallErrorKind =
+  | "Denied"
+  | "NotFound"
+  | "Limit"
+  | "Invalid"
+  | "Offline"
+  | "OutcomeUnknown"
+  | "Unavailable";
 
 export type ErrorKind = RuntimeErrorKind | RejectReason | ExternErrorKind | CallErrorKind;
 

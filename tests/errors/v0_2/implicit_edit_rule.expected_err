@@ -1,0 +1,1 @@
+tests/errors/v0_2/implicit_edit_rule.ostl:5:8: error[E0208]: `made` is an implicit field; the system sets it

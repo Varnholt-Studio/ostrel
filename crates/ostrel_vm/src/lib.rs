@@ -23,6 +23,7 @@ mod bytecode;
 mod exec;
 pub mod host;
 mod output;
+pub mod url;
 
 pub use bytecode::CompileError;
 pub use ostrel_ir::Span;

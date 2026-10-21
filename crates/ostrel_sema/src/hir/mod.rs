@@ -17,11 +17,12 @@
 //! them. The HIR grows by addition; enums are `non_exhaustive` where a later
 //! milestone adds variants (`extern` blocks arrive with the bridge).
 //!
-//! Status: stub. The types are the freeze proposal; [`resolve`] and [`check`]
-//! have their final shape but no implementation yet. The v0.1 checker in the
-//! crate root stays the one the CLI calls until the move to the HIR.
+//! Status: [`resolve`] is implemented; [`check`] checks types (AC-29), not yet
+//! placement and the rule checks. The v0.1 checker in the crate root checks
+//! script programs.
 
 mod body;
+mod resolve;
 mod ty;
 
 #[cfg(test)]
@@ -177,6 +178,41 @@ impl Program {
             _ => None,
         }
     }
+
+    /// True if `serial per key` on a field of `model` numbers rows in groups
+    /// that a row never leaves (D136, SYNTAX 4.2): a `fixed` field of type
+    /// `Bool`, `Int`, `Text` without `merge text`, `Time`, `Bytes`, an enum
+    /// or a reference, or the implicit `author`. Every other key, and a key
+    /// that is not a field of `model`, is a compile error at the key.
+    pub fn is_serial_key(&self, model: DefId, key: FieldRef) -> bool {
+        match &self.def(model).map(|d| &d.kind) {
+            Some(DefKind::Model(m)) => m.is_serial_key(key),
+            _ => false,
+        }
+    }
+}
+
+impl ModelDef {
+    /// [`Program::is_serial_key`] for a key of this model.
+    pub fn is_serial_key(&self, key: FieldRef) -> bool {
+        match key {
+            FieldRef::Implicit(field) => field == ImplicitField::Author,
+            FieldRef::Declared(field) => self.fields.get(field.index()).is_some_and(|f| {
+                f.mode == FieldMode::Fixed
+                    && f.merge == Merge::Default
+                    && matches!(
+                        f.ty,
+                        Ty::Bool
+                            | Ty::Int
+                            | Ty::Text
+                            | Ty::Time
+                            | Ty::Bytes
+                            | Ty::Enum(_)
+                            | Ty::Ref(_)
+                    )
+            }),
+        }
+    }
 }
 
 /// A top level declaration.
@@ -266,8 +302,10 @@ pub enum FieldMode {
     Fixed,
     /// `server`: written by server code only.
     Server,
-    /// `serial [per f]`: assigned by the server (ARCHITECTURE 5.1).
-    Serial(Option<FieldId>),
+    /// `serial [per f]`: assigned by the server (ARCHITECTURE 5.1). The
+    /// field after `per` may be any field name; [`Program::is_serial_key`]
+    /// says whether it is allowed, `resolve` reports E0307 otherwise (D136).
+    Serial(Option<FieldRef>),
 }
 
 /// Merge strategy of a field (SYNTAX 4.3, ARCHITECTURE 5.1).
@@ -374,32 +412,15 @@ pub struct Local {
 ///
 /// Never panics on any tree. Reports unknown and duplicate names; the result
 /// is complete when no diagnostic is an error.
-///
-/// Stub: reports every non empty input as not yet supported (`E0100`) and
-/// returns an empty program.
 pub fn resolve(sources: &[Source<'_>]) -> (Program, Vec<Diagnostic>) {
-    let diagnostics = sources
-        .iter()
-        .find(|s| !s.module.items().is_empty())
-        .map(|s| {
-            Diagnostic::error(
-                crate::codes::NOT_IN_V0_1,
-                Span::point(s.file, 0),
-                "this program needs the v0.2 checker, which is not available yet",
-            )
-        })
-        .into_iter()
-        .collect();
-    (Program::default(), diagnostics)
+    resolve::resolve(sources)
 }
 
 /// Checks types, placement and rules, and fills [`Expr::ty`],
 /// [`FnDef::placement`], [`Local::ty`] and [`VarDef::ty`].
 ///
-/// Runs only on a program whose [`resolve`] reported no error.
-///
-/// Stub: checks nothing and reports nothing.
+/// Runs only on a program whose [`resolve`] reported no error. Placement is
+/// not inferred yet: [`FnDef::placement`] stays as declared.
 pub fn check(program: &mut Program) -> Vec<Diagnostic> {
-    let _ = program;
-    Vec::new()
+    crate::check::check(program)
 }

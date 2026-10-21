@@ -1,0 +1,9 @@
+app Golden
+
+data Post
+  pos: Int
+  see if true
+
+fn f()
+  for p in Post sort nope
+    print(1)

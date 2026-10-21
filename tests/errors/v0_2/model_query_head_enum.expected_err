@@ -1,0 +1,1 @@
+tests/errors/v0_2/model_query_head_enum.ostl:6:12: error[E0205]: a query with `where`, `sort`, `limit` or `last` needs a data type; `Color` is not one

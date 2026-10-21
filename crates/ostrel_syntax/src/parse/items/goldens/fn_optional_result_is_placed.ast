@@ -1,0 +1,2 @@
+placed-fn [inferred] pick(a: Int, b: Int) -> Int?
+  (return a)

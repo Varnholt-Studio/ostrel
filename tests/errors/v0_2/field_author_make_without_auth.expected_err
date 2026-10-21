@@ -1,0 +1,1 @@
+tests/errors/v0_2/field_author_make_without_auth.ostl:8:15: error[E0204]: data type `Post` has no field `author`; every row has `author` only when the `app` has `auth paseto`

@@ -2,7 +2,8 @@
 
 Each case is a pair:
 
-* `NAME.ostl`: a v0.1 program (SYNTAX 4.11) with exactly one fault.
+* `NAME.ostl`: a v0.1 program (SYNTAX 4.11) with exactly one fault. The cases of the v0.2
+  front end live in `v0_2/` (see below).
 * `NAME.expected_err`: the exact stderr the CLI must print for it, one diagnostic per line.
 
 Expected output was written by hand from the language documents, before the compiler could
@@ -71,6 +72,8 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0027 | `parse_comparison_chain` | 5:15 | comparisons do not chain; write `a < b and b < c` |
 | E0028 | `parse_bare_return` | 2:9 | expected a value after `return`, found end of line |
 | E0100 | `check_float_type_v0_1` | 1:14 | type `Float` is not available in v0.1 |
+| E0100 | `check_v0_2_enum_declaration` | 4:1 | `enum` declaration is not available in v0.1 |
+| E0100 | `check_v0_2_server_fn` | 4:1 | `server fn` is not available in v0.1 |
 | E0200 | `name_unknown` | 3:9 | unknown name `y` |
 | E0201 | `name_duplicate_fn` | 4:4 | function `f` is already declared |
 | E0201 | `name_duplicate_main` | 4:4 | function `main` is already declared |
@@ -93,6 +96,77 @@ slice, E0200 to E0299 names, E0300 to E0399 types, E0400 to E0499 program entry.
 
 Codes enter this catalog with their first golden and are never renumbered or reused once they
 are on `dev` (SPEC 12.1).
+
+## v0.2 goldens (`tests/errors/v0_2/`)
+
+`ostrel check` sends an app (a program with an `app` declaration, SPEC 2) through name
+resolution into the HIR (`ostrel_sema::hir::resolve`) and then the HIR checker; a script program
+keeps the v0.1 checker above, so E0100 for `enum` or `server fn` in a script program is
+unchanged. The goldens in `tests/errors/v0_2/` follow the contract above (exit code 1, stderr
+byte for byte, line format, positions, one diagnostic per fault), with two differences:
+
+* Every case is an app: its first line is `app Golden`, so it reaches the HIR front end. It has no
+  `fn main()`, because an app has no entry function and E0400 does not apply.
+* Cases use the v0.2 grammar (`data`, `enum`, `view`, queries, `make`, rules, `serial per`).
+
+Codes and positions follow SPEC 12.6 (v1.12 to v1.16) and were written by hand from it. Message
+texts are the owner's (SPEC 12.6) and are the texts of `crates/ostrel_sema/src/hir/resolve.rs`.
+
+| Code | Case | Position | Message |
+|---|---|---|---|
+| E0200 | `name_query_head_unknown` | 4:12 | unknown data type `Nope` |
+| E0200 | `name_rule_unknown` | 5:10 | unknown name `nope` |
+| E0200 | `name_where_unknown` | 8:19 | unknown name `nope` |
+| E0201 | `name_duplicate_top_level` | 6:4 | `f` is already declared |
+| E0201 | `name_second_app` | 2:5 | a program has one `app`; this is the second |
+| E0203 | `type_field_unknown` | 4:8 | unknown type `Integer` |
+| E0203 | `type_make_function` | 7:8 | `g` is not a type |
+| E0203 | `type_make_unknown` | 4:8 | unknown data type `Nope` |
+| E0204 | `field_author_make_without_auth` | 8:15 | data type `Post` has no field `author`; every row has `author` only when the `app` has `auth paseto` |
+| E0204 | `field_author_read_without_auth` | 8:5 | data type `Post` has no field `author`; every row has `author` only when the `app` has `auth paseto` |
+| E0204 | `field_author_serial_per_without_auth` | 4:21 | data type `Post` has no field `author`; every row has `author` only when the `app` has `auth paseto` |
+| E0204 | `field_author_where_without_auth` | 8:19 | data type `Post` has no field `author`; every row has `author` only when the `app` has `auth paseto` |
+| E0204 | `field_unknown_access` | 8:5 | data type `Post` has no field `nope` |
+| E0204 | `field_unknown_make` | 8:15 | data type `Post` has no field `nope` |
+| E0204 | `field_unknown_serial_per` | 4:21 | data type `Post` has no field `nope` |
+| E0204 | `field_unknown_sort` | 8:22 | data type `Post` has no field `nope` |
+| E0205 | `model_make_builtin_type` | 4:8 | `make` needs a data type; `Int` is not one |
+| E0205 | `model_make_enum` | 6:8 | `make` needs a data type; `Color` is not one |
+| E0205 | `model_query_head_enum` | 6:12 | a query with `where`, `sort`, `limit` or `last` needs a data type; `Color` is not one |
+| E0206 | `member_author_declared_with_auth` | 5:3 | field `author` is an implicit field of every row in `Post` |
+| E0206 | `member_duplicate_app_line` | 3:3 | `home` is already declared in this `app` |
+| E0206 | `member_duplicate_field` | 5:3 | field `pos` is already declared in `Post` |
+| E0206 | `member_duplicate_make_field` | 8:23 | field `pos` is already given in this `make` |
+| E0206 | `member_duplicate_variant` | 3:28 | variant `red` is already declared in `Color` |
+| E0206 | `member_implicit_field_declared` | 4:3 | field `id` is an implicit field of every row in `Post` |
+| E0207 | `query_local_names_field` | 8:19 | local `pos` has the name of a field of `Post`; rename the local |
+| E0208 | `implicit_assign_made` | 8:5 | `made` is an implicit field; the system sets it |
+| E0208 | `implicit_author_assign_with_auth` | 9:5 | `author` is an implicit field; the system sets it |
+| E0208 | `implicit_edit_rule` | 5:8 | `made` is an implicit field; the system sets it |
+| E0208 | `implicit_make_id` | 8:15 | `id` is an implicit field; the system sets it |
+| E0309 | `type_args_missing` | 4:9 | `Set` takes 1 type argument, found 0 |
+| E0309 | `type_args_on_scalar` | 4:6 | `Int` takes 0 type arguments, found 1 |
+| E0309 | `type_args_wrong_count` | 4:6 | `Map` takes 2 type arguments, found 1 |
+
+Notes on the v0.2 cases:
+
+* `name_where_unknown`, `field_unknown_sort` and `field_author_where_without_auth` are the three
+  cases SPEC 12.6 v1.16 asks for: an unbound bare name in `where` is E0200, a name after `sort`
+  that is no field is E0204, and a bare `author` in `where` without `auth` is E0204 with the
+  `auth paseto` hint.
+* `field_author_*_without_auth` cover reading (also through `.handle`, one diagnostic), `where`,
+  `make` (E0204, not E0208) and `serial per` (E0204, not E0307), SPEC 12.6 v1.14.
+* `implicit_author_assign_with_auth` and `member_author_declared_with_auth` show that with `auth`
+  the field exists: a write is E0208 and a declared field `author` is E0206.
+* `name_query_head_unknown` (E0200) and `type_make_unknown` (E0203) are the same unknown name in
+  the two positions SPEC 12.6 v1.13 keeps apart; `model_*` are E0205 for a declared name that is
+  no model.
+* E0309 goldens start with `type_args_`; `type_arity` above is the call arity code E0302
+  (SPEC 12.6, v1.15).
+* Not covered yet: the std `User` cases of D142 (E0203 with the `auth paseto` hint, E0201 for a
+  declared `User` beside `auth`) and the E0200 of a bare word resolved by its expected type; they
+  wait for the D142 work in `ostrel_sema`. E0306 and E0307 come from the HIR checker, which is
+  still a stub.
 
 ## Interpolation depth
 

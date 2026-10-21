@@ -1,0 +1,5 @@
+fn main()
+  print("ok")
+
+server fn ping() -> Int
+  return 1

@@ -5,16 +5,75 @@ use ostrel_core::canon::encode;
 use ostrel_core::ids::{Hlc, InvalidId, OpId, ReplicaId, RowId, ServerSeq};
 use ostrel_core::value::Value;
 use ostrel_sync::protocol::{
-    Ack, CallError, ClientMsg, ErrorCode, Hello, LIMITS, ProtocolError, Query, RejectReason,
-    ServerMsg, Welcome,
+    Ack, CallId, ClientMsg, ErrorCode, FieldId, FnId, Hello, LIMITS, ModelId, ProtocolError,
+    RejectReason, ServerMsg, SubId, Welcome,
 };
 use ostrel_sync::wire::json::{self, Json};
 use ostrel_sync::wire::{
-    MAX_DEPTH, MAX_ECHO_BYTES, WireError, decode_client, decode_server, encode_client,
-    encode_server,
+    MAX_DEPTH, MAX_ECHO_BYTES, Requests, WireError, WireSchema, WireTy, decode_client,
+    decode_server, encode_client, encode_server,
 };
 
 const FRAME: usize = LIMITS.frame_bytes as usize;
+
+/// Models without fields and no functions: the messages here name models only in `evict`.
+/// Ops and their fields are tested in `wire_ops.rs`, queries, rows and calls in
+/// `wire_messages.rs`.
+struct Models;
+
+const MODELS: [&str; 5] = ["User", "Team", "Project", "Label", "Issue"];
+
+impl WireSchema for Models {
+    fn model_id(&self, name: &str) -> Option<ModelId> {
+        let at = MODELS.iter().position(|m| *m == name)?;
+        ModelId::try_from(at).ok()
+    }
+
+    fn model_name(&self, model: ModelId) -> Option<&str> {
+        MODELS.get(usize::try_from(model).ok()?).copied()
+    }
+
+    fn field_id(&self, _: ModelId, _: &str) -> Option<FieldId> {
+        None
+    }
+
+    fn field_name(&self, _: ModelId, _: FieldId) -> Option<&str> {
+        None
+    }
+
+    fn field_ty(&self, _: ModelId, _: FieldId) -> Option<&WireTy> {
+        None
+    }
+
+    fn function_id(&self, _: &str) -> Option<FnId> {
+        None
+    }
+
+    fn function_name(&self, _: FnId) -> Option<&str> {
+        None
+    }
+
+    fn function_params(&self, _: FnId) -> Option<&[WireTy]> {
+        None
+    }
+
+    fn function_result(&self, _: FnId) -> Option<&WireTy> {
+        None
+    }
+}
+
+/// No open subscription or call: none of the messages here needs one.
+struct NoRequests;
+
+impl Requests for NoRequests {
+    fn subscription_model(&self, _: SubId) -> Option<ModelId> {
+        None
+    }
+
+    fn call_function(&self, _: CallId) -> Option<FnId> {
+        None
+    }
+}
 
 fn replica() -> ReplicaId {
     ReplicaId(0x0123_4567_89ab_cdef)
@@ -36,21 +95,29 @@ fn row(wall_ms: u64) -> RowId {
 }
 
 fn client_round_trip(msg: ClientMsg) {
-    let frame = encode_client(&msg).unwrap();
-    assert_eq!(decode_client(frame.as_bytes()), Ok(msg), "frame {frame}");
+    let frame = encode_client(&msg, &Models).unwrap();
+    assert_eq!(
+        decode_client(frame.as_bytes(), &Models),
+        Ok(msg),
+        "frame {frame}"
+    );
 }
 
 fn server_round_trip(msg: ServerMsg) {
-    let frame = encode_server(&msg).unwrap();
-    assert_eq!(decode_server(frame.as_bytes()), Ok(msg), "frame {frame}");
+    let frame = encode_server(&msg, &Models, &NoRequests).unwrap();
+    assert_eq!(
+        decode_server(frame.as_bytes(), &Models, &NoRequests),
+        Ok(msg),
+        "frame {frame}"
+    );
 }
 
 fn client(text: &str) -> Result<ClientMsg, WireError> {
-    decode_client(text.as_bytes())
+    decode_client(text.as_bytes(), &Models)
 }
 
 fn server(text: &str) -> Result<ServerMsg, WireError> {
-    decode_server(text.as_bytes())
+    decode_server(text.as_bytes(), &Models, &NoRequests)
 }
 
 // -------------------------------------------------------------------------------------------
@@ -151,24 +218,31 @@ fn every_error_code_round_trips_with_and_without_subscription() {
 #[test]
 fn encoded_frames_are_canonical() {
     assert_eq!(
-        encode_server(&ServerMsg::Reset { sub: 7 }).unwrap(),
+        encode_server(&ServerMsg::Reset { sub: 7 }, &Models, &NoRequests).unwrap(),
         r#"{"sub":7,"t":"reset","v":0}"#
     );
     assert_eq!(
-        encode_server(&ServerMsg::Reject {
-            op: op(2),
-            reason: RejectReason::Forged
-        })
+        encode_server(
+            &ServerMsg::Reject {
+                op: op(2),
+                reason: RejectReason::Forged
+            },
+            &Models,
+            &NoRequests
+        )
         .unwrap(),
         r#"{"op":"0123456789abcdef00000002","reason":"Forged","t":"reject","v":0}"#
     );
     assert_eq!(
-        encode_client(&ClientMsg::Hello(Hello {
-            token: None,
-            replica: Some(replica()),
-            replica_secret: None,
-            last_server_seq: None,
-        }))
+        encode_client(
+            &ClientMsg::Hello(Hello {
+                token: None,
+                replica: Some(replica()),
+                replica_secret: None,
+                last_server_seq: None,
+            }),
+            &Models
+        )
         .unwrap(),
         r#"{"last_server_seq":null,"replica":"0123456789abcdef","replica_secret":null,"t":"hello","token":null,"v":0}"#
     );
@@ -199,8 +273,8 @@ fn a_received_frame_over_the_limit_is_refused_before_parsing() {
     // Not JSON at all: the size check must come first.
     let frame = vec![b'x'; FRAME + 1];
     let expected = Err(WireError::FrameTooLarge { bytes: FRAME + 1 });
-    assert_eq!(decode_server(&frame), expected);
-    let client_side = decode_client(&frame);
+    assert_eq!(decode_server(&frame, &Models, &NoRequests), expected);
+    let client_side = decode_client(&frame, &Models);
     assert_eq!(
         client_side,
         Err(WireError::FrameTooLarge { bytes: FRAME + 1 })
@@ -217,7 +291,7 @@ fn a_frame_over_the_limit_is_never_written() {
         last_server_seq: None,
     });
     assert!(matches!(
-        encode_client(&huge),
+        encode_client(&huge, &Models),
         Err(WireError::FrameTooLarge { bytes }) if bytes > FRAME
     ));
     let rows = vec![row(1); FRAME / 32];
@@ -227,7 +301,7 @@ fn a_frame_over_the_limit_is_never_written() {
         rows,
     };
     assert!(matches!(
-        encode_server(&evict),
+        encode_server(&evict, &Models, &NoRequests),
         Err(WireError::FrameTooLarge { .. })
     ));
 }
@@ -277,12 +351,16 @@ fn repeated_keys_are_refused_at_every_level() {
         Err(WireError::DuplicateKey("v".into()))
     );
     // Inside a nested object, and the same key in sibling objects is fine.
-    let mut welcome = encode_server(&ServerMsg::Welcome(Welcome {
-        replica: replica(),
-        replica_secret: None,
-        server_ms: 1,
-        limits: LIMITS,
-    }))
+    let mut welcome = encode_server(
+        &ServerMsg::Welcome(Welcome {
+            replica: replica(),
+            replica_secret: None,
+            server_ms: 1,
+            limits: LIMITS,
+        }),
+        &Models,
+        &NoRequests,
+    )
     .unwrap();
     let at = welcome.find(r#""bulk_rows":"#).unwrap();
     welcome.insert_str(at, r#""bulk_rows":1,"#);
@@ -405,12 +483,16 @@ fn the_edges_of_the_safe_range_parse_but_must_fit_their_field() {
         Ok(ServerMsg::Reset { sub: u32::MAX })
     );
     let max_ms = r#"{"limits":LIMITS,"replica":"0000000000000000","replica_secret":null,"server_ms":9007199254740991,"t":"welcome","v":0}"#;
-    let limits = encode_server(&ServerMsg::Welcome(Welcome {
-        replica: ReplicaId(0),
-        replica_secret: None,
-        server_ms: 0,
-        limits: LIMITS,
-    }))
+    let limits = encode_server(
+        &ServerMsg::Welcome(Welcome {
+            replica: ReplicaId(0),
+            replica_secret: None,
+            server_ms: 0,
+            limits: LIMITS,
+        }),
+        &Models,
+        &NoRequests,
+    )
     .unwrap();
     let limits = &limits[limits.find('{').unwrap() + 10..limits.find('}').unwrap() + 1];
     let frame = max_ms.replace("LIMITS", limits);
@@ -432,7 +514,7 @@ fn a_server_time_above_the_safe_range_is_not_written() {
         limits: LIMITS,
     });
     assert_eq!(
-        encode_server(&welcome),
+        encode_server(&welcome, &Models, &NoRequests),
         Err(WireError::FieldRange("server_ms"))
     );
 }
@@ -470,7 +552,7 @@ fn malformed_text_is_refused() {
     let mut bytes = br#"{"sub":7,"t":"reset","v":0,"x":"#.to_vec();
     bytes.extend_from_slice(b"\"\xff\"}");
     assert!(matches!(
-        decode_server(&bytes),
+        decode_server(&bytes, &Models, &NoRequests),
         Err(WireError::Malformed(_))
     ));
 }
@@ -619,12 +701,16 @@ fn names_and_pairs_are_checked() {
 
 #[test]
 fn a_missing_or_extra_limit_is_refused() {
-    let welcome = encode_server(&ServerMsg::Welcome(Welcome {
-        replica: replica(),
-        replica_secret: None,
-        server_ms: 1,
-        limits: LIMITS,
-    }))
+    let welcome = encode_server(
+        &ServerMsg::Welcome(Welcome {
+            replica: replica(),
+            replica_secret: None,
+            server_ms: 1,
+            limits: LIMITS,
+        }),
+        &Models,
+        &NoRequests,
+    )
     .unwrap();
     let without = welcome.replace(r#""bulk_rows":1000,"#, "");
     assert_eq!(server(&without), Err(WireError::MissingKey("bulk_rows")));
@@ -663,43 +749,34 @@ fn every_error_but_the_frame_limit_is_a_protocol_error() {
 }
 
 // -------------------------------------------------------------------------------------------
-// Messages with values are not covered yet
+// Models travel by name (D135)
 
 #[test]
-fn messages_with_values_queries_or_rows_are_unsupported_for_now() {
-    let unsupported_client = [
-        ClientMsg::Subscribe {
-            sub: 1,
-            query: Query::all(0),
-        },
-        ClientMsg::Ops(Vec::new()),
-        ClientMsg::Call {
-            call: 1,
-            function: 0,
-            args: Vec::new(),
-        },
-    ];
-    for msg in unsupported_client {
-        assert_eq!(encode_client(&msg), Err(WireError::Unsupported(msg.name())));
-        let frame = format!(r#"{{"v":0,"t":"{}"}}"#, msg.name());
-        assert_eq!(client(&frame), Err(WireError::Unsupported(msg.name())));
-    }
-    let unsupported_server = [
-        ServerMsg::Snapshot {
-            sub: 1,
-            rows: Vec::new(),
-            seq: ServerSeq(0),
-            last: true,
-        },
-        ServerMsg::Ops(Vec::new()),
-        ServerMsg::Return {
-            call: 1,
-            result: Err(CallError::Denied),
-        },
-    ];
-    for msg in unsupported_server {
-        assert_eq!(encode_server(&msg), Err(WireError::Unsupported(msg.name())));
-        let frame = format!(r#"{{"v":0,"t":"{}"}}"#, msg.name());
-        assert_eq!(server(&frame), Err(WireError::Unsupported(msg.name())));
-    }
+fn evict_names_its_model_on_the_wire() {
+    let evict = ServerMsg::Evict {
+        sub: 1,
+        model: 4,
+        rows: Vec::new(),
+    };
+    assert_eq!(
+        encode_server(&evict, &Models, &NoRequests).unwrap(),
+        r#"{"model":"Issue","rows":[],"sub":1,"t":"evict","v":0}"#
+    );
+    assert_eq!(
+        server(r#"{"model":"Gone","rows":[],"sub":1,"t":"evict","v":0}"#),
+        Err(WireError::UnknownModel("Gone".into()))
+    );
+    assert_eq!(
+        server(r#"{"model":4,"rows":[],"sub":1,"t":"evict","v":0}"#),
+        Err(WireError::WrongType("model"))
+    );
+    let unknown = ServerMsg::Evict {
+        sub: 1,
+        model: 9,
+        rows: Vec::new(),
+    };
+    assert_eq!(
+        encode_server(&unknown, &Models, &NoRequests),
+        Err(WireError::NotInSchema("model"))
+    );
 }

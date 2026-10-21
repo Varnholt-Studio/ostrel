@@ -1,0 +1,2 @@
+placed-fn [inferred] add(a: List[Int], b: Int) -> Int
+  (return b)
