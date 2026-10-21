@@ -5,7 +5,7 @@
 use ostrel_core::ids::{Hlc, OpId, ReplicaId, RowId};
 use ostrel_core::value::Value;
 use ostrel_sync::protocol::{
-    ClientMsg, DecodedOp, FieldId, LIMITS, ModelId, Op, OpBody, OpFault, ValueFault,
+    ClientMsg, DecodedOp, FieldId, FnId, LIMITS, ModelId, Op, OpBody, OpFault, ValueFault,
 };
 use ostrel_sync::wire::json::{self, Json};
 use ostrel_sync::wire::{
@@ -72,6 +72,22 @@ impl WireSchema for Schema {
     fn field_ty(&self, model: ModelId, field: FieldId) -> Option<&WireTy> {
         let (_, ty) = self.fields.get(usize::try_from(field).ok()?)?;
         (model == ITEM).then_some(ty)
+    }
+
+    fn function_id(&self, _: &str) -> Option<FnId> {
+        None
+    }
+
+    fn function_name(&self, _: FnId) -> Option<&str> {
+        None
+    }
+
+    fn function_params(&self, _: FnId) -> Option<&[WireTy]> {
+        None
+    }
+
+    fn function_result(&self, _: FnId) -> Option<&WireTy> {
+        None
     }
 }
 
@@ -251,11 +267,11 @@ fn a_malformed_op_is_a_protocol_error() {
             WireError::InvalidId("hlc", ostrel_core::ids::Hlc::from_hex("zz").unwrap_err()),
         ),
         (with_body(r#"{}"#), WireError::WrongType("body")),
+        (with_body(r#"{"move":{}}"#), WireError::WrongType("body")),
         (
-            with_body(r#"{"drop":{},"make":{}}"#),
+            with_body(r#"{"drop":{},"move":{}}"#),
             WireError::WrongType("body"),
         ),
-        (with_body(r#"{"move":{}}"#), WireError::WrongType("body")),
         (with_body(r#"{"drop":[]}"#), WireError::WrongType("body")),
         (
             with_body(r#"{"drop":{"field":"pos"}}"#),
@@ -651,4 +667,129 @@ fn encoding_an_invalid_op_is_a_typed_error() {
         encode_client(&batch, &schema()),
         Err(WireError::InvalidOp(op_id(2)))
     );
+}
+
+#[test]
+fn a_batch_over_the_batch_limit_is_read_whole() {
+    // The codec does not count ops: the server answers a batch over the limit with one
+    // `Reject Limit` per op, in batch order, so it needs every op head (D106).
+    let count = LIMITS.ops_per_batch + 1;
+    let ops: Vec<String> = (1..=count)
+        .map(|seq| encode_op(&op_with(seq, OpBody::Drop), &schema()).unwrap())
+        .collect();
+    let Ok(ClientMsg::Ops(decoded)) = decode_ops_frame(&ops_frame(&ops)) else {
+        panic!("expected an ops batch");
+    };
+    assert_eq!(decoded.len(), count as usize);
+    assert!(
+        decoded
+            .iter()
+            .zip(1..)
+            .all(|(op, seq)| *op == DecodedOp::Valid(op_with(seq, OpBody::Drop)))
+    );
+}
+
+#[test]
+fn a_client_never_writes_an_op_over_the_op_limit() {
+    // The client does not apply such a write and sends no op (D109), so the codec refuses to
+    // write one instead of leaving the check to every caller.
+    let make = |title: usize| {
+        op(OpBody::Make {
+            fields: vec![
+                (field("title"), text(&"y".repeat(title))),
+                (field("note"), text(&"z".repeat(LIMITS.text_bytes as usize))),
+            ],
+        })
+    };
+    let fill = LIMITS.op_bytes as usize - op_bytes(&make(0), &schema()).unwrap();
+    let exact = ClientMsg::Ops(vec![DecodedOp::Valid(make(fill))]);
+    assert!(encode_client(&exact, &schema()).is_ok());
+    let over = ClientMsg::Ops(vec![
+        DecodedOp::Valid(op_with(2, OpBody::Drop)),
+        DecodedOp::Valid(make(fill + 1)),
+    ]);
+    assert_eq!(
+        encode_client(&over, &schema()),
+        Err(WireError::OpTooLarge {
+            op: op_id(1),
+            bytes: LIMITS.op_bytes as usize + 1
+        })
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// A body with several kinds (D147, AC-55)
+
+#[test]
+fn a_body_with_several_kinds_makes_only_that_op_invalid() {
+    let tag = op_id(1).to_hex();
+    let owner = row().to_hex();
+    for body in [
+        // The hijack of `ac_55_hijack_one_op_both_directions`: add and remove in one op.
+        format!(
+            r#"{{"add":{{"field":"tags","elem":"x"}},"remove":{{"field":"tags","elem":"y","tags":["{tag}"]}}}}"#
+        ),
+        format!(
+            r#"{{"put":{{"field":"roles","key":"{owner}","value":1}},"remove_key":{{"field":"roles","key":"{owner}"}}}}"#
+        ),
+        r#"{"drop":{},"make":{}}"#.to_owned(),
+        r#"{"drop":{},"set":{"field":"count","value":1},"add":{"field":"tags","elem":"x"}}"#
+            .to_owned(),
+    ] {
+        assert_eq!(
+            decode_text(&with_body(&body)),
+            invalid(OpFault::SeveralKinds),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn several_kinds_leave_the_rest_of_the_batch_and_the_connection_alone() {
+    let good = encode_op(&op_with(1, OpBody::Drop), &schema()).unwrap();
+    let both = encode_op(&op_with(2, OpBody::Drop), &schema())
+        .unwrap()
+        .replace(
+            r#"{"drop":{}}"#,
+            r#"{"add":{"field":"tags","elem":"x"},"drop":{}}"#,
+        );
+    let later = encode_op(&op_with(3, OpBody::Drop), &schema()).unwrap();
+    assert_eq!(
+        decode_ops_frame(&ops_frame(&[good, both, later])),
+        Ok(ClientMsg::Ops(vec![
+            DecodedOp::Valid(op_with(1, OpBody::Drop)),
+            DecodedOp::Invalid {
+                id: op_id(2),
+                hlc: stamp(),
+                row: row(),
+                fault: OpFault::SeveralKinds,
+            },
+            DecodedOp::Valid(op_with(3, OpBody::Drop)),
+        ]))
+    );
+}
+
+#[test]
+fn several_kinds_stay_fatal_when_one_is_unknown_or_malformed() {
+    let add = r#""add":{"field":"tags","elem":"x"}"#;
+    for (body, want) in [
+        (
+            format!(r#"{{{add},"move":{{}}}}"#),
+            WireError::WrongType("body"),
+        ),
+        (
+            format!(r#"{{{add},"drop":[]}}"#),
+            WireError::WrongType("body"),
+        ),
+        (
+            format!(r#"{{{add},"remove":{{"field":"tags","elem":"x"}}}}"#),
+            WireError::MissingKey("tags"),
+        ),
+        (
+            format!(r#"{{{add},"set":{{"field":"count","value":1,"x":1}}}}"#),
+            WireError::UnknownKey("x".into()),
+        ),
+    ] {
+        assert_eq!(decode_text(&with_body(&body)), Err(want), "{body}");
+    }
 }

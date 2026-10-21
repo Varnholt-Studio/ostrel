@@ -1,18 +1,25 @@
 //! Messages to and from frames: the envelope and the fields of each message.
 
-use ostrel_core::canon::{encode_object, encode_str};
+use ostrel_core::canon::{encode, encode_object, encode_str};
 use ostrel_core::ids::{Hlc, InvalidId, OpId, ReplicaId, RowId, ServerSeq};
 use ostrel_core::value::INT_MAX;
 
 use super::json::{self, Json, NotSafeInt};
 use super::op::{decode_op, encode_op};
-use super::{WireError, WireSchema, clip};
+use super::query::{decode_query, encode_query};
+use super::row::{decode_row, encode_row};
+use super::value::read_value;
+use super::{Requests, WireError, WireSchema, clip};
 use crate::protocol::{
-    Ack, ClientMsg, DecodedOp, ErrorCode, Hello, LIMITS, Limits, ModelId, PROTOCOL_VERSION,
-    ProtocolError, RejectReason, ServerMsg, Welcome,
+    Ack, CallError, CallId, ClientMsg, DecodedOp, ErrorCode, FnId, Hello, LIMITS, Limits, LoggedOp,
+    ModelId, Op, PROTOCOL_VERSION, ProtocolError, RejectReason, ServerMsg, Value, Welcome,
 };
 
-/// Reads one frame sent by a client. Models and fields are looked up by name in `schema`.
+/// Reads one frame sent by a client. Models, fields and functions are looked up by name in
+/// `schema`.
+///
+/// A refused `subscribe` or `call` is not fatal ([`WireError::closes_connection`]); the server
+/// answers it with [`WireError::reply`].
 pub fn decode_client(frame: &[u8], schema: &dyn WireSchema) -> Result<ClientMsg, WireError> {
     let (name, mut fields) = open(frame)?;
     let msg = match name.as_str() {
@@ -33,16 +40,43 @@ pub fn decode_client(frame: &[u8], schema: &dyn WireSchema) -> Result<ClientMsg,
         "ops" => {
             ClientMsg::Ops(fields.req("ops", |k, j| list(k, j, |_, op| decode_op(op, schema)))?)
         }
-        "subscribe" => return Err(WireError::Unsupported("subscribe")),
-        "call" => return Err(WireError::Unsupported("call")),
+        "subscribe" => {
+            let sub = fields.req("sub", uint32)?;
+            let query = fields.req("query", any)?;
+            fields.finish()?;
+            let query = decode_query(query, schema)
+                .map_err(|fault| WireError::InvalidQuery { sub, fault })?;
+            return Ok(ClientMsg::Subscribe { sub, query });
+        }
+        "call" => {
+            let call = fields.req("call", uint32)?;
+            let function = fields.req("function", any)?;
+            let args = fields.req("args", any)?;
+            fields.finish()?;
+            let (function, args) = call_args(function, args, schema)
+                .map_err(|error| WireError::InvalidCall { call, error })?;
+            return Ok(ClientMsg::Call {
+                call,
+                function,
+                args,
+            });
+        }
         other => return Err(WireError::UnknownMessage(clip(other))),
     };
     fields.finish()?;
     Ok(msg)
 }
 
-/// Reads one frame sent by the server. Models and fields are looked up by name in `schema`.
-pub fn decode_server(frame: &[u8], schema: &dyn WireSchema) -> Result<ServerMsg, WireError> {
+/// Reads one frame sent by the server. Models, fields and functions are looked up by name in
+/// `schema`; the model of a `snapshot` and the function of a `return` come from `requests`.
+///
+/// A `snapshot` or `return` for a request the client no longer has is not fatal
+/// ([`WireError::UnknownSubscription`], [`WireError::UnknownCall`]); the client drops it.
+pub fn decode_server(
+    frame: &[u8],
+    schema: &dyn WireSchema,
+    requests: &dyn Requests,
+) -> Result<ServerMsg, WireError> {
     let (name, mut fields) = open(frame)?;
     let msg = match name.as_str() {
         "welcome" => ServerMsg::Welcome(Welcome {
@@ -76,9 +110,33 @@ pub fn decode_server(frame: &[u8], schema: &dyn WireSchema) -> Result<ServerMsg,
             sub: fields.opt("sub", uint32)?,
             code: fields.req("code", error_code)?,
         }),
-        "snapshot" => return Err(WireError::Unsupported("snapshot")),
-        "ops" => return Err(WireError::Unsupported("ops")),
-        "return" => return Err(WireError::Unsupported("return")),
+        "ops" => ServerMsg::Ops(fields.req("ops", |k, j| {
+            list(k, j, |_, logged| logged_op(logged, schema))
+        })?),
+        "snapshot" => {
+            let sub = fields.req("sub", uint32)?;
+            let rows = fields.req("rows", any)?;
+            let seq = fields.req("seq", server_seq)?;
+            let last = fields.req("last", boolean)?;
+            fields.finish()?;
+            let model = requests
+                .subscription_model(sub)
+                .ok_or(WireError::UnknownSubscription(sub))?;
+            let rows = list("rows", rows, |_, row| decode_row(row, model, schema))?;
+            return Ok(ServerMsg::Snapshot {
+                sub,
+                rows,
+                seq,
+                last,
+            });
+        }
+        "return" => {
+            let call = fields.req("call", uint32)?;
+            let result = fields.req("result", any)?;
+            fields.finish()?;
+            let result = call_result(call, result, schema, requests)?;
+            return Ok(ServerMsg::Return { call, result });
+        }
         other => return Err(WireError::UnknownMessage(clip(other))),
     };
     fields.finish()?;
@@ -88,7 +146,10 @@ pub fn decode_server(frame: &[u8], schema: &dyn WireSchema) -> Result<ServerMsg,
 /// Writes one client message as a canonical frame. Ids are written as their names in `schema`.
 ///
 /// A [`DecodedOp::Invalid`] in an `ops` batch is [`WireError::InvalidOp`]: it exists only on
-/// the receiving side, and no client sends an op it could not encode.
+/// the receiving side, and no client sends an op it could not encode. An op over the op limit
+/// is [`WireError::OpTooLarge`]: the client does not apply such a write and sends no op (D109).
+/// How many ops a batch holds is up to the caller; the server answers a batch over
+/// [`LIMITS`]`.ops_per_batch` with one `Reject Limit` per op (D106).
 pub fn encode_client(msg: &ClientMsg, schema: &dyn WireSchema) -> Result<String, WireError> {
     let fields = match msg {
         ClientMsg::Hello(h) => vec![
@@ -109,16 +170,43 @@ pub fn encode_client(msg: &ClientMsg, schema: &dyn WireSchema) -> Result<String,
             ("rows", array(rows.iter().map(|r| hex(&r.to_hex())))),
             ("last", last.to_string()),
         ],
-        ClientMsg::Ops(ops) => vec![("ops", ops_array(ops, schema)?)],
-        ClientMsg::Subscribe { .. } => return Err(WireError::Unsupported("subscribe")),
-        ClientMsg::Call { .. } => return Err(WireError::Unsupported("call")),
+        ClientMsg::Ops(ops) => vec![("ops", client_ops(ops, schema)?)],
+        ClientMsg::Subscribe { sub, query } => vec![
+            ("sub", sub.to_string()),
+            ("query", encode_query(query, schema)?),
+        ],
+        ClientMsg::Call {
+            call,
+            function,
+            args,
+        } => vec![
+            ("call", call.to_string()),
+            (
+                "function",
+                encode_str(
+                    schema
+                        .function_name(*function)
+                        .ok_or(WireError::NotInSchema("function"))?,
+                ),
+            ),
+            ("args", array(args.iter().map(encode))),
+        ],
     };
     close(msg.name(), fields)
 }
 
-/// Writes one server message as a canonical frame. Ids are written as their names in `schema`.
-/// A frame over the frame limit is an error: the server never sends one (D121).
-pub fn encode_server(msg: &ServerMsg, schema: &dyn WireSchema) -> Result<String, WireError> {
+/// Writes one server message as a canonical frame. Ids are written as their names in
+/// `schema`; the model of a `snapshot` comes from `requests`.
+///
+/// A frame over the frame limit is an error: the server never sends one (D121). The one
+/// exception is a `return` whose result does not fit: it is written with `CallError::Limit`
+/// instead of the result (D121). [`super::snapshot_pages`] and [`super::ops_pages`] split
+/// rows and ops into frames that fit.
+pub fn encode_server(
+    msg: &ServerMsg,
+    schema: &dyn WireSchema,
+    requests: &dyn Requests,
+) -> Result<String, WireError> {
     let fields = match msg {
         ServerMsg::Welcome(w) => vec![
             ("replica", hex(&w.replica.to_hex())),
@@ -159,12 +247,59 @@ pub fn encode_server(msg: &ServerMsg, schema: &dyn WireSchema) -> Result<String,
             ("sub", opt(e.sub, |s| s.to_string())),
             ("code", encode_str(error_code_name(e.code))),
         ],
-        ServerMsg::Snapshot { .. } => return Err(WireError::Unsupported("snapshot")),
-        ServerMsg::Ops(_) => return Err(WireError::Unsupported("ops")),
-        ServerMsg::Return { .. } => return Err(WireError::Unsupported("return")),
+        ServerMsg::Snapshot {
+            sub,
+            rows,
+            seq,
+            last,
+        } => {
+            let model = requests
+                .subscription_model(*sub)
+                .ok_or(WireError::UnknownSubscription(*sub))?;
+            let rows = rows
+                .iter()
+                .map(|row| encode_row(row, model, schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            vec![
+                ("sub", sub.to_string()),
+                ("rows", array(rows)),
+                ("seq", hex(&seq.to_hex())),
+                ("last", last.to_string()),
+            ]
+        }
+        ServerMsg::Ops(ops) => vec![("ops", server_ops(ops, schema)?)],
+        ServerMsg::Return { call, result } => {
+            let frame = close(msg.name(), return_fields(*call, result)?);
+            return match frame {
+                Err(WireError::FrameTooLarge { .. }) if result.is_ok() => {
+                    close(msg.name(), return_fields(*call, &Err(CallError::Limit))?)
+                }
+                other => other,
+            };
+        }
     };
     close(msg.name(), fields)
 }
+
+/// Defines [`call_error_result`] and [`CALL_ERRORS`] from one list, like [`error_codes`]: a
+/// new [`CallError`] variant does not compile until it is in the list. The list holds the call
+/// errors that travel by name; `Runtime` travels with its kind.
+macro_rules! call_errors {
+    ($($error:ident),* $(,)?) => {
+        /// The key and content of the `result` of a failed call.
+        fn call_error_result(error: &CallError) -> (&'static str, String) {
+            match error {
+                $(CallError::$error => ("err", encode_str(stringify!($error))),)*
+                CallError::Runtime { kind } => ("runtime", encode_str(kind)),
+            }
+        }
+
+        /// Every call error that travels by name, with its name, for the reader.
+        const CALL_ERRORS: &[(&str, CallError)] = &[$((stringify!($error), CallError::$error)),*];
+    };
+}
+
+call_errors![Denied, NotFound, Limit, Invalid, Unavailable];
 
 /// Defines [`error_code_name`] and [`ERROR_CODES`] from one list, so the two cannot drift
 /// apart: the `match` is exhaustive, so a new [`ErrorCode`] variant does not compile until it
@@ -262,6 +397,11 @@ impl Fields {
         })
     }
 
+    /// True when the object still holds `key`.
+    pub(super) fn has(&self, key: &str) -> bool {
+        self.entries.iter().any(|(k, _)| k == key)
+    }
+
     /// Fails on the first key no field has read.
     pub(super) fn finish(self) -> Result<(), WireError> {
         match self.entries.first() {
@@ -281,7 +421,7 @@ pub(super) fn string(key: &'static str, j: Json) -> Result<String, WireError> {
     }
 }
 
-fn boolean(key: &'static str, j: Json) -> Result<bool, WireError> {
+pub(super) fn boolean(key: &'static str, j: Json) -> Result<bool, WireError> {
     match j {
         Json::Bool(b) => Ok(b),
         _ => Err(WireError::WrongType(key)),
@@ -350,6 +490,11 @@ pub(super) fn hlc(key: &'static str, j: Json) -> Result<Hlc, WireError> {
     hex_id(key, j, Hlc::from_hex)
 }
 
+/// Any JSON, read later by a typed reader.
+fn any(_: &'static str, j: Json) -> Result<Json, WireError> {
+    Ok(j)
+}
+
 /// `[op, hlc]`.
 fn restamp(key: &'static str, j: Json) -> Result<(OpId, Hlc), WireError> {
     match j {
@@ -385,6 +530,109 @@ fn error_code(key: &'static str, j: Json) -> Result<ErrorCode, WireError> {
         .copied()
         .find(|c| error_code_name(*c) == name)
         .ok_or(WireError::WrongType(key))
+}
+
+/// `{"seq", "op"}`: one op of a server `ops` message. An op that does not fit the receiver's
+/// schema is fatal: client and server share one compiled schema.
+fn logged_op(j: Json, schema: &dyn WireSchema) -> Result<LoggedOp, WireError> {
+    let Json::Obj(entries) = j else {
+        return Err(WireError::WrongType("ops"));
+    };
+    let mut f = Fields { entries };
+    let seq = f.req("seq", server_seq)?;
+    let op = f.req("op", |_, op| decode_op(op, schema))?;
+    f.finish()?;
+    match op {
+        DecodedOp::Valid(op) => Ok(LoggedOp { seq, op }),
+        DecodedOp::Invalid { id, fault, .. } => Err(WireError::ServerOp { op: id, fault }),
+    }
+}
+
+/// The function and arguments of a `call`. An unknown function is `NotFound` (D99); a name
+/// that is not a string, arguments that are not an array of the right length, or a value that
+/// does not fit its parameter is `Invalid`.
+fn call_args(
+    function: Json,
+    args: Json,
+    schema: &dyn WireSchema,
+) -> Result<(FnId, Vec<Value>), CallError> {
+    let Json::Str(name) = function else {
+        return Err(CallError::Invalid);
+    };
+    let function = schema.function_id(&name).ok_or(CallError::NotFound)?;
+    let params = schema
+        .function_params(function)
+        .ok_or(CallError::NotFound)?;
+    let Json::Arr(args) = args else {
+        return Err(CallError::Invalid);
+    };
+    if args.len() != params.len() {
+        return Err(CallError::Invalid);
+    }
+    let args = params
+        .iter()
+        .zip(args)
+        .map(|(ty, arg)| read_value(ty, arg).map_err(|_| CallError::Invalid))
+        .collect::<Result<_, _>>()?;
+    Ok((function, args))
+}
+
+/// `{"ok": value}`, `{"err": name}` or `{"runtime": kind}`. The value has the result type of
+/// the function of the call; a value that does not fit is fatal like a server op that does not
+/// fit.
+fn call_result(
+    call: CallId,
+    j: Json,
+    schema: &dyn WireSchema,
+    requests: &dyn Requests,
+) -> Result<Result<Value, CallError>, WireError> {
+    let function = requests
+        .call_function(call)
+        .ok_or(WireError::UnknownCall(call))?;
+    let Json::Obj(entries) = j else {
+        return Err(WireError::WrongType("result"));
+    };
+    let Ok([(kind, content)]) = <[(String, Json); 1]>::try_from(entries) else {
+        return Err(WireError::WrongType("result"));
+    };
+    match kind.as_str() {
+        "ok" => {
+            let ty = schema
+                .function_result(function)
+                .ok_or(WireError::NotInSchema("function"))?;
+            read_value(ty, content)
+                .map(Ok)
+                .map_err(|fault| WireError::Value {
+                    key: "result",
+                    fault,
+                })
+        }
+        "err" => {
+            let name = string("result", content)?;
+            CALL_ERRORS
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, error)| Err(error.clone()))
+                .ok_or(WireError::WrongType("result"))
+        }
+        "runtime" => {
+            let kind = string("result", content)?;
+            if !is_runtime_kind(&kind) {
+                return Err(WireError::WrongType("result"));
+            }
+            Ok(Err(CallError::Runtime { kind }))
+        }
+        _ => Err(WireError::WrongType("result")),
+    }
+}
+
+/// A runtime error kind name (ARCHITECTURE 3.4): 1 to [`super::MAX_ECHO_BYTES`] ASCII letters.
+/// The codec does not keep the list of kinds, which belongs to the VM; it only keeps the name
+/// short and plain.
+fn is_runtime_kind(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind.len() <= super::MAX_ECHO_BYTES
+        && kind.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
 fn limits(key: &'static str, j: Json) -> Result<Limits, WireError> {
@@ -444,16 +692,63 @@ fn model_name(model: ModelId, schema: &dyn WireSchema) -> Result<&str, WireError
         .ok_or(WireError::NotInSchema("model"))
 }
 
-/// The ops of a client batch, each as [`encode_op`] writes it.
-fn ops_array(ops: &[DecodedOp], schema: &dyn WireSchema) -> Result<String, WireError> {
+/// The ops of a client batch, each as [`encode_op`] writes it and within the op limit.
+fn client_ops(ops: &[DecodedOp], schema: &dyn WireSchema) -> Result<String, WireError> {
     let items = ops
         .iter()
         .map(|op| match op {
-            DecodedOp::Valid(op) => encode_op(op, schema),
+            DecodedOp::Valid(op) => op_within_limit(op, schema),
             DecodedOp::Invalid { id, .. } => Err(WireError::InvalidOp(*id)),
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(array(items))
+}
+
+/// The ops of a server `ops` message, each as `{"seq", "op"}`.
+fn server_ops(ops: &[LoggedOp], schema: &dyn WireSchema) -> Result<String, WireError> {
+    let items = ops
+        .iter()
+        .map(|logged| logged_op_text(logged, schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(array(items))
+}
+
+/// One element of a server `ops` message.
+pub(super) fn logged_op_text(
+    logged: &LoggedOp,
+    schema: &dyn WireSchema,
+) -> Result<String, WireError> {
+    encode_object(&[
+        ("op", encode_op(&logged.op, schema)?),
+        ("seq", hex(&logged.seq.to_hex())),
+    ])
+    .map_err(|_| WireError::Malformed("repeated field".into()))
+}
+
+/// [`encode_op`] for a client op, which must stay within the op limit (D109).
+fn op_within_limit(op: &Op, schema: &dyn WireSchema) -> Result<String, WireError> {
+    let text = encode_op(op, schema)?;
+    if text.len() > LIMITS.op_bytes as usize {
+        return Err(WireError::OpTooLarge {
+            op: op.id,
+            bytes: text.len(),
+        });
+    }
+    Ok(text)
+}
+
+/// The fields of a `return`.
+fn return_fields(
+    call: CallId,
+    result: &Result<Value, CallError>,
+) -> Result<Vec<(&'static str, String)>, WireError> {
+    let result = match result {
+        Ok(value) => ("ok", encode(value)),
+        Err(error) => call_error_result(error),
+    };
+    let result =
+        encode_object(&[result]).map_err(|_| WireError::Malformed("repeated field".into()))?;
+    Ok(vec![("call", call.to_string()), ("result", result)])
 }
 
 /// A `u64` as a JSON integer; above the safe range it cannot travel (D24).

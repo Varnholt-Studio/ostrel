@@ -240,6 +240,9 @@ pub enum OpFault {
     Tags { field: FieldId },
     /// The canonical encoding of the op is over [`Limits::op_bytes`] (D109).
     TooLarge { bytes: usize },
+    /// The body names two or more kinds, for example `add` and `remove`. Only this op is
+    /// `Reject Invalid`; the connection stays open (D147, ARCHITECTURE 5.6).
+    SeveralKinds,
 }
 
 /// Why a received value does not fit the type of its place (D132).

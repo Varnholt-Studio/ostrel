@@ -18,11 +18,13 @@
 //! Two kinds of fault, as D132 sets them:
 //!
 //! * the form is wrong (not an object, a missing or extra key, a malformed `id`, `hlc` or
-//!   `row`, a body that is not one of the seven): [`WireError`], fatal for the connection;
+//!   `row`, a body that is not an object or names a kind that is not one of the seven):
+//!   [`WireError`], fatal for the connection;
 //! * the form is right but the op does not fit the schema (unknown model or field, a value of
-//!   the wrong type, a body that does not suit the field) or is over the op size limit:
-//!   [`DecodedOp::Invalid`]. The server rejects it in step 6 of ARCHITECTURE 5.5, after the
-//!   order check, so a replay still gets its original outcome.
+//!   the wrong type, a body that does not suit the field), names two or more of the seven
+//!   kinds (D147), or is over the op size limit: [`DecodedOp::Invalid`]. The server rejects
+//!   it in step 6 of ARCHITECTURE 5.5, after the order check, so a replay still gets its
+//!   original outcome.
 //!
 //! Whether a `make` names every declared field (D116) is checked by the server in step 6, not
 //! here.
@@ -54,6 +56,9 @@ pub fn decode_op(json: Json, schema: &dyn WireSchema) -> Result<DecodedOp, WireE
         hlc: stamp,
         row,
         fault,
+    };
+    let BodyForm::One(body) = body else {
+        return Ok(invalid(OpFault::SeveralKinds));
     };
     let Some(model_id) = schema.model_id(&model) else {
         return Ok(invalid(OpFault::UnknownModel(clip(&model))));
@@ -189,15 +194,33 @@ enum RawBody {
     },
 }
 
-/// Checks the form of `body`: an object with exactly one known key whose object has exactly
-/// the keys of that kind.
-fn raw_body(key: &'static str, json: Json) -> Result<RawBody, WireError> {
+/// A body whose form is right, or one that names several kinds of the seven (D147).
+enum BodyForm {
+    One(RawBody),
+    SeveralKinds,
+}
+
+/// Checks the form of `body`: an object of one or more known kinds, each holding an object
+/// with exactly the keys of that kind. An unknown kind or a malformed kind is fatal, also next
+/// to a well formed one; two or more well formed kinds make only the op invalid (D147).
+fn raw_body(key: &'static str, json: Json) -> Result<BodyForm, WireError> {
     let Json::Obj(entries) = json else {
         return Err(WireError::WrongType(key));
     };
-    let Ok([(kind, inner)]) = <[(String, Json); 1]>::try_from(entries) else {
-        return Err(WireError::WrongType(key));
-    };
+    let several = entries.len() > 1;
+    let mut bodies = entries
+        .into_iter()
+        .map(|(kind, inner)| raw_kind(key, &kind, inner))
+        .collect::<Result<Vec<_>, _>>()?;
+    match bodies.pop() {
+        Some(body) if !several => Ok(BodyForm::One(body)),
+        Some(_) => Ok(BodyForm::SeveralKinds),
+        None => Err(WireError::WrongType(key)),
+    }
+}
+
+/// Checks one kind of a body: its object has exactly the keys of that kind.
+fn raw_kind(key: &'static str, kind: &str, inner: Json) -> Result<RawBody, WireError> {
     let Json::Obj(entries) = inner else {
         return Err(WireError::WrongType(key));
     };
@@ -205,7 +228,7 @@ fn raw_body(key: &'static str, json: Json) -> Result<RawBody, WireError> {
         return Ok(RawBody::Make(entries));
     }
     let mut f = Fields { entries };
-    let body = match kind.as_str() {
+    let body = match kind {
         "drop" => RawBody::Drop,
         "set" => RawBody::Set {
             field: f.req("field", string)?,
