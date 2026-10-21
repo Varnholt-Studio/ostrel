@@ -1,0 +1,8 @@
+style
+  .a {
+    color: red;
+  } /* open
+  .b {}
+
+fn main()
+  print(1)
