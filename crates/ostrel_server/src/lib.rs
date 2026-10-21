@@ -9,6 +9,8 @@
 //!   feature `dev-identity`, which cannot be built without debug assertions (D127).
 //! * [`audit`] stores the audit entry of every elevated execution with the SHA-256 of the
 //!   canonical encoding of its argument list, never the arguments themselves (D117, D118).
+//! * [`key_status`] checks the status of the device key behind a token on every `Hello` and
+//!   HTTP request and closes the open sessions of a revoked key (D102).
 //! * [`secret`] holds a `replica_secret` (D111) and keeps it out of every `Debug` output.
 //! * [`host`] is the [`ostrel_vm::host::ServerHost`] of one VM task, and [`task`] runs a
 //!   program image with it next to the database connection of the task.
@@ -40,6 +42,7 @@ compile_error!(
 pub mod audit;
 pub mod host;
 pub mod identity;
+pub mod key_status;
 pub mod secret;
 pub mod task;
 
