@@ -17,7 +17,7 @@
 //! expression is not decided yet (properties other than `len` and `trim`,
 //! methods of collections, contextual names, std names other than
 //! `Url.parse`, attribute values of std elements other than `img src`,
-//! `link href`, `look` and `scroll`), the expression gets [`Ty::Error`] and nothing is reported,
+//! `link href`, and `look` and `scroll` on any element), the expression gets [`Ty::Error`] and nothing is reported,
 //! so a valid program never fails here. Not yet covered: `E0300` and the
 //! ordering of optionals (both stand at the operator, which the HIR does not
 //! record) and placement.
@@ -428,8 +428,9 @@ impl<'p> Cx<'p> {
             // URLs of `img` and `link` (SPEC 12.13) and the words of `look`
             // and `scroll` (SYNTAX 5); the other attribute types are not
             // declared yet.
-            if let (Some(_), Some(ExprKind::Word { name: word, .. })) =
-                (std, self.p.expr(*value).map(|x| &x.kind))
+            // `look` and `scroll` are common attributes (SYNTAX 4.8), so
+            // their words hold on the element of a view as well.
+            if let Some(ExprKind::Word { name: word, .. }) = self.p.expr(*value).map(|x| &x.kind)
                 && let Some(v) = std_value(name, word)
             {
                 self.words.push((*value, Res::Std(StdName::Value(v))));
@@ -537,15 +538,20 @@ impl<'p> Cx<'p> {
             } => {
                 // SYNTAX 4.4: a none element is not in the collection; a map
                 // holds its keys. A collection literal takes its element type
-                // from the element, unless the element is a word (D142).
+                // from the element, unless the element is a word (D142). A
+                // list may hold `none` (D170), a set may not.
                 let set = match p.expr(*collection).map(|x| &x.kind) {
                     Some(ExprKind::Set(_)) => Some(true),
                     Some(ExprKind::List(_)) => Some(false),
                     _ => None,
                 };
                 if let Some(set) = set.filter(|_| !self.is_word(*element)) {
-                    let item = Box::new(unwrap_optional(self.expr(*element)));
-                    let want = if set { Ty::Set(item) } else { Ty::List(item) };
+                    let item = unwrap_optional(self.expr(*element));
+                    let want = match item {
+                        _ if set => Ty::Set(Box::new(item)),
+                        Ty::Error => Ty::List(Box::new(item)),
+                        _ => Ty::List(Box::new(Ty::Optional(Box::new(item)))),
+                    };
                     self.hinted(*collection, &want);
                     return Ty::Bool;
                 }

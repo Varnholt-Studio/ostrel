@@ -929,3 +929,130 @@ fn ac_29_parenthesized_lower_bound_is_reported_at_the_parenthesis() {
         ["E0311 4:14"]
     );
 }
+
+#[test]
+fn ac_29_none_in_a_list_literal_after_in() {
+    // A list may hold `none` (D170), so `x in [1, none]` is valid like
+    // `x in xs` with `xs: List[Int?]`; a set may not.
+    clean(&with_note(
+        "fn f(x: Int) -> Bool\n  return x in [1, none]\n",
+    ));
+    clean(&with_note(
+        "fn f(x: Int?) -> Bool\n  return x in [1, none]\n",
+    ));
+    clean(&with_note(
+        "fn f(x: Int, xs: List[Int?]) -> Bool\n  return x in xs\n",
+    ));
+    let src = with_note("fn f(x: Int) -> Bool\n  return x in {1, none}\n");
+    assert_eq!(diags(&src), ["E0304 8:19"]);
+}
+
+#[test]
+fn ac_29_list_with_none_against_a_plain_list_is_e0304_at_the_none() {
+    let src = with_note("fn f(xs: List[Int]) -> Bool\n  return xs == [1, none]\n");
+    assert_eq!(diags(&src), ["E0304 8:20"]);
+}
+
+#[test]
+fn ac_29_common_attribute_words_on_a_view_element() {
+    clean(&with_note(
+        "view Other\n  text \"a\"\nview Main\n  Other look: strong\n",
+    ));
+}
+
+/// Probes of review #2565: literals and variables of the same type get the
+/// same verdict, and the positions stay put.
+#[test]
+fn ac_29_review_probes_keep_their_verdicts() {
+    let cases: [(String, &[&str]); 21] = [
+        (
+            format!("{WORDS}fn f(xs: List[Phase]?) -> Bool\n  return xs == [open]\n"),
+            &[],
+        ),
+        (
+            format!("{WORDS}fn f(c: Card) -> Bool\n  return (c.door) in {{open}}\n"),
+            &[],
+        ),
+        (
+            format!("{WORDS}fn f(c: Card) -> Bool\n  return open in {{open, shut}}\n"),
+            &["E0200 11:19"],
+        ),
+        (
+            with_note("fn f(m: Map[Text, Int]) -> Bool\n  return m == [\"a\": 1]\n"),
+            &[],
+        ),
+        (
+            with_note("fn f(m: Map[Text, Int]) -> Bool\n  return m == [\"a\": none]\n"),
+            &["E0304 8:21"],
+        ),
+        (
+            with_note("fn f(xs: List[Int]) -> Bool\n  return xs == []\n"),
+            &[],
+        ),
+        (
+            with_note("fn f(xs: List[Int?]) -> Bool\n  return [1] == xs\n"),
+            &[],
+        ),
+        (
+            with_note("fn f(xs: List[Int?], ys: List[Int]) -> Bool\n  return ys == xs\n"),
+            &[],
+        ),
+        (
+            with_note("fn f(xs: List[Int]) -> Bool\n  return xs == [none]\n"),
+            &["E0304 8:17"],
+        ),
+        (
+            with_note("fn f(n: Int) -> Bool\n  return n == [1]\n"),
+            &["E0304 8:15"],
+        ),
+        (
+            with_note("fn f() -> Bool\n  return \"a\" in {1}\n"),
+            &["E0304 8:18"],
+        ),
+        (
+            with_note("fn f(xs: Set[Int]) -> Bool\n  return \"a\" in xs\n"),
+            &["E0304 8:10"],
+        ),
+        (
+            with_note("fn f() -> Int\n  return (\"x\")\n"),
+            &["E0304 8:10"],
+        ),
+        (
+            with_note("view Main\n  text \"a\" look: end\n"),
+            &["E0200 8:18"],
+        ),
+        (
+            with_note("view Main\n  text \"a\" hint: strong\n"),
+            &["E0200 8:18"],
+        ),
+        (
+            with_note("fn f(xs: Set[Int]) -> Bool\n  return 1 in xs\n"),
+            &[],
+        ),
+        (
+            with_note("fn f(x: Int) -> Bool\n  return x in [\"a\": 1]\n"),
+            &["E0304 8:10"],
+        ),
+        (
+            with_note("fn f(x: Int, m: Map[Text, Int]) -> Bool\n  return x in m\n"),
+            &["E0304 8:10"],
+        ),
+        (
+            with_note("fn f(x: Int) -> Bool\n  return x in [1, none]\n"),
+            &[],
+        ),
+        (
+            with_note("fn f(x: Int, xs: List[Int?]) -> Bool\n  return x in xs\n"),
+            &[],
+        ),
+        (
+            with_note("fn f(x: Int) -> Bool\n  return x in {1, none}\n"),
+            &["E0304 8:19"],
+        ),
+    ];
+    for (src, want) in &cases {
+        assert_eq!(diags(src), *want, "{src}");
+    }
+    let src = with_note("fn f(xs: List[Int]) -> Int\n  for n in xs\n    return n\n");
+    assert_eq!(resolve_diags(&src), ["E0305 7:4"]);
+}
