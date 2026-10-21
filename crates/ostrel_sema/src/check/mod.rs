@@ -522,7 +522,8 @@ impl<'p> Cx<'p> {
                 collection,
                 ..
             } => {
-                let found = self.expr(*element);
+                // SYNTAX 4.4: a none element is not in the collection.
+                let found = unwrap_optional(self.expr(*element));
                 if let Ty::Set(t) | Ty::List(t) | Ty::Range(t) = self.expr(*collection) {
                     self.expect(*element, &t, &found);
                 }

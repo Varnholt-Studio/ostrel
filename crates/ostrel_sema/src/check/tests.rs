@@ -197,6 +197,32 @@ fn mismatch_in_set_literal_and_in() {
     assert_eq!(diags(&src), ["E0304 8:10"]);
 }
 
+// SYNTAX 4.4: `x in c` with `x` none is false, so an optional element fits.
+#[test]
+fn optional_field_in_set_literal_is_valid() {
+    clean("app A\ndata Post\n  tag: Text?\n  see if tag in {\"a\", \"b\"}\n");
+}
+
+#[test]
+fn optional_field_in_set_parameter_is_valid() {
+    clean(
+        "app A\ndata Post\n  tag: Text?\n  see if true\nfn f(p: Post, tags: Set[Text]) -> Bool\n  return p.tag in tags\n",
+    );
+}
+
+#[test]
+fn none_in_set_is_valid() {
+    clean("app A\nfn f(tags: Set[Text]) -> Bool\n  return none in tags\n");
+}
+
+#[test]
+fn optional_element_must_fit_inside() {
+    assert_eq!(
+        diags("app A\ndata Post\n  n: Int?\n  see if n in {\"a\"}\n"),
+        ["E0304 4:10"]
+    );
+}
+
 #[test]
 fn conditions_must_be_bool() {
     // Rule, check, `if`, `where`, view `if`, style condition.
