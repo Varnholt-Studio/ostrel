@@ -199,20 +199,78 @@ fn small_server_messages_round_trip() {
 
 #[test]
 fn every_error_code_round_trips_with_and_without_subscription() {
-    let codes = [
-        ErrorCode::Protocol,
-        ErrorCode::FrameTooLarge,
-        ErrorCode::Unauthorized,
-        ErrorCode::ReplicaExpired,
-        ErrorCode::TooManySubscriptions,
-        ErrorCode::FilterTooLarge,
-        ErrorCode::FilterNotReadable,
-    ];
-    for code in codes {
-        for sub in [None, Some(5)] {
-            server_round_trip(ServerMsg::Error(ProtocolError { sub, code }));
+    for code in ErrorCode::ALL {
+        if code == ErrorCode::RateLimited {
+            server_round_trip(ServerMsg::Error(ProtocolError::rate_limited(5, 1_500)));
+            continue;
+        }
+        server_round_trip(ServerMsg::Error(ProtocolError::fatal(code)));
+        if !code.is_session_fatal() {
+            server_round_trip(ServerMsg::Error(ProtocolError::of_subscription(5, code)));
         }
     }
+}
+
+#[test]
+fn error_frames_of_the_session_limits_are_canonical() {
+    // ARCHITECTURE 5.4 and 5.9, D156, D158, D159: the wire names of the new codes and the
+    // `retry_after_ms` of `RateLimited`, which every other `error` carries as null.
+    let encoded = |e: ProtocolError| encode_server(&ServerMsg::Error(e), &Models, &NoRequests);
+    assert_eq!(
+        encoded(ProtocolError::rate_limited(9, 250)).unwrap(),
+        r#"{"code":"RateLimited","retry_after_ms":250,"sub":9,"t":"error","v":0}"#
+    );
+    for (code, name) in [
+        (ErrorCode::Superseded, "Superseded"),
+        (ErrorCode::TooManySessions, "TooManySessions"),
+        (ErrorCode::Overloaded, "Overloaded"),
+    ] {
+        assert_eq!(
+            encoded(ProtocolError::fatal(code)).unwrap(),
+            format!(r#"{{"code":"{name}","retry_after_ms":null,"sub":null,"t":"error","v":0}}"#)
+        );
+    }
+}
+
+#[test]
+fn an_error_whose_fields_do_not_fit_its_code_is_refused() {
+    let frame = |sub: &str, code: &str, ms: &str| {
+        format!(r#"{{"v":0,"t":"error","sub":{sub},"code":"{code}","retry_after_ms":{ms}}}"#)
+    };
+    let refused = |code| Err(WireError::IllFormedError(code));
+    // A delay beside another code, RateLimited without subscription or without delay, and a
+    // session code that names a subscription.
+    assert_eq!(
+        server(&frame("3", "Protocol", "10")),
+        refused(ErrorCode::Protocol)
+    );
+    assert_eq!(
+        server(&frame("null", "RateLimited", "10")),
+        refused(ErrorCode::RateLimited)
+    );
+    assert_eq!(
+        server(&frame("3", "RateLimited", "null")),
+        refused(ErrorCode::RateLimited)
+    );
+    assert_eq!(
+        server(&frame("3", "Overloaded", "null")),
+        refused(ErrorCode::Overloaded)
+    );
+    assert_eq!(
+        server(&frame("3", "RateLimited", "-1")),
+        Err(WireError::FieldRange("retry_after_ms"))
+    );
+    assert!(server(&frame("3", "RateLimited", "0")).is_ok());
+    // The writer refuses the same errors instead of sending them.
+    let ill = ProtocolError {
+        sub: None,
+        ..ProtocolError::rate_limited(3, 10)
+    };
+    assert_eq!(
+        encode_server(&ServerMsg::Error(ill), &Models, &NoRequests),
+        Err(WireError::IllFormedError(ErrorCode::RateLimited))
+    );
+    assert!(WireError::IllFormedError(ErrorCode::RateLimited).closes_connection());
 }
 
 #[test]
@@ -633,6 +691,10 @@ fn every_key_is_required_and_no_other_key_is_allowed() {
         server(r#"{"v":0,"t":"error","code":"Protocol"}"#),
         Err(WireError::MissingKey("sub"))
     );
+    assert_eq!(
+        server(r#"{"v":0,"t":"error","sub":null,"code":"Protocol"}"#),
+        Err(WireError::MissingKey("retry_after_ms"))
+    );
 }
 
 #[test]
@@ -675,7 +737,7 @@ fn names_and_pairs_are_checked() {
         Err(WireError::WrongType("reason"))
     );
     assert_eq!(
-        server(r#"{"v":0,"t":"error","sub":null,"code":"Teapot"}"#),
+        server(r#"{"v":0,"t":"error","sub":null,"code":"Teapot","retry_after_ms":null}"#),
         Err(WireError::WrongType("code"))
     );
     let ack = |restamped: &str| {
