@@ -1,0 +1,1344 @@
+{
+  "ac": "AC-11",
+  "fixture": "teams",
+  "cases": [
+    {
+      "name": "ac_11_owner_renames_own_task",
+      "covers": "control",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "Two renamed"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "t2.title is \"Two renamed\"; nothing else changed"
+      }
+    },
+    {
+      "name": "ac_11_member_makes_own_task",
+      "covers": "control",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:t9",
+                "body": {
+                  "make": {
+                    "team": "$row:alpha",
+                    "title": "Nine",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "one new Task t9 in alpha, owner bob"
+      }
+    },
+    {
+      "name": "ac_11_admin_drops_unlocked_task",
+      "covers": "control",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "alice",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "drop": {}
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "t2 is deleted"
+      }
+    },
+    {
+      "name": "ac_11_wrong_principal_renames_foreign_task",
+      "covers": "wrong_principal",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t1",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "Mine now"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_wrong_principal_drops_task",
+      "covers": "wrong_principal",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t1",
+                "body": {
+                  "drop": {}
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_admin_drops_unlocked_task"
+    },
+    {
+      "name": "ac_11_wrong_principal_makes_task_in_foreign_team",
+      "covers": "wrong_principal",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "carol",
+      "source": "ARCHITECTURE 5.5 step 5 runs before the rules in step 8: carol cannot read alpha, so the reference is Invalid",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "team": "$row:alpha",
+                    "title": "Intruder",
+                    "owner": "$user:carol",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_wrong_principal_grants_itself_admin",
+      "covers": "wrong_principal",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ARCHITECTURE 5.6 D97: a value change is checked as removal then addition",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Team",
+                "row": "$row:alpha",
+                "body": {
+                  "put": {
+                    "field": "roles",
+                    "key": "$user:bob",
+                    "value": "admin"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_wrong_principal_no_identity",
+      "covers": "wrong_principal",
+      "kind": "session",
+      "verdict": "deny",
+      "as": "anonymous",
+      "source": "D147 (1): in an app with auth a Hello without a token is a fatal Error Unauthorized, so no session exists and nothing can be sent",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "hello",
+            "token": null,
+            "replica": null,
+            "replica_secret": null,
+            "last_server_seq": null
+          },
+          "expect": [
+            {
+              "error": "Unauthorized",
+              "fatal": true
+            }
+          ],
+          "note": "The op this case used to send (rename task t1 as anonymous) can never reach the server: the session is refused at Hello"
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_forged_owner_in_make",
+      "covers": "forged_owner",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "team": "$row:alpha",
+                    "title": "Framed",
+                    "owner": "$user:alice",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_forged_owner_by_edit",
+      "covers": "forged_owner",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "teams.ostl has no record edit rule and no edit owner rule (D8)",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "owner",
+                    "value": "$user:alice"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_forged_author_in_make",
+      "covers": "forged_owner",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D116: implicit fields are not part of a make; a field the make may not name is Invalid",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "team": "$row:alpha",
+                    "title": "Nine",
+                    "owner": "$user:bob",
+                    "locked": false,
+                    "author": "$user:alice"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_forged_op_replica",
+      "covers": "forged_owner",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ARCHITECTURE 5.5 step 1: the replica of the op is the session's replica",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$opof:alice",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t1",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "Spoofed"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Forged",
+              "op": "$opof:alice"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_forged_row_replica_in_make",
+      "covers": "forged_owner",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ARCHITECTURE 5.5 step 1: the RowId of a make carries the session's replica",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$foreignrow:alice",
+                "body": {
+                  "make": {
+                    "team": "$row:alpha",
+                    "title": "Nine",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Forged",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_unknown_field_in_make",
+      "covers": "unknown_field",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D116, D132",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "team": "$row:alpha",
+                    "title": "Nine",
+                    "owner": "$user:bob",
+                    "locked": false,
+                    "priority": 9
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_unknown_field_in_set",
+      "covers": "unknown_field",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D132",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "priority",
+                    "value": 9
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_missing_field_with_default_in_make",
+      "covers": "unknown_field",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D116: the server never evaluates a default for a client op",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "team": "$row:alpha",
+                    "title": "Nine",
+                    "owner": "$user:bob"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_repeated_field_in_make",
+      "covers": "unknown_field",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ARCHITECTURE 5.4 wire form: a field named twice is a repeated key, fatal under D77",
+      "steps": [
+        {
+          "send_raw": "{\"ops\":[{\"body\":{\"make\":{\"locked\":false,\"owner\":\"$user:bob\",\"team\":\"$row:alpha\",\"title\":\"A\",\"title\":\"B\"}},\"hlc\":\"$hlc\",\"id\":\"$op\",\"model\":\"Task\",\"row\":\"$newrow:x\"}],\"t\":\"ops\",\"v\":0}",
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_unknown_model",
+      "covers": "unknown_field",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D132",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Secret",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "title": "x"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_wrong_value_type",
+      "covers": "unknown_field",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D132",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": 5
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_wrong_reference_form",
+      "covers": "unknown_field",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D132",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "team": "alpha",
+                    "title": "Nine",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_check_violated_in_make",
+      "covers": "unknown_field",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ARCHITECTURE 5.5 step 6: check invariants",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "team": "$row:alpha",
+                    "title": "",
+                    "owner": "$user:bob",
+                    "locked": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_offline_op_after_field_removed",
+      "covers": "unknown_field",
+      "kind": "migration",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D132: an offline op whose field was removed is Invalid and never applied to another field; t2.heading stays as migrated",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "Written offline"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ],
+          "note": "The op is created while the server runs teams.ostl and sent after the server restarted with teams_v2.ostl"
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task",
+      "app_after": "tests/acceptance/v0_2/apps/teams_v2.ostl"
+    },
+    {
+      "name": "ac_11_oversized_frame_10_mib",
+      "covers": "oversized_payload",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ARCHITECTURE 5.9: frame over 1 MiB is fatal FrameTooLarge",
+      "steps": [
+        {
+          "send_generated": {
+            "kind": "make_with_text",
+            "model": "Task",
+            "row": "$newrow:x",
+            "fields": {
+              "team": "$row:alpha",
+              "title": "Nine",
+              "owner": "$user:bob",
+              "locked": false
+            },
+            "text_field": "title",
+            "frame_bytes": 10485760
+          },
+          "expect": [
+            {
+              "close": true,
+              "error_if_sent": "FrameTooLarge"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_oversized_text_value",
+      "covers": "oversized_payload",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ARCHITECTURE 5.9: Text over 256 KiB is Invalid; the frame stays under 1 MiB",
+      "steps": [
+        {
+          "send_generated": {
+            "kind": "make_with_text",
+            "model": "Task",
+            "row": "$newrow:x",
+            "fields": {
+              "team": "$row:alpha",
+              "title": "Nine",
+              "owner": "$user:bob",
+              "locked": false
+            },
+            "text_field": "title",
+            "text_bytes": 300000
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_makes_own_task"
+    },
+    {
+      "name": "ac_11_malformed_invalid_utf8",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send_bytes_hex": "7b2276223a302c2274223a226f7073222c226f7073223a5b5d2c2278223a22ff227d",
+          "expect": [
+            {
+              "close": true,
+              "error_if_sent": "Protocol"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_malformed_not_json",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send_raw": "{\"v\":0,\"t\":\"ops\",\"ops\":[",
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_malformed_wrong_version",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 1,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "v1"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_malformed_unknown_message",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "admin",
+            "ops": []
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_malformed_extra_frame_key",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "Extra"
+                  }
+                }
+              }
+            ],
+            "admin": true
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_malformed_op_head",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "ZZ",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "Bad id"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_malformed_body_two_kinds",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D147 (2): a body object whose keys are all known kinds but more than one is Reject Invalid for this op only; an unknown kind or a body that is no object stays fatal",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "x"
+                  },
+                  "drop": {}
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Invalid",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task",
+      "known_red": "crates/ostrel_sync/src/wire/op.rs raw_body still turns a body with more than one key into a fatal WireError; red until the T5 follow up task of D147 (2) lands"
+    },
+    {
+      "name": "ac_11_malformed_body_unknown_kind",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "D147 (2): a body key that is none of the seven kinds stays a fatal form fault, also next to a known kind",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "x"
+                  },
+                  "swap": {}
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_malformed_too_deep",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "wire MAX_DEPTH",
+      "steps": [
+        {
+          "send_generated": {
+            "kind": "nested_arrays",
+            "depth": 200,
+            "in": "ops"
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_malformed_number_out_of_range",
+      "covers": "malformed_encoding",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "alice",
+      "source": "D24",
+      "steps": [
+        {
+          "send_raw": "{\"args\":[\"$row:alpha\"],\"call\":9007199254740993,\"function\":\"clearTasks\",\"t\":\"call\",\"v\":0}",
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_malformed_ops_before_hello",
+      "covers": "malformed_encoding",
+      "kind": "session",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "ErrorCode::Protocol: a message out of order",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Task",
+                "row": "$row:t2",
+                "body": {
+                  "set": {
+                    "field": "title",
+                    "value": "Early"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ],
+          "note": "Sent as the first frame of the connection, before Hello"
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_owner_renames_own_task"
+    },
+    {
+      "name": "ac_11_member_reads_team_tasks",
+      "covers": "control",
+      "kind": "subscribe",
+      "verdict": "allow",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "subscribe",
+            "sub": 1,
+            "query": {
+              "model": "Task",
+              "filter": null,
+              "order": [],
+              "limit": null,
+              "after": null
+            }
+          },
+          "expect": [
+            {
+              "snapshot": {
+                "rows": [
+                  "t1",
+                  "t2"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged"
+    },
+    {
+      "name": "ac_11_outsider_reads_no_foreign_task",
+      "covers": "read",
+      "kind": "subscribe",
+      "verdict": "deny",
+      "as": "carol",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "subscribe",
+            "sub": 1,
+            "query": {
+              "model": "Task",
+              "filter": null,
+              "order": [],
+              "limit": null,
+              "after": null
+            }
+          },
+          "expect": [
+            {
+              "snapshot": {
+                "rows": [
+                  "g1"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_reads_team_tasks"
+    },
+    {
+      "name": "ac_11_outsider_filters_on_foreign_team",
+      "covers": "read",
+      "kind": "subscribe",
+      "verdict": "deny",
+      "as": "carol",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "subscribe",
+            "sub": 1,
+            "query": {
+              "model": "Task",
+              "filter": {
+                "cmp": [
+                  "eq",
+                  {
+                    "field": {
+                      "hops": [],
+                      "field": "team"
+                    }
+                  },
+                  {
+                    "const": "$row:alpha"
+                  }
+                ]
+              },
+              "order": [],
+              "limit": null,
+              "after": null
+            }
+          },
+          "expect": [
+            {
+              "snapshot": {
+                "rows": []
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_11_member_reads_team_tasks"
+    }
+  ]
+}

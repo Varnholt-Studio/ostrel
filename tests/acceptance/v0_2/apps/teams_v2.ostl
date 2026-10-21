@@ -1,0 +1,44 @@
+// Schema change fixture of the rule bypass suite (AC-11, D132): teams.ostl after the field
+// `title` of `Task` was removed and `heading` was added in its place. An offline op written
+// against teams.ostl that sets `title` must be Invalid and must never write `heading`.
+
+app Teams
+  auth paseto open
+
+enum Role = guest | member | admin
+
+data Team
+  name: Text
+  roles: Map[User, Role] = [me: admin]
+  check name.len in 1..80
+  see if me in roles
+  make if roles == [me: admin]
+  edit name if roles[me] == admin
+  edit roles if roles[me] == admin
+
+data Task
+  team: Team fixed
+  heading: Text
+  owner: User
+  locked: Bool = false
+  check heading.len in 1..200
+  see if me in team.roles
+  make if owner == me and (team.roles[me] ?? guest) >= member
+  edit heading if owner == me
+  drop if team.roles[me] == admin and not locked
+
+server fn clearTasks(t: Team)
+  call if t.roles[me] == admin
+  drop Task where team == t
+
+server fn purgeTasks(t: Team)
+  drop Task where team == t
+
+server fn archiveTeam(t: Team) as system
+  call if t.roles[me] == admin
+  drop Task where team == t
+
+view Main
+  col
+    for t in Team sort name
+      text t.name

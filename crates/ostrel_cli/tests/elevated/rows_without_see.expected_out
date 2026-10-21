@@ -1,0 +1,6 @@
+elevated functions: 2
+crates/ostrel_cli/tests/elevated/rows_without_see.ostl:14:1: `exportNotes` -> List[Note]: returns rows without see
+  client path: exportNotes
+  client path: report -> collect -> exportNotes
+crates/ostrel_cli/tests/elevated/rows_without_see.ostl:18:1: `firstNote` -> Note?: returns rows without see
+  client path: firstNote

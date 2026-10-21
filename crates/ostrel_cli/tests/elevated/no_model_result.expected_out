@@ -1,0 +1,6 @@
+elevated functions: 2
+crates/ostrel_cli/tests/elevated/no_model_result.ostl:9:1: `countTeams` -> Int
+  client path: countTeams
+crates/ostrel_cli/tests/elevated/no_model_result.ostl:13:1: `rename`
+  client path: rename
+  client path: renameAll -> rename

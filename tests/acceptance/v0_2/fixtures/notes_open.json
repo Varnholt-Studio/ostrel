@@ -1,0 +1,20 @@
+{
+  "app": "examples/v0_2/notes/notes.ostl",
+  "users": [],
+  "replicas": [
+    "s1",
+    "s2"
+  ],
+  "given": [
+    {
+      "as": "s1",
+      "make": "Note",
+      "alias": "n1",
+      "fields": {
+        "title": "First",
+        "body": "",
+        "pinned": false
+      }
+    }
+  ]
+}
