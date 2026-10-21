@@ -43,6 +43,11 @@ fn ac_18_conformance_memory() {
   error variant are reported.
 * `append_ops` and `reject` items of a `tx` step are one `append_ops` or `record_reject` call
   each, in order with the writes. An expected `Invalid` matches any rule text.
+* Every `append_ops` call is checked against the log as the transaction reads it with
+  `ops_since` before and after the call: the ops of the call follow the earlier log in order
+  with strictly increasing positions, and the returned position is the one of the last op, or
+  the last position of the log for a call without ops. A wrong result fails the step and the
+  transaction is rolled back.
 * A `tx` step with `"rollback"` runs every call, which must succeed, and then rolls back.
 * Each `ops_since` step runs begin, `ops_since`, rollback and compares the ops in order; the
   positions must be above the given one and strictly increase, their values are not compared.
@@ -57,6 +62,20 @@ fn ac_18_conformance_memory() {
 * The run fails if the folder has no case files, a file is invalid, or a test name repeats
   across files.
 
+## Built in cases
+
+`run_dir` also runs the cases of `run_builtin`, reported under the file name `harness`. They
+need a result that depends on the driver, which the fixed expectations of a case file cannot
+state.
+
+* `ac_10_commit_error_is_final`, outcome contract of `commit` (D156, D159; doc comment of
+  `Transaction::commit`). It appends op A, appends A again (must give `Conflict`) and commits.
+  A driver may refuse calls after an error, so the commit may give `Err`; then A must be
+  nowhere (no replay outcome, `last_seq` 0, not in the log), also after the next commit on the
+  same connection. If the commit gives `Ok`, A must be committed. The memory driver and SQLite
+  refuse the commit, so they run the `Err` branch. Commit errors a driver has beyond this one
+  (a stale copy in memory, a lost connection in PostgreSQL) are tested by the driver crate.
+
 The case file reader is strict: unknown or missing keys, lone surrogates, duplicate object keys,
 values that do not fit the field type and `text_repeat` values over 16 MiB make the file invalid.
 
@@ -66,6 +85,7 @@ values that do not fit the field type and `text_repeat` values over 16 MiB make 
 a reference driver with one injected fault each (upsert, reused tombstone id, missing version
 increase, lost NUL, UTF-16 order, rollback that keeps writes, ignored limit, `last_seq` not
 raised by `append_ops`, a second outcome for one op, committed positions given again, a log
-read in the wrong order) and checks that exactly the affected cases fail. A driver that leaves
+read in the wrong order, a wrong position returned by `append_ops`, a refused commit that is
+visible at once or after the next commit) and checks that exactly the affected cases fail. A driver that leaves
 a gap after a rollback, as a PostgreSQL sequence does, must still pass. It also runs the shared
 case files against the fault free reference driver, once through the entry shown above.
