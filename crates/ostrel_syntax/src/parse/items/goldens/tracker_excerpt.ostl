@@ -1,0 +1,43 @@
+enum Role = guest | member | admin
+enum Status = backlog | todo | doing | done | canceled
+
+data Team
+  name: Text
+  prefix: Text fixed
+  roles: Map[User, Role] = [me: admin]
+  see if me in roles
+  make if roles == [me: admin]
+  edit name if roles[me] == admin
+  edit roles if roles[me] == admin and admin in new.roles.values
+
+data Issue
+  team: Team fixed
+  number: Int? serial per team
+  title: Text
+  body: Text merge text
+  status: Status = backlog
+  assignee: User?
+  rank: Rank
+  check title.len in 1..200
+  check assignee == none or assignee in team.roles
+  see if me in team.roles
+  make if (team.roles[me] ?? guest) >= member
+  edit if (team.roles[me] ?? guest) >= member
+  edit status if status != done or team.roles[me] == admin
+  drop if team.roles[me] == admin
+
+server fn closeDone(t: Team, days: Int)
+  call if t.roles[me] == admin
+  drop Issue where team == t and status == done and changed < now - days.days
+
+view Board(t: Team)
+  row ~board
+    for s in Status
+      col ~lane
+        text s.label look: strong
+        for i in Issue where team == t and status == s sort rank
+          col ~card
+            if let n = i.number
+              text "{t.prefix}-{n}" look: muted
+            text i.title
+            pick bind: i.assignee options: t.roles.keys

@@ -71,6 +71,8 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0027 | `parse_comparison_chain` | 5:15 | comparisons do not chain; write `a < b and b < c` |
 | E0028 | `parse_bare_return` | 2:9 | expected a value after `return`, found end of line |
 | E0100 | `check_float_type_v0_1` | 1:14 | type `Float` is not available in v0.1 |
+| E0100 | `check_v0_2_enum_declaration` | 4:1 | `enum` declaration is not available in v0.1 |
+| E0100 | `check_v0_2_server_fn` | 4:1 | `server fn` is not available in v0.1 |
 | E0200 | `name_unknown` | 3:9 | unknown name `y` |
 | E0201 | `name_duplicate_fn` | 4:4 | function `f` is already declared |
 | E0201 | `name_duplicate_main` | 4:4 | function `main` is already declared |

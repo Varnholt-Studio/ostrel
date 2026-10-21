@@ -1,7 +1,7 @@
 use ostrel_core::{FileId, SourceMap};
 use ostrel_syntax::ast::{
-    BinaryOp, BlockId, ExprId, ExprKind, FnDecl, Ident, Module, Param, StmtId, StmtKind, StrPart,
-    TextRange, TypeRef, UnaryOp,
+    AppDecl, BinaryOp, BlockId, EnumDecl, ExprId, ExprKind, FnDecl, Ident, Item, Module, Param,
+    PlacedFnDecl, Placement, StmtId, StmtKind, StrPart, TextRange, TypeRef, TypedParam, UnaryOp,
 };
 
 use super::*;
@@ -161,6 +161,83 @@ fn ac_03_golden_check_float_type_v0_1() {
         );
         b.main_print_ok(0);
     });
+}
+
+#[test]
+fn ac_03_golden_check_v0_2_enum_declaration() {
+    golden!("check_v0_2_enum_declaration", |b| {
+        b.main_print_ok(0);
+        let decl = EnumDecl {
+            name: b.ident("Color", 0),
+            variants: Box::new([b.ident("red", 0), b.ident("green", 0)]),
+            range: b.r("enum Color = red | green", 0),
+        };
+        b.m.add_item(Item::Enum(Box::new(decl))).unwrap();
+    });
+}
+
+#[test]
+fn ac_03_golden_check_v0_2_server_fn() {
+    golden!("check_v0_2_server_fn", |b| {
+        b.main_print_ok(0);
+        let one = b.int("1", 0);
+        let body = ret(b, one);
+        let result = b.m.named_ty("Int").unwrap();
+        let decl = PlacedFnDecl {
+            placement: Placement::Server,
+            name: b.ident("ping", 0),
+            params: Box::new([]),
+            result: Some(result),
+            elevated: None,
+            call_rule: None,
+            body,
+            range: b.r("server fn ping() -> Int\n  return 1", 0),
+        };
+        b.m.add_item(Item::PlacedFn(Box::new(decl))).unwrap();
+    });
+}
+
+/// Every v0.2 declaration is reported at its first keyword, one diagnostic
+/// per declaration, never at 1:1 (kai #1757).
+#[test]
+fn v0_2_declarations_are_reported_at_their_keyword() {
+    let src = "fn main()\n  print(\"ok\")\n\napp Notes\n\nenum Color = red\n\n\
+               fn helper(n: List<Int>) -> Int\n  return 1\n";
+    let mut b = B::new(src);
+    b.main_print_ok(0);
+    let app = AppDecl {
+        name: b.ident("Notes", 0),
+        items: Box::new([]),
+        range: b.r("app Notes", 0),
+    };
+    b.m.add_item(Item::App(Box::new(app))).unwrap();
+    let decl = EnumDecl {
+        name: b.ident("Color", 0),
+        variants: Box::new([b.ident("red", 0)]),
+        range: b.r("enum Color = red", 0),
+    };
+    b.m.add_item(Item::Enum(Box::new(decl))).unwrap();
+    let one = b.int("1", 0);
+    let body = ret(&mut b, one);
+    let list = b.m.named_ty("List").unwrap();
+    let int = b.m.named_ty("Int").unwrap();
+    let placed = PlacedFnDecl {
+        placement: Placement::Inferred,
+        name: b.ident("helper", 0),
+        params: Box::new([TypedParam::bare("n", list)]),
+        result: Some(int),
+        elevated: None,
+        call_rule: None,
+        body,
+        range: b.r("fn helper(n: List<Int>) -> Int\n  return 1", 0),
+    };
+    b.m.add_item(Item::PlacedFn(Box::new(placed))).unwrap();
+    assert_eq!(
+        b.render("t.ostl"),
+        "t.ostl:4:1: error[E0100]: `app` declaration is not available in v0.1\n\
+         t.ostl:6:1: error[E0100]: `enum` declaration is not available in v0.1\n\
+         t.ostl:8:1: error[E0100]: this function declaration is not available in v0.1\n"
+    );
 }
 
 #[test]

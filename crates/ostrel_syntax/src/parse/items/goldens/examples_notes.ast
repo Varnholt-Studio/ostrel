@@ -1,0 +1,31 @@
+app Notes
+data Note
+  (field title Text)
+  (field body Text (= (str )))
+  (field pinned Bool (= false))
+  (check (in (. title len) (.. 1 200)))
+  (check (in (. body len) (.. 0 2000)))
+  (see true)
+  (make true)
+  (edit true)
+  (edit title (not pinned))
+  (drop (not pinned))
+fn deleteNote(n: Note)
+  (drop (query n))
+view Main
+  <col>
+    <entry (hint: (str "New note")) (submit: (str "Add"))>
+      (on submit (make Note (title it)))
+    for n (query Note (sort title))
+      <col>
+        <text (. n title) (look: strong)>
+        <text (. n body)>
+        <entry (hint: (str "Text of " {(. n title)})) (submit: (str "Save"))>
+          (on submit (= (. n body) it))
+        if (. n pinned)
+          <button (str "Unpin") (on click (= (. n pinned) false))>
+        else
+          <entry (hint: (str "Rename " {(. n title)})) (submit: (str "Rename"))>
+            (on submit (= (. n title) it))
+          <button (str "Pin") (on click (= (. n pinned) true))>
+          <button (str "Delete") (on click (call deleteNote n))>

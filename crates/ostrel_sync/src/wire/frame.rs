@@ -5,14 +5,15 @@ use ostrel_core::ids::{Hlc, InvalidId, OpId, ReplicaId, RowId, ServerSeq};
 use ostrel_core::value::INT_MAX;
 
 use super::json::{self, Json, NotSafeInt};
-use super::{WireError, clip};
+use super::op::{decode_op, encode_op};
+use super::{WireError, WireSchema, clip};
 use crate::protocol::{
-    Ack, ClientMsg, ErrorCode, Hello, LIMITS, Limits, PROTOCOL_VERSION, ProtocolError,
-    RejectReason, ServerMsg, Welcome,
+    Ack, ClientMsg, DecodedOp, ErrorCode, Hello, LIMITS, Limits, ModelId, PROTOCOL_VERSION,
+    ProtocolError, RejectReason, ServerMsg, Welcome,
 };
 
-/// Reads one frame sent by a client.
-pub fn decode_client(frame: &[u8]) -> Result<ClientMsg, WireError> {
+/// Reads one frame sent by a client. Models and fields are looked up by name in `schema`.
+pub fn decode_client(frame: &[u8], schema: &dyn WireSchema) -> Result<ClientMsg, WireError> {
     let (name, mut fields) = open(frame)?;
     let msg = match name.as_str() {
         "hello" => ClientMsg::Hello(Hello {
@@ -29,8 +30,10 @@ pub fn decode_client(frame: &[u8]) -> Result<ClientMsg, WireError> {
             rows: fields.req("rows", |k, j| list(k, j, row_id))?,
             last: fields.req("last", boolean)?,
         },
+        "ops" => {
+            ClientMsg::Ops(fields.req("ops", |k, j| list(k, j, |_, op| decode_op(op, schema)))?)
+        }
         "subscribe" => return Err(WireError::Unsupported("subscribe")),
-        "ops" => return Err(WireError::Unsupported("ops")),
         "call" => return Err(WireError::Unsupported("call")),
         other => return Err(WireError::UnknownMessage(clip(other))),
     };
@@ -38,8 +41,8 @@ pub fn decode_client(frame: &[u8]) -> Result<ClientMsg, WireError> {
     Ok(msg)
 }
 
-/// Reads one frame sent by the server.
-pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
+/// Reads one frame sent by the server. Models and fields are looked up by name in `schema`.
+pub fn decode_server(frame: &[u8], schema: &dyn WireSchema) -> Result<ServerMsg, WireError> {
     let (name, mut fields) = open(frame)?;
     let msg = match name.as_str() {
         "welcome" => ServerMsg::Welcome(Welcome {
@@ -63,7 +66,7 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
         },
         "evict" => ServerMsg::Evict {
             sub: fields.req("sub", uint32)?,
-            model: fields.req("model", uint32)?,
+            model: fields.req("model", |k, j| model_id(k, j, schema))?,
             rows: fields.req("rows", |k, j| list(k, j, row_id))?,
         },
         "reset" => ServerMsg::Reset {
@@ -82,8 +85,11 @@ pub fn decode_server(frame: &[u8]) -> Result<ServerMsg, WireError> {
     Ok(msg)
 }
 
-/// Writes one client message as a canonical frame.
-pub fn encode_client(msg: &ClientMsg) -> Result<String, WireError> {
+/// Writes one client message as a canonical frame. Ids are written as their names in `schema`.
+///
+/// A [`DecodedOp::Invalid`] in an `ops` batch is [`WireError::InvalidOp`]: it exists only on
+/// the receiving side, and no client sends an op it could not encode.
+pub fn encode_client(msg: &ClientMsg, schema: &dyn WireSchema) -> Result<String, WireError> {
     let fields = match msg {
         ClientMsg::Hello(h) => vec![
             ("token", opt(h.token.as_deref(), encode_str)),
@@ -103,16 +109,16 @@ pub fn encode_client(msg: &ClientMsg) -> Result<String, WireError> {
             ("rows", array(rows.iter().map(|r| hex(&r.to_hex())))),
             ("last", last.to_string()),
         ],
+        ClientMsg::Ops(ops) => vec![("ops", ops_array(ops, schema)?)],
         ClientMsg::Subscribe { .. } => return Err(WireError::Unsupported("subscribe")),
-        ClientMsg::Ops(_) => return Err(WireError::Unsupported("ops")),
         ClientMsg::Call { .. } => return Err(WireError::Unsupported("call")),
     };
     close(msg.name(), fields)
 }
 
-/// Writes one server message as a canonical frame. A frame over the frame limit is an error:
-/// the server never sends one (D121).
-pub fn encode_server(msg: &ServerMsg) -> Result<String, WireError> {
+/// Writes one server message as a canonical frame. Ids are written as their names in `schema`.
+/// A frame over the frame limit is an error: the server never sends one (D121).
+pub fn encode_server(msg: &ServerMsg, schema: &dyn WireSchema) -> Result<String, WireError> {
     let fields = match msg {
         ServerMsg::Welcome(w) => vec![
             ("replica", hex(&w.replica.to_hex())),
@@ -145,7 +151,7 @@ pub fn encode_server(msg: &ServerMsg) -> Result<String, WireError> {
         ],
         ServerMsg::Evict { sub, model, rows } => vec![
             ("sub", sub.to_string()),
-            ("model", model.to_string()),
+            ("model", encode_str(model_name(*model, schema)?)),
             ("rows", array(rows.iter().map(|r| hex(&r.to_hex())))),
         ],
         ServerMsg::Reset { sub } => vec![("sub", sub.to_string())],
@@ -355,6 +361,15 @@ fn restamp(key: &'static str, j: Json) -> Result<(OpId, Hlc), WireError> {
     }
 }
 
+/// A model name of a server message. Client and server share one compiled schema, so a name
+/// the receiver does not know is a fatal mismatch, unlike an unknown model in a client op.
+fn model_id(key: &'static str, j: Json, schema: &dyn WireSchema) -> Result<ModelId, WireError> {
+    let name = string(key, j)?;
+    schema
+        .model_id(&name)
+        .ok_or_else(|| WireError::UnknownModel(clip(&name)))
+}
+
 fn reject_reason(key: &'static str, j: Json) -> Result<RejectReason, WireError> {
     let name = string(key, j)?;
     RejectReason::ALL
@@ -385,6 +400,7 @@ fn limits(key: &'static str, j: Json) -> Result<Limits, WireError> {
         ops_burst: f.req("ops_burst", uint32)?,
         rows_per_hour: f.req("rows_per_hour", uint32)?,
         op_bytes: f.req("op_bytes", uint32)?,
+        row_bytes: f.req("row_bytes", uint32)?,
         nesting_depth: f.req("nesting_depth", uint32)?,
         text_bytes: f.req("text_bytes", uint32)?,
         subscriptions_per_session: f.req("subscriptions_per_session", uint32)?,
@@ -422,6 +438,24 @@ pub(super) fn array(items: impl IntoIterator<Item = String>) -> String {
     ostrel_core::canon::encode_array(&items)
 }
 
+fn model_name(model: ModelId, schema: &dyn WireSchema) -> Result<&str, WireError> {
+    schema
+        .model_name(model)
+        .ok_or(WireError::NotInSchema("model"))
+}
+
+/// The ops of a client batch, each as [`encode_op`] writes it.
+fn ops_array(ops: &[DecodedOp], schema: &dyn WireSchema) -> Result<String, WireError> {
+    let items = ops
+        .iter()
+        .map(|op| match op {
+            DecodedOp::Valid(op) => encode_op(op, schema),
+            DecodedOp::Invalid { id, .. } => Err(WireError::InvalidOp(*id)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(array(items))
+}
+
 /// A `u64` as a JSON integer; above the safe range it cannot travel (D24).
 fn safe_uint64(key: &'static str, v: u64) -> Result<String, WireError> {
     if v > INT_MAX.unsigned_abs() {
@@ -440,6 +474,7 @@ fn limits_object(l: &Limits) -> Result<String, WireError> {
         ops_burst,
         rows_per_hour,
         op_bytes,
+        row_bytes,
         nesting_depth,
         text_bytes,
         subscriptions_per_session,
@@ -465,6 +500,7 @@ fn limits_object(l: &Limits) -> Result<String, WireError> {
         ("ops_burst", ops_burst),
         ("rows_per_hour", rows_per_hour),
         ("op_bytes", op_bytes),
+        ("row_bytes", row_bytes),
         ("nesting_depth", nesting_depth),
         ("text_bytes", text_bytes),
         ("subscriptions_per_session", subscriptions_per_session),
