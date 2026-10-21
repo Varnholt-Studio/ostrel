@@ -16,7 +16,7 @@ use ostrel_core::Span;
 use ostrel_sema::hir;
 
 use super::{App, Enum, EnumId, Field, FieldMode, FieldRef, Merge, Model, ModelId, Program};
-use super::{Registration, Ty};
+use super::{ImplicitField, Registration, Ty};
 
 /// Why a HIR could not be lowered: it was not accepted by `hir::check`, or it
 /// is inconsistent. The span points at the declaration where this was found.
@@ -98,9 +98,17 @@ impl Ids {
             hir::FieldMode::Plain => FieldMode::Plain,
             hir::FieldMode::Fixed => FieldMode::Fixed,
             hir::FieldMode::Server => FieldMode::Server,
-            hir::FieldMode::Serial(per) => {
-                FieldMode::Serial(per.map(|f| FieldRef::Declared(super::FieldId(f.0))))
-            }
+            hir::FieldMode::Serial(per) => FieldMode::Serial(per.map(|f| match f {
+                hir::FieldRef::Declared(id) => FieldRef::Declared(super::FieldId(id.0)),
+                hir::FieldRef::Implicit(implicit) => FieldRef::Implicit(match implicit {
+                    hir::ImplicitField::Id => ImplicitField::Id,
+                    hir::ImplicitField::Made => ImplicitField::Made,
+                    hir::ImplicitField::Changed => ImplicitField::Changed,
+                    hir::ImplicitField::Author => ImplicitField::Author,
+                    hir::ImplicitField::Pending => ImplicitField::Pending,
+                    hir::ImplicitField::Rejected => ImplicitField::Rejected,
+                }),
+            })),
         };
         let merge = match field.merge {
             hir::Merge::Default => Merge::Default,

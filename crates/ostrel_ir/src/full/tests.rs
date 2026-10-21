@@ -1062,7 +1062,7 @@ fn hir_program(field_ty: hir::Ty) -> hir::Program {
                         field(
                             "number",
                             hir::Ty::Int,
-                            hir::FieldMode::Serial(Some(hir::FieldId(0))),
+                            hir::FieldMode::Serial(Some(hir::FieldRef::Declared(hir::FieldId(0)))),
                         ),
                         field("extra", field_ty, hir::FieldMode::Server),
                     ],
