@@ -270,7 +270,7 @@ fn main()
 }
 
 #[test]
-fn code_after_return_is_not_lowered_and_a_missing_return_is_an_error() {
+fn code_after_return_is_not_lowered() {
     let p = ok("\
 fn f(a: Int) -> Int
   return a
@@ -281,22 +281,34 @@ fn main()
 ");
     let (_, f) = func(&p, "f");
     assert!(!insts(f).any(|k| matches!(k, InstKind::Print { .. })));
-    assert_eq!(
-        error_at(
-            "\
+}
+
+/// A missing `return` is E0305 of the front end (D189), so `lower` never
+/// sees such a program.
+#[test]
+fn a_missing_return_is_reported_before_lower() {
+    let src = "\
 fn f(a: Int) -> Int
   if a > 0
     return a
 
 fn main()
   print(\"{f(1)}\")
-"
-        ),
-        (
-            "unchecked",
-            "fn f(a: Int) -> Int\n  if a > 0\n    return a".to_string()
-        )
+";
+    let (tokens, lexed) = ostrel_syntax::lex::lex(src, FILE);
+    let (module, parsed) = ostrel_syntax::parse::parse(src, FILE, &tokens, &lexed);
+    assert!(
+        lexed.is_empty() && parsed.is_empty(),
+        "{lexed:?} {parsed:?}"
     );
+    let (mut program, mut diags) = hir::resolve(&[hir::Source {
+        file: FILE,
+        text: src,
+        module: &module,
+    }]);
+    diags.extend(hir::check(&mut program));
+    let codes: Vec<String> = diags.iter().map(|d| d.code.to_string()).collect();
+    assert_eq!(codes, ["E0305"]);
 }
 
 #[test]
