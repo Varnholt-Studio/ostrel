@@ -1,0 +1,1 @@
+crates/ostrel_cli/tests/ac_56/own_loop_var_in_count.ostl:11:31: error[E0207]: loop variable `k` is not bound in its own query; rename the local

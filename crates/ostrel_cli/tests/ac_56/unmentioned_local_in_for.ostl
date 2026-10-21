@@ -1,0 +1,13 @@
+// SPEC 12.10: a clashing local the query does not mention is reported at the type name
+// in the query head.
+app Golden
+
+data Post
+  pos: Int
+  text: Text
+  see if true
+  drop if true
+
+fn f(text: Text)
+  for p in Post sort pos limit 2
+    let x = 1
