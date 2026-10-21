@@ -649,15 +649,13 @@ fn a_bridge_call_under_the_write_lock_is_busy_and_not_sent() {
 }
 
 #[test]
-fn the_step_limit_under_the_write_lock_is_200_000() {
+fn the_step_limit_is_200_000_with_and_without_the_write_lock() {
     let s = setup();
     assert!(block_on(s.server.call(None, BUMP, &[text("a")])).is_ok());
     assert!(block_on(s.server.call(None, COUNT, &[])).is_ok());
     assert_eq!(LOCKED_CALL_STEPS, 200_000);
-    assert_eq!(
-        *s.probe.steps.borrow(),
-        [(BUMP, 200_000), (COUNT, Limits::default().max_steps)]
-    );
+    // D177: a call that takes no lock has the same step limit.
+    assert_eq!(*s.probe.steps.borrow(), [(BUMP, 200_000), (COUNT, 200_000)]);
 }
 
 #[test]

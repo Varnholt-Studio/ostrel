@@ -4,7 +4,10 @@
 //! ([`ServerFns`]), the writer connection behind the write lock, the read connection, the audit
 //! store and the clock. [`CallServer::call`] runs one call in the order of D159 and D161:
 //!
-//! * A fn that is not locking takes no lock. It gets the read connection as
+//! * A fn that is not locking takes no lock. Its VM step limit is [`LOCKED_CALL_STEPS`] as
+//!   well: the process runs on one thread, so a VM that loops without an await blocks every
+//!   session, writers and the broadcast queue included, whether or not it holds the lock
+//!   (ARCHITECTURE 5.9, risk 13 (a)). It gets the read connection as
 //!   [`CallDb::Read`], a [`ReadDb`] that reads each query in a read transaction of its own
 //!   and gives the connection no other way, so no read
 //!   transaction is open while the VM runs, across an `extern js server` call or while it waits
@@ -49,6 +52,9 @@ use crate::host::{Clock, TaskHost};
 
 /// VM steps of a call while it holds the write lock (ARCHITECTURE 5.9, D161); each row that a
 /// query returns under the lock counts 100 steps, which the VM entry charges.
+///
+/// A call that takes no lock gets the same step limit: it blocks the process just as long
+/// while its VM runs, so it may not take longer than a writer may.
 pub const LOCKED_CALL_STEPS: u64 = 200_000;
 
 /// The database a server fn reads and writes in one call.
@@ -169,7 +175,7 @@ pub struct CallServer {
 impl CallServer {
     /// A call server. `writer` and `reader` are two connections to the same app database; the
     /// reader must be opened in the adapter's reader form (D161). `limits` are the VM limits
-    /// of a call; under the write lock the step limit is at most [`LOCKED_CALL_STEPS`].
+    /// of a call; the step limit of every call is at most [`LOCKED_CALL_STEPS`].
     pub fn new(
         fns: Box<dyn ServerFns>,
         writer: Box<dyn Connection>,
@@ -209,6 +215,10 @@ impl CallServer {
         let mut clock = SharedClock(&self.clock);
         let mut audit = SharedAudit(&self.audit);
         let mut host = TaskHost::new(principal, &mut clock, &mut audit);
+        let limits = Limits {
+            max_steps: self.limits.max_steps.min(LOCKED_CALL_STEPS),
+            ..self.limits
+        };
 
         if !self.fns.is_locking(function) {
             let result = self
@@ -218,7 +228,7 @@ impl CallServer {
                     &mut host,
                     function,
                     args,
-                    self.limits,
+                    limits,
                 )
                 .await;
             let (_, audit_failure) = host.finish();
@@ -232,10 +242,6 @@ impl CallServer {
         let mut writer = self.writer.lock().await;
         let Ok(mut tx) = writer.begin().await else {
             return Ok(Err(CallError::Unavailable));
-        };
-        let limits = Limits {
-            max_steps: self.limits.max_steps.min(LOCKED_CALL_STEPS),
-            ..self.limits
         };
         let result = {
             let mut locked = LockedHost(&mut host);
