@@ -242,18 +242,23 @@ fn optional_element_makes_literal_optional_in_either_order() {
 
 #[test]
 fn literal_with_none_does_not_fit_plain_elements() {
-    // Same finding at the literal, whatever the position of `none`.
+    // With an expected type the finding is at `none`, wherever it stands.
     assert_eq!(
         diags("app A\nvar xs: List[Int] = [1, none]\n"),
-        ["E0304 2:21"]
+        ["E0304 2:25"]
     );
     assert_eq!(
         diags("app A\nvar xs: List[Int] = [none, 1]\n"),
-        ["E0304 2:21"]
+        ["E0304 2:22"]
     );
     assert_eq!(
         messages("app A\nvar tags: Set[Text] = {\"a\", none}\n"),
-        ["expected `Set[Text]`, found `Set[Text?]`"]
+        ["expected `Text`, found `none`"]
+    );
+    // Without one, the literal's type does not fit.
+    assert_eq!(
+        diags("app A\nvar xs = [1, none]\nvar ys: List[Int] = xs\n"),
+        ["E0304 3:21"]
     );
 }
 
@@ -427,5 +432,180 @@ fn std_user_rules_check_clean() {
         p.exprs
             .iter()
             .any(|e| matches!(e.kind, ExprKind::Name(Res::Field(..))))
+    );
+}
+
+/// All orders of `items`.
+fn permutations(items: &[&str]) -> Vec<Vec<String>> {
+    if items.len() <= 1 {
+        return vec![items.iter().map(|s| s.to_string()).collect()];
+    }
+    let mut all = Vec::new();
+    for i in 0..items.len() {
+        let mut rest = items.to_vec();
+        let first = rest.remove(i);
+        for mut tail in permutations(&rest) {
+            tail.insert(0, first.to_string());
+            all.push(tail);
+        }
+    }
+    all
+}
+
+/// Brackets, annotation, elements and the expected type of `var xs`.
+type Case = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    Option<Ty>,
+);
+
+/// The type of `var xs` and the codes of the diagnostics.
+fn var_outcome(src: &str) -> (Option<Ty>, Vec<String>) {
+    let (p, d) = run(src);
+    let ty = p.defs.iter().find_map(|d| match &d.kind {
+        DefKind::Var(v) => v.ty.clone(),
+        _ => None,
+    });
+    (ty, d.into_iter().map(|d| d.code.to_string()).collect())
+}
+
+// SYNTAX 4.4, yannick #2408, ivo #2419: the type of a literal and its
+// findings do not depend on the order of its elements, also nested, with
+// and without an expected type.
+#[test]
+fn literal_types_do_not_depend_on_element_order() {
+    let int = || Box::new(Ty::Int);
+    let opt = |t: Box<Ty>| Box::new(Ty::Optional(t));
+    let cases: [Case; 10] = [
+        (
+            "[",
+            "]",
+            "",
+            &["[1]", "[none]", "[2, none]"],
+            Some(Ty::List(Box::new(Ty::List(opt(int()))))),
+        ),
+        (
+            "[",
+            "]",
+            ": List[List[Int?]]",
+            &["[1]", "[none]", "[]"],
+            Some(Ty::List(Box::new(Ty::List(opt(int()))))),
+        ),
+        (
+            "{",
+            "}",
+            "",
+            &["\"a\"", "none", "\"b\""],
+            Some(Ty::Set(opt(Box::new(Ty::Text)))),
+        ),
+        (
+            "{",
+            "}",
+            ": Set[Text?]",
+            &["\"a\"", "none", "\"b\""],
+            Some(Ty::Set(opt(Box::new(Ty::Text)))),
+        ),
+        (
+            "[",
+            "]",
+            "",
+            &["1: [none]", "2: [3]", "4: []"],
+            Some(Ty::Map(int(), Box::new(Ty::List(opt(int()))))),
+        ),
+        (
+            "[",
+            "]",
+            ": Map[Int, Int?]",
+            &["1: none", "2: 3"],
+            Some(Ty::Map(int(), opt(int()))),
+        ),
+        (
+            "[",
+            "]",
+            "",
+            &["{none}", "{1}", "none"],
+            Some(Ty::List(opt(Box::new(Ty::Set(opt(int())))))),
+        ),
+        // Elements without a join: one finding, no element type, in every order.
+        (
+            "[",
+            "]",
+            "",
+            &["[1]", "[\"a\"]", "[none]"],
+            Some(Ty::List(Box::new(Ty::Error))),
+        ),
+        (
+            "[",
+            "]",
+            "",
+            &["1", "\"a\"", "none"],
+            Some(Ty::List(Box::new(Ty::Error))),
+        ),
+        // With an expected type each element that does not fit is a finding.
+        (
+            "[",
+            "]",
+            ": List[List[Int]]",
+            &["[1]", "[\"a\"]", "[none]"],
+            Some(Ty::List(Box::new(Ty::List(int())))),
+        ),
+    ];
+    for (open, close, annotation, items, want) in cases {
+        let mut seen: Option<(Option<Ty>, Vec<String>)> = None;
+        for order in permutations(items) {
+            let src = format!(
+                "app A\nvar xs{annotation} = {open}{}{close}\n",
+                order.join(", ")
+            );
+            let got = var_outcome(&src);
+            assert_eq!(got.0, want, "{src}");
+            match &seen {
+                Some(first) => assert_eq!(&got, first, "{src}"),
+                None => seen = Some(got),
+            }
+        }
+    }
+    // The number of findings of the failing cases.
+    assert_eq!(
+        var_outcome("app A\nvar xs = [[\"a\"], [none], [1]]\n").1,
+        ["E0304"]
+    );
+    assert_eq!(
+        var_outcome("app A\nvar xs: List[List[Int]] = [[none], [\"a\"], [1]]\n").1,
+        ["E0304", "E0304"]
+    );
+}
+
+#[test]
+fn nested_literal_from_review_is_valid_in_either_order() {
+    clean("app A\nvar xs: List[List[Int?]] = [[1], [none]]\n");
+    clean("app A\nvar xs: List[List[Int?]] = [[none], [1]]\n");
+    clean("app A\nvar xs = [[1], [none]]\nvar ys: List[List[Int?]] = xs\n");
+    clean("app A\nvar xs = [[none], [1]]\nvar ys: List[List[Int?]] = xs\n");
+    // Parameters and fields pass their type into the literal as well.
+    clean(
+        "app A\nfn g(xs: List[List[Int?]]) -> Int\n  return 1\nfn f() -> Int\n  return g([[1], [none]])\n",
+    );
+    clean(
+        "app A\ndata T\n  m: Map[Text, List[Int?]] = [\"a\": [1], \"b\": [none]]\n  see if true\n",
+    );
+}
+
+#[test]
+fn mixed_literal_reports_the_element_against_the_expected_type() {
+    // ivo #2417: [1, 'a'] and ['a', 1] at List[Text] give the same finding.
+    assert_eq!(
+        diags("app A\nvar xs: List[Text] = [1, \"a\"]\n"),
+        ["E0304 2:23"]
+    );
+    assert_eq!(
+        diags("app A\nvar xs: List[Text] = [\"a\", 1]\n"),
+        ["E0304 2:28"]
+    );
+    assert_eq!(
+        messages("app A\nvar xs: List[Text] = [\"a\", 1]\n"),
+        ["expected `Text`, found `Int`"]
     );
 }

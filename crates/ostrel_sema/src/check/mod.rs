@@ -106,16 +106,13 @@ impl<'p> Cx<'p> {
         // `var`s first: functions and views read their types.
         for (i, def) in p.defs.iter().enumerate() {
             if let DefKind::Var(v) = &def.kind {
-                let found = v.value.map(|e| self.expr(e));
-                let ty = match (&v.ty, found) {
-                    (Some(want), Some(found)) => {
-                        if let Some(e) = v.value {
-                            self.expect(e, want, &found);
-                        }
+                let ty = match (&v.ty, v.value) {
+                    (Some(want), Some(e)) => {
+                        self.value(e, want);
                         want.clone()
                     }
                     (Some(want), None) => want.clone(),
-                    (None, Some(found)) => found,
+                    (None, Some(e)) => self.expr(e),
                     (None, None) => Ty::Error,
                 };
                 self.vars.insert(DefId(id(i)), ty);
@@ -127,8 +124,7 @@ impl<'p> Cx<'p> {
                     self.side = Side::Open;
                     for f in &m.fields {
                         if let Some(e) = f.default {
-                            let found = self.expr(e);
-                            self.expect(e, &f.ty, &found);
+                            self.value(e, &f.ty);
                         }
                     }
                     for rule in &m.rules {
@@ -247,8 +243,7 @@ impl<'p> Cx<'p> {
         for &s in block.stmts.iter() {
             match self.p.stmt(s).map(|st| &st.kind) {
                 Some(StmtKind::Expr(e)) if Some(s) == last && !branches && *result != Ty::Unit => {
-                    let found = self.expr(*e);
-                    self.expect(*e, result, &found);
+                    self.value(*e, result);
                 }
                 _ => self.stmt(s),
             }
@@ -290,10 +285,10 @@ impl<'p> Cx<'p> {
                     self.block(*b);
                 }
             }
-            StmtKind::Return(e) => {
-                let found = self.expr(*e);
-                match self.result.clone() {
-                    Some(Ty::Unit) if !matches!(found, Ty::Unit | Ty::Error) => {
+            StmtKind::Return(e) => match self.result.clone() {
+                Some(Ty::Unit) => {
+                    let found = self.expr(*e);
+                    if !matches!(found, Ty::Unit | Ty::Error) {
                         let message = format!(
                             "this function returns nothing, found {}",
                             self.describe(&found)
@@ -301,10 +296,14 @@ impl<'p> Cx<'p> {
                         self.diags
                             .push(Diagnostic::error(codes::MISMATCH, stmt.span, message));
                     }
-                    Some(want) => self.expect(*e, &want, &found),
-                    None => {}
                 }
-            }
+                Some(want) => {
+                    self.value(*e, &want);
+                }
+                None => {
+                    self.expr(*e);
+                }
+            },
             StmtKind::Expr(e) | StmtKind::Drop(e) => {
                 self.expr(*e);
             }
@@ -344,8 +343,7 @@ impl<'p> Cx<'p> {
             }) => self.p.field(*m, *f).map_or(Ty::Error, |f| f.ty.clone()),
             _ => want,
         };
-        let found = self.expr(value);
-        self.expect(value, &want, &found);
+        self.value(value, &want);
     }
 
     fn set_local(&mut self, local: LocalId, ty: Ty) {
@@ -567,8 +565,7 @@ impl<'p> Cx<'p> {
             ExprKind::Make { model, fields } => {
                 for &(f, value) in fields.iter() {
                     let want = self.p.field(*model, f).map_or(Ty::Error, |f| f.ty.clone());
-                    let found = self.expr(value);
-                    self.expect(value, &want, &found);
+                    self.value(value, &want);
                 }
                 Ty::Ref(*model)
             }
@@ -585,26 +582,70 @@ impl<'p> Cx<'p> {
         }
     }
 
-    /// The common type of the elements of a literal: the first known element
-    /// type, optional when any element is `none` or optional (SYNTAX 4.4),
-    /// whatever its position. E0304 at each element that does not fit it.
+    /// The common type of the elements of a literal without an expected
+    /// type: the [`join`] of all element types, so it does not depend on
+    /// their order (SYNTAX 4.4). Elements without a join give one E0304, at
+    /// the first element that does not join the ones before it, and the
+    /// literal gets [`Ty::Error`].
     fn items(&mut self, items: &[ExprId]) -> Ty {
-        let found: Vec<Ty> = items.iter().map(|&item| self.expr(item)).collect();
-        let optional = found.iter().any(|t| matches!(t, Ty::Optional(_)));
-        let inner: Vec<Ty> = found.into_iter().map(unwrap_optional).collect();
-        let common = inner
-            .iter()
-            .find(|t| **t != Ty::Error)
-            .cloned()
-            .unwrap_or(Ty::Error);
-        for (&item, found) in items.iter().zip(&inner) {
-            self.expect(item, &common, found);
+        let mut common = Ty::Error;
+        let mut items = items.iter();
+        while let Some(&item) = items.next() {
+            let found = self.expr(item);
+            match join(&common, &found) {
+                Some(ty) => common = ty,
+                None => {
+                    let at = self.span(item);
+                    self.mismatch(at, &common, &found);
+                    for &rest in items {
+                        self.expr(rest);
+                    }
+                    return Ty::Error;
+                }
+            }
         }
-        if optional {
-            Ty::Optional(Box::new(common))
-        } else {
-            common
+        common
+    }
+
+    /// Checks `e` where a value of type `want` is required and gives the type
+    /// of `e`. A collection literal takes its element types from `want`, so
+    /// each element is checked on its own (E0304 at the element).
+    fn value(&mut self, e: ExprId, want: &Ty) -> Ty {
+        let p = self.p;
+        let kind = p.expr(e).map(|x| &x.kind);
+        let inner = match want {
+            Ty::Optional(t) => &**t,
+            t => t,
+        };
+        let ty = match (kind, inner) {
+            (Some(ExprKind::Set(items)), Ty::Set(w))
+            | (Some(ExprKind::List(items)), Ty::List(w))
+                if **w != Ty::Error =>
+            {
+                for &item in items.iter() {
+                    self.value(item, w);
+                }
+                inner.clone()
+            }
+            (Some(ExprKind::Map(entries)), Ty::Map(wk, wv))
+                if **wk != Ty::Error && **wv != Ty::Error =>
+            {
+                for &(k, v) in entries.iter() {
+                    self.value(k, wk);
+                    self.value(v, wv);
+                }
+                inner.clone()
+            }
+            _ => {
+                let found = self.expr(e);
+                self.expect(e, want, &found);
+                return found;
+            }
+        };
+        if let Some(slot) = self.exprs.get_mut(e.index()) {
+            *slot = Some(ty.clone());
         }
+        ty
     }
 
     fn name_ty(&self, res: Res) -> Ty {
@@ -768,8 +809,7 @@ impl<'p> Cx<'p> {
             return;
         }
         for (&a, want) in args.iter().zip(params) {
-            let found = self.expr(a);
-            self.expect(a, want, &found);
+            self.value(a, want);
         }
     }
 }
@@ -789,6 +829,24 @@ fn fits(want: &Ty, found: &Ty) -> bool {
         (Ty::Map(wk, wv), Ty::Map(fk, fv)) => fits(wk, fk) && fits(wv, fv),
         _ => want == found,
     }
+}
+
+/// The least type both `a` and `b` fit, if there is one: `none` with `T`
+/// gives `T?`, and collections join element by element. [`Ty::Error`] joins
+/// with everything. Commutative and associative, so the join of a literal's
+/// elements does not depend on their order.
+fn join(a: &Ty, b: &Ty) -> Option<Ty> {
+    let both = |x: &Ty, y: &Ty| join(x, y).map(Box::new);
+    Some(match (a, b) {
+        (Ty::Error, t) | (t, Ty::Error) => t.clone(),
+        (Ty::Optional(x), Ty::Optional(y)) => Ty::Optional(both(x, y)?),
+        (Ty::Optional(x), t) | (t, Ty::Optional(x)) => Ty::Optional(both(x, t)?),
+        (Ty::Set(x), Ty::Set(y)) => Ty::Set(both(x, y)?),
+        (Ty::List(x), Ty::List(y)) => Ty::List(both(x, y)?),
+        (Ty::Map(xk, xv), Ty::Map(yk, yv)) => Ty::Map(both(xk, yk)?, both(xv, yv)?),
+        _ if a == b => a.clone(),
+        _ => return None,
+    })
 }
 
 /// A known type that is no optional, remote or unknown value.
