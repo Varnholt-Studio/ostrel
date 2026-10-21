@@ -10,13 +10,12 @@
 //! op that carries it becomes `Invalid` (D132).
 
 use std::cmp::Ordering;
-use std::fmt;
 
 use ostrel_core::ids::RowId;
 use ostrel_core::value::{Value, compare_key};
 
 use super::json::{Json, NotSafeInt};
-use crate::protocol::LIMITS;
+use crate::protocol::{LIMITS, ModelId, ValueFault};
 
 /// The type of a value on the wire: one variant per row of the type table (ARCHITECTURE 5.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,8 +30,10 @@ pub enum WireTy {
     Bytes,
     /// The variant names in declaration order.
     Enum(Vec<String>),
-    /// A row id; the target model plays no part in the wire form.
-    Ref,
+    /// A reference to a row of the given model (D165). On the wire it is the row id alone:
+    /// reading and writing ignore the target, which only a query hop checks
+    /// ([`super::query`]).
+    Ref(ModelId),
     /// `T?`: a value of `T` or `null`.
     Optional(Box<WireTy>),
     Set(Box<WireTy>),
@@ -41,47 +42,6 @@ pub enum WireTy {
     Rank,
     /// `Int serial`: an `Int` on the wire, assigned by the server.
     Serial,
-}
-
-/// Why a value does not fit its type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValueFault {
-    /// The JSON kind does not match the type, for example a string for an `Int`.
-    WrongType,
-    /// An `Int`, `Serial` or `Time` outside the safe range (D24).
-    IntRange,
-    /// Collections nested deeper than [`LIMITS`]`.nesting_depth`.
-    TooDeep,
-    /// A `Text` of more than [`LIMITS`]`.text_bytes` UTF-8 bytes (D109).
-    TextTooLong,
-    /// A name that is not a variant of the enum.
-    UnknownVariant,
-    /// A reference that is not a 32 digit lowercase row id.
-    InvalidRef,
-    /// `Bytes` that are not unpadded base64url.
-    InvalidBytes,
-    /// A `Rank` key that is not 1 to [`LIMITS`]`.rank_digits` base 62 digits without a
-    /// trailing `0` (D88).
-    InvalidRank,
-    /// A `Set` that holds an element twice, or a `Map` that holds a key twice.
-    Repeated,
-}
-
-impl fmt::Display for ValueFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let why = match self {
-            ValueFault::WrongType => "value has the wrong JSON form for its type",
-            ValueFault::IntRange => "integer outside the safe range",
-            ValueFault::TooDeep => "value nested too deeply",
-            ValueFault::TextTooLong => "text over the text limit",
-            ValueFault::UnknownVariant => "unknown enum variant",
-            ValueFault::InvalidRef => "reference is not a row id",
-            ValueFault::InvalidBytes => "bytes are not unpadded base64url",
-            ValueFault::InvalidRank => "invalid rank key",
-            ValueFault::Repeated => "set element or map key repeated",
-        };
-        f.write_str(why)
-    }
 }
 
 /// Reads one value of type `ty`.
@@ -121,7 +81,7 @@ fn read(ty: &WireTy, json: Json, depth: u32) -> Result<Value, ValueFault> {
                 Err(ValueFault::UnknownVariant)
             }
         }
-        (WireTy::Ref, Json::Str(s)) => RowId::from_hex(&s)
+        (WireTy::Ref(_), Json::Str(s)) => RowId::from_hex(&s)
             .map(Value::Ref)
             .map_err(|_| ValueFault::InvalidRef),
         (WireTy::Rank, Json::Str(s)) => {

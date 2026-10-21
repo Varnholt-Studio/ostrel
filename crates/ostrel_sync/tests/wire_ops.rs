@@ -4,10 +4,12 @@
 
 use ostrel_core::ids::{Hlc, OpId, ReplicaId, RowId};
 use ostrel_core::value::Value;
-use ostrel_sync::protocol::{FieldId, LIMITS, ModelId, Op, OpBody};
+use ostrel_sync::protocol::{
+    ClientMsg, DecodedOp, FieldId, FnId, LIMITS, ModelId, Op, OpBody, OpFault, ValueFault,
+};
 use ostrel_sync::wire::json::{self, Json};
 use ostrel_sync::wire::{
-    DecodedOp, OpFault, ValueFault, WireError, WireSchema, WireTy, decode_op, encode_op, op_bytes,
+    WireError, WireSchema, WireTy, decode_client, decode_op, encode_client, encode_op, op_bytes,
     read_value,
 };
 
@@ -27,10 +29,10 @@ fn schema() -> Schema {
             ("due", Time),
             ("blob", Bytes),
             ("state", Enum(vec!["open".into(), "closed".into()])),
-            ("owner", Ref),
+            ("owner", Ref(ITEM)),
             ("note", Optional(Box::new(Text))),
             ("tags", Set(Box::new(Text))),
-            ("roles", Map(Box::new(Ref), Box::new(Int))),
+            ("roles", Map(Box::new(Ref(ITEM)), Box::new(Int))),
             ("steps", List(Box::new(Int))),
             ("pos", Rank),
             ("number", Serial),
@@ -70,6 +72,22 @@ impl WireSchema for Schema {
     fn field_ty(&self, model: ModelId, field: FieldId) -> Option<&WireTy> {
         let (_, ty) = self.fields.get(usize::try_from(field).ok()?)?;
         (model == ITEM).then_some(ty)
+    }
+
+    fn function_id(&self, _: &str) -> Option<FnId> {
+        None
+    }
+
+    fn function_name(&self, _: FnId) -> Option<&str> {
+        None
+    }
+
+    fn function_params(&self, _: FnId) -> Option<&[WireTy]> {
+        None
+    }
+
+    fn function_result(&self, _: FnId) -> Option<&WireTy> {
+        None
     }
 }
 
@@ -249,11 +267,11 @@ fn a_malformed_op_is_a_protocol_error() {
             WireError::InvalidId("hlc", ostrel_core::ids::Hlc::from_hex("zz").unwrap_err()),
         ),
         (with_body(r#"{}"#), WireError::WrongType("body")),
+        (with_body(r#"{"move":{}}"#), WireError::WrongType("body")),
         (
-            with_body(r#"{"drop":{},"make":{}}"#),
+            with_body(r#"{"drop":{},"move":{}}"#),
             WireError::WrongType("body"),
         ),
-        (with_body(r#"{"move":{}}"#), WireError::WrongType("body")),
         (with_body(r#"{"drop":[]}"#), WireError::WrongType("body")),
         (
             with_body(r#"{"drop":{"field":"pos"}}"#),
@@ -266,6 +284,15 @@ fn a_malformed_op_is_a_protocol_error() {
         (
             with_body(r#"{"set":{"field":3,"value":1}}"#),
             WireError::WrongType("field"),
+        ),
+        // Only the tags of a `remove` may be absent (D135); its structure keys may not.
+        (
+            with_body(r#"{"remove":{"elem":"x","tags":[]}}"#),
+            WireError::MissingKey("field"),
+        ),
+        (
+            with_body(r#"{"remove":{"field":"tags"}}"#),
+            WireError::MissingKey("elem"),
         ),
         (
             with_body(r#"{"make":{"title":"a","title":"b"}}"#),
@@ -340,6 +367,19 @@ fn a_remove_names_one_to_sixty_four_valid_tags() {
         Ok(DecodedOp::Valid(_))
     ));
     let over: Vec<String> = (1..=LIMITS.tags_per_remove + 1).map(tag).collect();
+    // Tags that are absent or `null` make only this op invalid, not the frame (D135).
+    for body in [
+        r#"{"remove":{"field":"tags","elem":"x"}}"#,
+        r#"{"remove":{"field":"tags","elem":"x","tags":null}}"#,
+    ] {
+        assert_eq!(
+            decode_text(&with_body(body)),
+            invalid(OpFault::Tags {
+                field: field("tags")
+            }),
+            "{body}"
+        );
+    }
     for tags in [
         vec![],
         over,
@@ -534,5 +574,278 @@ fn ids_unknown_to_the_schema_are_not_written() {
     assert_eq!(
         encode_op(&unknown_field, &schema()),
         Err(WireError::NotInSchema("field"))
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// The client `ops` message (D135)
+
+fn ops_frame(ops: &[String]) -> String {
+    format!(r#"{{"ops":[{}],"t":"ops","v":0}}"#, ops.join(","))
+}
+
+fn decode_ops_frame(frame: &str) -> Result<ClientMsg, WireError> {
+    decode_client(frame.as_bytes(), &schema())
+}
+
+fn op_with(seq: u32, body: OpBody) -> Op {
+    Op {
+        id: op_id(seq),
+        ..op(body)
+    }
+}
+
+#[test]
+fn a_client_ops_batch_round_trips() {
+    let batch = ClientMsg::Ops(vec![
+        DecodedOp::Valid(op_with(1, OpBody::Drop)),
+        DecodedOp::Valid(op_with(
+            2,
+            OpBody::Set {
+                field: field("title"),
+                value: text("x"),
+            },
+        )),
+    ]);
+    let frame = encode_client(&batch, &schema()).unwrap();
+    assert_eq!(decode_ops_frame(&frame), Ok(batch), "{frame}");
+    let empty = ClientMsg::Ops(Vec::new());
+    let frame = encode_client(&empty, &schema()).unwrap();
+    assert_eq!(frame, r#"{"ops":[],"t":"ops","v":0}"#);
+    assert_eq!(decode_ops_frame(&frame), Ok(empty));
+}
+
+#[test]
+fn an_op_that_does_not_fit_the_schema_leaves_the_rest_of_the_batch_valid() {
+    let good = encode_op(&op_with(1, OpBody::Drop), &schema()).unwrap();
+    let bad = encode_op(
+        &op_with(
+            2,
+            OpBody::Set {
+                field: field("count"),
+                value: int(1),
+            },
+        ),
+        &schema(),
+    )
+    .unwrap()
+    .replace(r#""value":1"#, r#""value":"1""#);
+    let later = encode_op(&op_with(3, OpBody::Drop), &schema()).unwrap();
+    let Ok(ClientMsg::Ops(ops)) = decode_ops_frame(&ops_frame(&[good, bad, later])) else {
+        panic!("expected an ops batch");
+    };
+    assert_eq!(
+        ops,
+        [
+            DecodedOp::Valid(op_with(1, OpBody::Drop)),
+            DecodedOp::Invalid {
+                id: op_id(2),
+                hlc: stamp(),
+                row: row(),
+                fault: OpFault::Value {
+                    field: field("count"),
+                    fault: ValueFault::WrongType,
+                },
+            },
+            DecodedOp::Valid(op_with(3, OpBody::Drop)),
+        ]
+    );
+}
+
+#[test]
+fn a_malformed_op_head_fails_the_whole_frame() {
+    let good = encode_op(&op_with(1, OpBody::Drop), &schema()).unwrap();
+    let bad_head = good.replace(r#""row":""#, r#""row":"x"#);
+    assert!(matches!(
+        decode_ops_frame(&ops_frame(&[good.clone(), bad_head])),
+        Err(WireError::InvalidId("row", _))
+    ));
+    assert_eq!(
+        decode_ops_frame(r#"{"ops":{},"t":"ops","v":0}"#),
+        Err(WireError::WrongType("ops"))
+    );
+    assert_eq!(
+        decode_ops_frame(r#"{"ops":[1],"t":"ops","v":0}"#),
+        Err(WireError::WrongType("ops"))
+    );
+    assert_eq!(
+        decode_ops_frame(r#"{"t":"ops","v":0}"#),
+        Err(WireError::MissingKey("ops"))
+    );
+}
+
+#[test]
+fn encoding_an_invalid_op_is_a_typed_error() {
+    let batch = ClientMsg::Ops(vec![
+        DecodedOp::Valid(op_with(1, OpBody::Drop)),
+        DecodedOp::Invalid {
+            id: op_id(2),
+            hlc: stamp(),
+            row: row(),
+            fault: OpFault::UnknownModel("Gone".into()),
+        },
+    ]);
+    assert_eq!(
+        encode_client(&batch, &schema()),
+        Err(WireError::InvalidOp(op_id(2)))
+    );
+}
+
+#[test]
+fn a_batch_over_the_batch_limit_is_read_whole() {
+    // The codec does not count ops: the server answers a batch over the limit with one
+    // `Reject Limit` per op, in batch order, so it needs every op head (D106).
+    let count = LIMITS.ops_per_batch + 1;
+    let ops: Vec<String> = (1..=count)
+        .map(|seq| encode_op(&op_with(seq, OpBody::Drop), &schema()).unwrap())
+        .collect();
+    let Ok(ClientMsg::Ops(decoded)) = decode_ops_frame(&ops_frame(&ops)) else {
+        panic!("expected an ops batch");
+    };
+    assert_eq!(decoded.len(), count as usize);
+    assert!(
+        decoded
+            .iter()
+            .zip(1..)
+            .all(|(op, seq)| *op == DecodedOp::Valid(op_with(seq, OpBody::Drop)))
+    );
+}
+
+#[test]
+fn a_client_never_writes_an_op_over_the_op_limit() {
+    // The client does not apply such a write and sends no op (D109), so the codec refuses to
+    // write one instead of leaving the check to every caller.
+    let make = |title: usize| {
+        op(OpBody::Make {
+            fields: vec![
+                (field("title"), text(&"y".repeat(title))),
+                (field("note"), text(&"z".repeat(LIMITS.text_bytes as usize))),
+            ],
+        })
+    };
+    let fill = LIMITS.op_bytes as usize - op_bytes(&make(0), &schema()).unwrap();
+    let exact = ClientMsg::Ops(vec![DecodedOp::Valid(make(fill))]);
+    assert!(encode_client(&exact, &schema()).is_ok());
+    let over = ClientMsg::Ops(vec![
+        DecodedOp::Valid(op_with(2, OpBody::Drop)),
+        DecodedOp::Valid(make(fill + 1)),
+    ]);
+    assert_eq!(
+        encode_client(&over, &schema()),
+        Err(WireError::OpTooLarge {
+            op: op_id(1),
+            bytes: LIMITS.op_bytes as usize + 1
+        })
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// A body with several kinds (D147, AC-55)
+
+#[test]
+fn a_body_with_several_kinds_makes_only_that_op_invalid() {
+    let tag = op_id(1).to_hex();
+    let owner = row().to_hex();
+    for body in [
+        // The hijack of `ac_55_hijack_one_op_both_directions`: add and remove in one op.
+        format!(
+            r#"{{"add":{{"field":"tags","elem":"x"}},"remove":{{"field":"tags","elem":"y","tags":["{tag}"]}}}}"#
+        ),
+        format!(
+            r#"{{"put":{{"field":"roles","key":"{owner}","value":1}},"remove_key":{{"field":"roles","key":"{owner}"}}}}"#
+        ),
+        r#"{"drop":{},"make":{}}"#.to_owned(),
+        // A `remove` without tags is well formed (D135), so it counts as a kind here.
+        r#"{"add":{"field":"tags","elem":"x"},"remove":{"field":"tags","elem":"x"}}"#.to_owned(),
+        r#"{"drop":{},"set":{"field":"count","value":1},"add":{"field":"tags","elem":"x"}}"#
+            .to_owned(),
+    ] {
+        assert_eq!(
+            decode_text(&with_body(&body)),
+            invalid(OpFault::SeveralKinds),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn several_kinds_leave_the_rest_of_the_batch_and_the_connection_alone() {
+    let good = encode_op(&op_with(1, OpBody::Drop), &schema()).unwrap();
+    let both = encode_op(&op_with(2, OpBody::Drop), &schema())
+        .unwrap()
+        .replace(
+            r#"{"drop":{}}"#,
+            r#"{"add":{"field":"tags","elem":"x"},"drop":{}}"#,
+        );
+    let later = encode_op(&op_with(3, OpBody::Drop), &schema()).unwrap();
+    assert_eq!(
+        decode_ops_frame(&ops_frame(&[good, both, later])),
+        Ok(ClientMsg::Ops(vec![
+            DecodedOp::Valid(op_with(1, OpBody::Drop)),
+            DecodedOp::Invalid {
+                id: op_id(2),
+                hlc: stamp(),
+                row: row(),
+                fault: OpFault::SeveralKinds,
+            },
+            DecodedOp::Valid(op_with(3, OpBody::Drop)),
+        ]))
+    );
+}
+
+#[test]
+fn several_kinds_stay_fatal_when_one_is_unknown_or_malformed() {
+    let add = r#""add":{"field":"tags","elem":"x"}"#;
+    for (body, want) in [
+        (
+            format!(r#"{{{add},"move":{{}}}}"#),
+            WireError::WrongType("body"),
+        ),
+        (
+            format!(r#"{{{add},"drop":[]}}"#),
+            WireError::WrongType("body"),
+        ),
+        (
+            format!(r#"{{{add},"remove":{{"field":"tags","tags":[]}}}}"#),
+            WireError::MissingKey("elem"),
+        ),
+        (
+            format!(r#"{{{add},"set":{{"field":"count","value":1,"x":1}}}}"#),
+            WireError::UnknownKey("x".into()),
+        ),
+    ] {
+        assert_eq!(decode_text(&with_body(&body)), Err(want), "{body}");
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Hostile: a `remove` without tags inside a batch (D135, AC-55)
+
+/// A peer that leaves out the tags of a `remove` loses that op and nothing else: the ops
+/// before and after it stay valid and the frame keeps the connection open.
+#[test]
+fn a_remove_without_tags_leaves_the_rest_of_the_batch_and_the_connection_alone() {
+    let good = encode_op(&op_with(1, OpBody::Drop), &schema()).unwrap();
+    let untagged = encode_op(&op_with(2, OpBody::Drop), &schema())
+        .unwrap()
+        .replace(
+            r#"{"drop":{}}"#,
+            r#"{"remove":{"elem":"x","field":"tags"}}"#,
+        );
+    let later = encode_op(&op_with(3, OpBody::Drop), &schema()).unwrap();
+    assert_eq!(
+        decode_ops_frame(&ops_frame(&[good, untagged, later])),
+        Ok(ClientMsg::Ops(vec![
+            DecodedOp::Valid(op_with(1, OpBody::Drop)),
+            DecodedOp::Invalid {
+                id: op_id(2),
+                hlc: stamp(),
+                row: row(),
+                fault: OpFault::Tags {
+                    field: field("tags")
+                },
+            },
+            DecodedOp::Valid(op_with(3, OpBody::Drop)),
+        ]))
     );
 }

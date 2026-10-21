@@ -18,55 +18,26 @@
 //! Two kinds of fault, as D132 sets them:
 //!
 //! * the form is wrong (not an object, a missing or extra key, a malformed `id`, `hlc` or
-//!   `row`, a body that is not one of the seven): [`WireError`], fatal for the connection;
+//!   `row`, a body that is not an object or names a kind that is not one of the seven):
+//!   [`WireError`], fatal for the connection;
 //! * the form is right but the op does not fit the schema (unknown model or field, a value of
-//!   the wrong type, a body that does not suit the field) or is over the op size limit:
-//!   [`DecodedOp::Invalid`]. The server rejects it in step 6 of ARCHITECTURE 5.5, after the
-//!   order check, so a replay still gets its original outcome.
+//!   the wrong type, a body that does not suit the field), names two or more of the seven
+//!   kinds (D147), has a `remove` whose tags are absent, `null`, empty, over the limit or not
+//!   op ids (D135), or is over the op size limit: [`DecodedOp::Invalid`]. The server rejects
+//!   it in step 6 of ARCHITECTURE 5.5, after the order check, so a replay still gets its
+//!   original outcome.
 //!
 //! Whether a `make` names every declared field (D116) is checked by the server in step 6, not
 //! here.
 
 use ostrel_core::canon::{encode, encode_object, encode_str};
-use ostrel_core::ids::{Hlc, OpId, RowId};
+use ostrel_core::ids::OpId;
 
 use super::frame::{Fields, array, hex, hlc, op_id, row_id, string};
 use super::json::Json;
-use super::value::{ValueFault, WireTy, read_value};
+use super::value::{WireTy, read_value};
 use super::{WireError, WireSchema, clip};
-use crate::protocol::{FieldId, LIMITS, ModelId, Op, OpBody};
-
-/// An op read from a frame.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DecodedOp {
-    Valid(Op),
-    /// Well formed but not valid for the schema; the server answers `Reject Invalid`.
-    Invalid {
-        id: OpId,
-        hlc: Hlc,
-        row: RowId,
-        fault: OpFault,
-    },
-}
-
-/// Why a well formed op is [`DecodedOp::Invalid`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OpFault {
-    /// The schema has no model of this name (cut to [`super::MAX_ECHO_BYTES`]).
-    UnknownModel(String),
-    /// The model has no field of this name (cut to [`super::MAX_ECHO_BYTES`]).
-    UnknownField(String),
-    /// A value of this field does not fit its type.
-    Value { field: FieldId, fault: ValueFault },
-    /// The body does not suit the type of the field, for example `add` on a `Text` field or
-    /// `set` on a `Set` field.
-    WrongBody { field: FieldId },
-    /// A `remove` names no tag, more than [`LIMITS`]`.tags_per_remove` tags, or a tag that is
-    /// not an op id.
-    Tags { field: FieldId },
-    /// The canonical encoding of the op is over [`LIMITS`]`.op_bytes` (D109).
-    TooLarge { bytes: usize },
-}
+use crate::protocol::{DecodedOp, FieldId, LIMITS, ModelId, Op, OpBody, OpFault};
 
 /// Reads one element of an `ops` array.
 pub fn decode_op(json: Json, schema: &dyn WireSchema) -> Result<DecodedOp, WireError> {
@@ -86,6 +57,9 @@ pub fn decode_op(json: Json, schema: &dyn WireSchema) -> Result<DecodedOp, WireE
         hlc: stamp,
         row,
         fault,
+    };
+    let BodyForm::One(body) = body else {
+        return Ok(invalid(OpFault::SeveralKinds));
     };
     let Some(model_id) = schema.model_id(&model) else {
         return Ok(invalid(OpFault::UnknownModel(clip(&model))));
@@ -208,7 +182,9 @@ enum RawBody {
     Remove {
         field: String,
         elem: Json,
-        tags: Json,
+        /// `None` when the key `tags` is absent. That makes only this op invalid, not the
+        /// frame: the tags are content to check against the limit, like a value (D135).
+        tags: Option<Json>,
     },
     Put {
         field: String,
@@ -221,15 +197,33 @@ enum RawBody {
     },
 }
 
-/// Checks the form of `body`: an object with exactly one known key whose object has exactly
-/// the keys of that kind.
-fn raw_body(key: &'static str, json: Json) -> Result<RawBody, WireError> {
+/// A body whose form is right, or one that names several kinds of the seven (D147).
+enum BodyForm {
+    One(RawBody),
+    SeveralKinds,
+}
+
+/// Checks the form of `body`: an object of one or more known kinds, each holding an object
+/// with exactly the keys of that kind. An unknown kind or a malformed kind is fatal, also next
+/// to a well formed one; two or more well formed kinds make only the op invalid (D147).
+fn raw_body(key: &'static str, json: Json) -> Result<BodyForm, WireError> {
     let Json::Obj(entries) = json else {
         return Err(WireError::WrongType(key));
     };
-    let Ok([(kind, inner)]) = <[(String, Json); 1]>::try_from(entries) else {
-        return Err(WireError::WrongType(key));
-    };
+    let several = entries.len() > 1;
+    let mut bodies = entries
+        .into_iter()
+        .map(|(kind, inner)| raw_kind(key, &kind, inner))
+        .collect::<Result<Vec<_>, _>>()?;
+    match bodies.pop() {
+        Some(body) if !several => Ok(BodyForm::One(body)),
+        Some(_) => Ok(BodyForm::SeveralKinds),
+        None => Err(WireError::WrongType(key)),
+    }
+}
+
+/// Checks one kind of a body: its object has exactly the keys of that kind.
+fn raw_kind(key: &'static str, kind: &str, inner: Json) -> Result<RawBody, WireError> {
     let Json::Obj(entries) = inner else {
         return Err(WireError::WrongType(key));
     };
@@ -237,7 +231,7 @@ fn raw_body(key: &'static str, json: Json) -> Result<RawBody, WireError> {
         return Ok(RawBody::Make(entries));
     }
     let mut f = Fields { entries };
-    let body = match kind.as_str() {
+    let body = match kind {
         "drop" => RawBody::Drop,
         "set" => RawBody::Set {
             field: f.req("field", string)?,
@@ -250,7 +244,11 @@ fn raw_body(key: &'static str, json: Json) -> Result<RawBody, WireError> {
         "remove" => RawBody::Remove {
             field: f.req("field", string)?,
             elem: f.req("elem", any)?,
-            tags: f.req("tags", any)?,
+            tags: if f.has("tags") {
+                Some(f.req("tags", any)?)
+            } else {
+                None
+            },
         },
         "put" => RawBody::Put {
             field: f.req("field", string)?,
@@ -362,9 +360,10 @@ impl RawBody {
     }
 }
 
-/// The tags of a `remove`: 1 to `tags_per_remove` op ids (ARCHITECTURE 5.9, 6.2).
-fn remove_tags(json: Json) -> Option<Vec<OpId>> {
-    let Json::Arr(items) = json else {
+/// The tags of a `remove`: 1 to `tags_per_remove` op ids (ARCHITECTURE 5.9, 6.2). `None`
+/// for anything else, an absent key included.
+fn remove_tags(json: Option<Json>) -> Option<Vec<OpId>> {
+    let Some(Json::Arr(items)) = json else {
         return None;
     };
     if items.is_empty() || items.len() > LIMITS.tags_per_remove as usize {

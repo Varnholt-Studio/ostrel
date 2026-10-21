@@ -7,7 +7,7 @@
 //! with [`StubLiterals`], a minimal literal scanner.
 
 use super::*;
-use crate::ast::{BinaryOp, Item, MAX_HEIGHT, MAX_NODES, StrPart, UnaryOp};
+use crate::ast::{BinaryOp, FnDecl, Item, MAX_HEIGHT, MAX_NODES, StrPart, UnaryOp};
 use crate::lex::{LiteralScan, TextStop, lex_with};
 use ostrel_core::SourceMap;
 
@@ -738,7 +738,7 @@ fn compound_operators_are_e0020() {
     }
     // `= -1` and `==` are not compound operators.
     let src = "fn main()\n  print(1 == 1)\n  x = -1\n";
-    assert_eq!(codes_at(src), vec![(100, at(src, "=", 2))]);
+    assert!(codes_at(src).is_empty());
 }
 
 #[test]
@@ -897,76 +897,39 @@ fn else_if_chain_builds_nested_ifs() -> R {
     Ok(())
 }
 
+/// The constructs that v0.1 reported as E0100 parse since T119; the
+/// checker reports them (ARCHITECTURE 3.4). Only `extern` (v0.3, D95) is
+/// still E0100 in the parser, once, and its block is skipped.
 #[test]
-fn constructs_outside_the_slice_are_e0100_once() -> R {
-    let cases = [
-        (
-            "data Message\n  text: Text\n",
-            "data",
-            "`data` declaration is not available in v0.1",
-        ),
-        (
-            "server fn f()\n  print(1)\n",
-            "server",
-            "`server fn` is not available in v0.1",
-        ),
-        (
-            "client fn f()\n  print(1)\n",
-            "client",
-            "`client fn` is not available in v0.1",
-        ),
-        (
-            "fn f() as system\n  print(1)\n",
-            "as",
-            "`as system` is not available in v0.1",
-        ),
-        (
-            "fn f(a: Int?)\n  print(1)\n",
-            "Int",
-            "an optional type is not available in v0.1",
-        ),
-        (
-            "fn f(a: List[Int])\n  print(1)\n",
-            "List",
-            "a type with type arguments is not available in v0.1",
-        ),
-        (
-            "fn f()\n  for x in xs\n    print(x)\n",
-            "for",
-            "`for` is not available in v0.1",
-        ),
-        (
-            "fn f()\n  drop x\n",
-            "drop",
-            "`drop` is not available in v0.1",
-        ),
-        (
-            "fn f()\n  if let y = x\n    print(y)\n",
-            "let",
-            "`if let` is not available in v0.1",
-        ),
-        (
-            "fn f()\n  x = 1\n",
-            "=",
-            "assignment is not available in v0.1",
-        ),
+fn v0_2_constructs_parse_and_extern_stays_e0100() -> R {
+    let heads = [
+        "data Message\n  text: Text\n",
+        "server fn f()\n  print(1)\n",
+        "client fn f()\n  print(1)\n",
+        "fn f() as system\n  call if g(1)\n  print(1)\n",
+        "fn f(a: Int?)\n  print(1)\n",
+        "fn f(a: List[Int])\n  print(1)\n",
+        "fn f()\n  for x in xs\n    print(x)\n",
+        "fn f()\n  drop x\n",
+        "fn f()\n  if let y = x\n    print(y)\n",
+        "fn f()\n  x = 1\n",
     ];
-    for (head, word, message) in cases {
+    for head in heads {
         let src = format!("{head}{MAIN}");
         let (m, diags) = parse(&src);
-        assert_eq!(diags.len(), 1, "{head:?}: {diags:?}");
-        assert_eq!(diags.first().must()?.code, codes::NOT_IN_V0_1, "{head:?}");
-        assert_eq!(
-            diags.first().must()?.span.start,
-            at(&src, word, 0),
-            "{head:?}"
-        );
-        assert_eq!(diags.first().must()?.message, message);
-        assert!(
-            fn_items(&m).iter().any(|f| &*f.name.text == "main"),
-            "{head:?}"
-        );
+        assert!(diags.is_empty(), "{head:?}: {diags:?}");
+        assert_eq!(m.items().len(), 2, "{head:?}");
     }
+    let src = format!("extern js client \"marked\" as md\n  fn parse(src: Text) -> Text\n{MAIN}");
+    let (m, diags) = parse(&src);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags.first().must()?.code, codes::NOT_IN_V0_1);
+    assert_eq!(diags.first().must()?.span.start, 0);
+    assert_eq!(
+        diags.first().must()?.message,
+        "`extern` declaration is not available in v0.1"
+    );
+    assert!(fn_items(&m).iter().any(|f| &*f.name.text == "main"));
     Ok(())
 }
 

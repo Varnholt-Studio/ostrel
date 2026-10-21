@@ -1,0 +1,1 @@
+tests/errors/v0_2/name_second_app.ostl:2:5: error[E0201]: a program has one `app`; this is the second

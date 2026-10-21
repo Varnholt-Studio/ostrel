@@ -1,0 +1,1 @@
+tests/errors/v0_2/implicit_author_assign_with_auth.ostl:9:5: error[E0208]: `author` is an implicit field; the system sets it

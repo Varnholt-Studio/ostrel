@@ -1,0 +1,1 @@
+tests/errors/v0_2/type_args_missing.ostl:4:9: error[E0309]: `Set` takes 1 type argument, found 0

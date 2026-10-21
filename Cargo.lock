@@ -340,6 +340,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostrel_server"
+version = "0.1.0"
+dependencies = [
+ "ostrel_core",
+ "ostrel_db",
+ "ostrel_db_memory",
+ "ostrel_db_sqlite",
+ "ostrel_ir",
+ "ostrel_sema",
+ "ostrel_syntax",
+ "ostrel_vm",
+ "sha2",
+]
+
+[[package]]
 name = "ostrel_sync"
 version = "0.1.0"
 dependencies = [

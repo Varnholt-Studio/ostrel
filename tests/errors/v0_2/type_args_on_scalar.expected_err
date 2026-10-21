@@ -1,0 +1,1 @@
+tests/errors/v0_2/type_args_on_scalar.ostl:4:6: error[E0309]: `Int` takes 0 type arguments, found 1

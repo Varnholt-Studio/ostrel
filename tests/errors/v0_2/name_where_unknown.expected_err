@@ -1,0 +1,1 @@
+tests/errors/v0_2/name_where_unknown.ostl:8:19: error[E0200]: unknown name `nope`

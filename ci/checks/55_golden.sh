@@ -6,6 +6,8 @@
 #                         (at least 10 cases)
 #   ac_03_error_goldens   tests/errors/NAME.ostl   `ostrel check`  exit 1, stderr == NAME.expected_err
 #                         (at least 15 cases)
+#                         tests/errors/v0_2/NAME.ostl, same contract: goldens of the v0.2 front end
+#                         (an `app` under `ostrel check` goes through name resolution into the HIR)
 #   ac_52_runtime_goldens tests/runtime/NAME.ostl  `ostrel run`    exit 1, stdout == NAME.expected
 #                         and stderr == NAME.expected_err; one case per runtime error kind
 #                         IntOverflow, DivisionByZero, CallDepth, StepLimit, TextLimit (SPEC 5.0)
@@ -121,13 +123,15 @@ ac_02_examples() {
 }
 
 ac_03_error_goldens() {
-  local ostrel=$1 tmp=$2 dir=tests/errors f stem rc
-  for f in "$dir"/*.ostl; do
-    [ -e "$f" ] || continue
-    stem=${f%.ostl}
-    [ -f "$stem.expected_err" ] || continue
-    rc=$(runcase "$tmp/case" "$ostrel" check "$f")
-    expect_exit "$f" "$rc" 1 && expect_same "$f" stderr "$stem.expected_err" "$tmp/case.stderr"
+  local ostrel=$1 tmp=$2 dir f stem rc
+  for dir in tests/errors tests/errors/v0_2; do
+    for f in "$dir"/*.ostl; do
+      [ -e "$f" ] || continue
+      stem=${f%.ostl}
+      [ -f "$stem.expected_err" ] || continue
+      rc=$(runcase "$tmp/case" "$ostrel" check "$f")
+      expect_exit "$f" "$rc" 1 && expect_same "$f" stderr "$stem.expected_err" "$tmp/case.stderr"
+    done
   done
 }
 
@@ -173,6 +177,11 @@ structure_rules() {
   fi
   pairs examples/v0_1 expected
   pairs tests/errors expected_err
+  if [ -d tests/errors/v0_2 ]; then
+    pairs tests/errors/v0_2 expected_err
+  else
+    structure "tests/errors/v0_2 does not exist (v0.2 error goldens, SPEC 12.6)"
+  fi
   if [ -d tests/runtime ]; then pairs tests/runtime expected expected_err; fi
   n=$(count examples/v0_1)
   [ "$n" -ge "$MIN_EXAMPLES" ] || structure "examples/v0_1 has $n cases, at least $MIN_EXAMPLES needed (AC-02)"
@@ -216,7 +225,7 @@ golden_runner_selftest() {
   trap "rm -rf '$scratch'" RETURN
   work="$scratch/work"
   fake="$scratch/fake-ostrel"
-  mkdir -p "$work" "$scratch/tree/examples/v0_1" "$scratch/tree/tests/errors" \
+  mkdir -p "$work" "$scratch/tree/examples/v0_1" "$scratch/tree/tests/errors/v0_2" \
     "$scratch/tree/tests/runtime"
   # Fake compiler: behaviour comes from FAKE_* markers inside the case file, so each self
   # test case can break exactly one thing.
@@ -250,6 +259,8 @@ FAKE
       printf '# ERR tests/errors/x%s.ostl:1:1: error[E0008]: bad\n# EXIT 1\n' "$i" >"tests/errors/x$i.ostl"
       printf 'tests/errors/x%s.ostl:1:1: error[E0008]: bad\n' "$i" >"tests/errors/x$i.expected_err"
     done
+    printf '# ERR tests/errors/v0_2/y1.ostl:2:3: error[E0204]: bad\n# EXIT 1\n' >tests/errors/v0_2/y1.ostl
+    printf 'tests/errors/v0_2/y1.ostl:2:3: error[E0204]: bad\n' >tests/errors/v0_2/y1.expected_err
     for k in "${RUNTIME_KINDS[@]}"; do
       printf '# OUT before\n# ERR tests/runtime/%s.ostl:2:3: runtime error[%s]: m\n# EXIT 1\n' "$k" "$k" >"tests/runtime/$k.ostl"
       printf 'before\n' >"tests/runtime/$k.expected"
@@ -271,6 +282,11 @@ FAKE
   sel "example panics" 0 1 "printf '# OUT ok 01\n# EXIT 101\n' >examples/v0_1/e01.ostl" || bad=1
   sel "error exits 0" 0 1 "printf '# ERR x\n# EXIT 0\n' >tests/errors/x01.ostl" || bad=1
   sel "error column differs" 0 1 "printf 'tests/errors/x01.ostl:1:2: error[E0008]: bad\n' >tests/errors/x01.expected_err" || bad=1
+  sel "v0_2 error column differs" 0 1 "printf 'tests/errors/v0_2/y1.ostl:2:4: error[E0204]: bad\n' >tests/errors/v0_2/y1.expected_err" || bad=1
+  sel "v0_2 error exits 0" 0 1 "sed -i 's/^# EXIT 1/# EXIT 0/' tests/errors/v0_2/y1.ostl" || bad=1
+  sel "v0_2 expected without case" 1 0 "printf 'x\n' >tests/errors/v0_2/orphan.expected_err" || bad=1
+  sel "v0_2 case without expected" 1 0 "rm tests/errors/v0_2/y1.expected_err" || bad=1
+  sel "v0_2 dir missing" 1 0 "rm -r tests/errors/v0_2" || bad=1
   sel "runtime stdout differs" 0 1 "printf 'other\n' >tests/runtime/CallDepth.expected" || bad=1
   sel "runtime stderr differs" 0 1 "printf 'tests/runtime/CallDepth.ostl:2:3: runtime error[CallDepth]: n\n' >tests/runtime/CallDepth.expected_err" || bad=1
   sel "runtime exits 0" 0 1 "sed -i 's/^# EXIT 1/# EXIT 0/' tests/runtime/IntOverflow.ostl" || bad=1
@@ -317,7 +333,7 @@ tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 all_suites "$ostrel" "$tmp"
 
-echo "   examples $(count examples/v0_1), error goldens $(count tests/errors), runtime goldens $( [ -d tests/runtime ] && count tests/runtime || echo 0)"
+echo "   examples $(count examples/v0_1), error goldens $(count tests/errors), v0.2 error goldens $( [ -d tests/errors/v0_2 ] && count tests/errors/v0_2 || echo 0), runtime goldens $( [ -d tests/runtime ] && count tests/runtime || echo 0)"
 if [ "$structure_fail" = 1 ]; then
   exit 1
 fi

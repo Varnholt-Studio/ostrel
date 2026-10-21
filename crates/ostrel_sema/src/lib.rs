@@ -32,8 +32,8 @@ use std::collections::HashMap;
 
 use ostrel_core::{Code, Diagnostic, FileId, Span};
 use ostrel_syntax::ast::{
-    BinaryOp, BlockId, ExprId, ExprKind, FnDecl, Item, Module, StmtId, StmtKind, StrPart,
-    TextRange, TypeRef, UnaryOp,
+    BinaryOp, BlockId, ExprId, ExprKind, FnDecl, Item, Module, Placement, StmtId, StmtKind,
+    StrPart, TextRange, TypeRef, UnaryOp,
 };
 
 /// Diagnostic codes reported by the checker.
@@ -225,6 +225,28 @@ fn id_u32(index: usize) -> u32 {
     u32::try_from(index).unwrap_or(u32::MAX)
 }
 
+/// Where and how E0100 names a declaration outside the v0.1 slice. The
+/// position is the first keyword of the declaration, the start of its range,
+/// and the wording matches the parser's E0100 for the same declaration.
+fn outside_slice(item: &Item) -> (TextRange, String) {
+    let keyword = |kw: &str, range: TextRange| (range, format!("`{kw}` declaration"));
+    match item {
+        Item::App(decl) => keyword("app", decl.range),
+        Item::Enum(decl) => keyword("enum", decl.range),
+        Item::Data(decl) => keyword("data", decl.range),
+        Item::Var(decl) => keyword("var", decl.range),
+        Item::View(decl) => keyword("view", decl.range),
+        Item::Style(decl) => keyword("style", decl.range),
+        Item::PlacedFn(decl) => match decl.placement {
+            Placement::Inferred => (decl.range, "this function declaration".to_string()),
+            placement => (decl.range, format!("`{} fn`", placement.as_str())),
+        },
+        // `Item::Fn` is handled by the caller. A kind added to the tree
+        // later has no known range here, so it is reported at the file start.
+        _ => (TextRange::empty(0), "this declaration".to_string()),
+    }
+}
+
 struct Cx<'a> {
     module: &'a Module,
     file: FileId,
@@ -247,18 +269,15 @@ impl<'a> Cx<'a> {
     fn declare(&mut self) {
         let module = self.module;
         for (index, item) in module.items().iter().enumerate() {
-            #[allow(unreachable_patterns)]
-            let decl = match item {
-                Item::Fn(decl) => decl,
-                _ => {
-                    self.error(
-                        codes::NOT_IN_V0_1,
-                        TextRange::empty(0),
-                        "this declaration is not available in v0.1".to_string(),
-                    );
-                    self.out.fns.push(None);
-                    continue;
-                }
+            let Item::Fn(decl) = item else {
+                let (range, what) = outside_slice(item);
+                self.error(
+                    codes::NOT_IN_V0_1,
+                    range,
+                    format!("{what} is not available in v0.1"),
+                );
+                self.out.fns.push(None);
+                continue;
             };
             let name = &*decl.name.text;
             if self.fn_by_name.contains_key(name) {

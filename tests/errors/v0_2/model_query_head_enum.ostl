@@ -1,0 +1,7 @@
+app Golden
+
+enum Color = red | green
+
+fn f()
+  for c in Color limit 1
+    print(1)
