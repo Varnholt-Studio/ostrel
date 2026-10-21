@@ -9,6 +9,8 @@
 //!   feature `dev-identity`, which cannot be built without debug assertions (D127).
 //! * [`audit`] stores the audit entry of every elevated execution with the SHA-256 of the
 //!   canonical encoding of its argument list, never the arguments themselves (D117, D118).
+//! * [`key_status`] checks the status of the device key behind a token on every `Hello` and
+//!   HTTP request and closes the open sessions of a revoked key (D102).
 //! * [`secret`] holds a `replica_secret` (D111) and keeps it out of every `Debug` output.
 //! * [`host`] is the [`ostrel_vm::host::ServerHost`] of one VM task, and [`task`] runs a
 //!   program image with it next to the database connection of the task.
@@ -16,8 +18,9 @@
 //! Secrets never reach a log: tokens, replica secrets and audit arguments have no `Debug`
 //! or `Display` output that shows them (olga #1655, georg #1572 F9, D122).
 //!
-//! The WebSocket transport (`Call`/`Return` frames of ARCHITECTURE 5.4) is not part of this
-//! crate version; it follows once the wire codec of `ostrel_sync` is merged.
+//! * [`ws`] is the server side of the WebSocket session: it reads `Call` frames, runs each
+//!   call under the locking rules of ARCHITECTURE 5.4 and writes its `Return`. The socket
+//!   itself follows in a later version.
 
 // This crate handles requests from untrusted clients: no unwrap, expect, panic or
 // unchecked indexing.
@@ -40,8 +43,10 @@ compile_error!(
 pub mod audit;
 pub mod host;
 pub mod identity;
+pub mod key_status;
 pub mod secret;
 pub mod task;
+pub mod ws;
 
 /// Hex digits of a SHA-256 digest, lowercase, as audit records and logs show it.
 pub fn sha256_hex(digest: &[u8; 32]) -> String {
