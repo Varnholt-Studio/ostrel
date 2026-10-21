@@ -20,7 +20,7 @@ use ostrel_db::api::{
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
 
 use crate::codec::{self, Corrupt};
-use crate::eval::{self, Lookup, Stored};
+use ostrel_db::eval::{self, LiveRow, Lookup};
 
 /// Value of `PRAGMA user_version` for this layout. A file of layout 1 is brought to this
 /// layout on connect; a file with any other non zero value was written by something else and is
@@ -295,14 +295,14 @@ fn each_row(
     Ok(())
 }
 
-fn row_of(rows: &mut BTreeMap<RowId, Stored>, id: RowId) -> Result<&mut Stored, DbError> {
+fn row_of(rows: &mut BTreeMap<RowId, LiveRow>, id: RowId) -> Result<&mut LiveRow, DbError> {
     rows.get_mut(&id).ok_or(corrupt(Corrupt))
 }
 
 /// Live rows with their fields and collections, in id order.
-fn load(conn: &Connection, which: Which) -> Result<BTreeMap<RowId, Stored>, DbError> {
+fn load(conn: &Connection, which: Which) -> Result<BTreeMap<RowId, LiveRow>, DbError> {
     let cond = which.clause();
-    let mut out: BTreeMap<RowId, Stored> = BTreeMap::new();
+    let mut out: BTreeMap<RowId, LiveRow> = BTreeMap::new();
     let id_at = |r: &rusqlite::Row<'_>| -> Result<RowId, DbError> {
         codec::row_id_from(&get::<Vec<u8>>(r, 0)?).map_err(corrupt)
     };
@@ -315,7 +315,7 @@ fn load(conn: &Connection, which: Which) -> Result<BTreeMap<RowId, Stored>, DbEr
         |r| {
             out.insert(
                 id_at(r)?,
-                Stored {
+                LiveRow {
                     model: to_u32(get(r, 1)?)?,
                     version: to_u64(get(r, 2)?)?,
                     fields: BTreeMap::new(),
@@ -410,11 +410,11 @@ fn load(conn: &Connection, which: Which) -> Result<BTreeMap<RowId, Stored>, DbEr
 /// Rows read through hops, each loaded at most once per query.
 struct Rows<'c> {
     conn: &'c Connection,
-    cache: RefCell<HashMap<RowId, Option<Rc<Stored>>>>,
+    cache: RefCell<HashMap<RowId, Option<Rc<LiveRow>>>>,
 }
 
 impl Lookup for Rows<'_> {
-    fn live(&self, id: RowId) -> Result<Option<Rc<Stored>>, DbError> {
+    fn live(&self, id: RowId) -> Result<Option<Rc<LiveRow>>, DbError> {
         if let Some(hit) = self.cache.borrow().get(&id) {
             return Ok(hit.clone());
         }
@@ -424,14 +424,15 @@ impl Lookup for Rows<'_> {
     }
 }
 
-/// Runs a query on what `conn` sees. [`ostrel_db::api::Query::check`] runs first.
+/// Runs a query on what `conn` sees. [`ostrel_db::api::Query::check`] runs first, before any
+/// row is loaded.
 pub fn query(
     conn: &Connection,
     enums: &[EnumColumn],
     q: &ostrel_db::api::Query,
 ) -> Result<ostrel_db::api::Rows, DbError> {
     q.check(enums)?;
-    let rows: Vec<(RowId, Rc<Stored>)> = load(conn, Which::Model(q.model))?
+    let rows: Vec<(RowId, Rc<LiveRow>)> = load(conn, Which::Model(q.model))?
         .into_iter()
         .map(|(id, r)| (id, Rc::new(r)))
         .collect();
@@ -457,45 +458,6 @@ fn stored(v: &Value) -> Result<Vec<u8>, DbError> {
 
 fn key(v: &Value) -> Result<Vec<u8>, DbError> {
     codec::order_key(v).ok_or(DbError::Invalid("value nested too deeply"))
-}
-
-/// Refuses values of enum columns, and of `Map` fields whose values are enums, that are not
-/// declared variants (contract rules in `ostrel_db::api`). `Set` elements and `Map` keys are
-/// not checked (D87).
-pub fn check_enums(enums: &[EnumColumn], writes: &[Write]) -> Result<(), DbError> {
-    let declared = |model: ModelId, f: FieldId, v: &Value| match eval::variants(enums, model, f) {
-        Some(vs) if *v != Value::Null => eval::ordinal(vs, v).is_some(),
-        _ => true,
-    };
-    for w in writes {
-        let (Write::Insert {
-            model,
-            fields,
-            collections,
-            ..
-        }
-        | Write::Update {
-            model,
-            fields,
-            collections,
-            ..
-        }) = w
-        else {
-            continue;
-        };
-        let bad_field = fields.iter().any(|(f, v)| !declared(*model, *f, v));
-        let bad_value = collections.iter().any(|(f, c)| match c {
-            CollectionChange::Map(entries) => entries
-                .iter()
-                .filter_map(|e| e.value.as_ref())
-                .any(|v| !declared(*model, *f, v)),
-            CollectionChange::Set(_) => false,
-        });
-        if bad_field || bad_value {
-            return Err(DbError::Invalid("enum value is not a declared variant"));
-        }
-    }
-    Ok(())
 }
 
 /// Refuses values this driver cannot store (nesting beyond [`codec::MAX_DEPTH`]) before the
@@ -542,8 +504,10 @@ pub fn check_storable(writes: &[Write]) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Applies one write. The caller runs it inside a savepoint and has run `check_writes`,
-/// [`check_enums`] and [`check_storable`] on the batch.
+/// Applies one write through the row transitions of [`LiveRow`], so the rules of a write on
+/// one row are those every driver without SQL queries uses (D139, D143). The caller runs it
+/// inside a savepoint and has run `check_writes`, [`eval::check_enums`] and [`check_storable`]
+/// on the batch. Which ids are taken and turning a row into a tombstone stay here.
 pub fn apply_write(conn: &Connection, w: &Write) -> Result<(), DbError> {
     match w {
         Write::Insert {
@@ -553,21 +517,28 @@ pub fn apply_write(conn: &Connection, w: &Write) -> Result<(), DbError> {
             collections,
         } => {
             let id = codec::row_id_bytes(*row);
+            let new = LiveRow::inserted(*model, fields, collections);
+            let version = to_i64(new.version)?;
             // The id is taken while a live row or a tombstone holds it, in any model.
             let added = conn
                 .prepare_cached(
-                    "INSERT INTO ostrel_rows (id, model, version, deleted) VALUES (?1, ?2, 1, 0)
+                    "INSERT INTO ostrel_rows (id, model, version, deleted) VALUES (?1, ?2, ?3, 0)
                      ON CONFLICT (id) DO NOTHING",
                 )
-                .and_then(|mut s| s.execute(params![&id[..], model]))
+                .and_then(|mut s| s.execute(params![&id[..], model, version]))
                 .map_err(backend)?;
             if added == 0 {
                 return Err(DbError::Conflict);
             }
-            write_fields(conn, &id, fields)?;
-            for (f, c) in collections {
-                apply_collection(conn, &id, *f, c)?;
-            }
+            // A new row has no stored entries, so every collection field is written whole.
+            let slices: Vec<Slice> = collections
+                .iter()
+                .map(|(f, _)| Slice {
+                    field: *f,
+                    keys: None,
+                })
+                .collect();
+            write_back(conn, &id, &new, fields, &slices)
         }
         Write::Update {
             model,
@@ -577,11 +548,15 @@ pub fn apply_write(conn: &Connection, w: &Write) -> Result<(), DbError> {
             collections,
         } => {
             let id = codec::row_id_bytes(*row);
-            bump_version(conn, &id, *model, *expect_version, false)?;
-            write_fields(conn, &id, fields)?;
+            let mut live = head(conn, &id)?;
+            live.check(*model, *expect_version)?;
+            let mut slices = Vec::with_capacity(collections.len());
             for (f, c) in collections {
-                apply_collection(conn, &id, *f, c)?;
+                slices.push(load_slice(conn, &id, *f, c, &mut live)?);
             }
+            live.update(fields, collections);
+            set_version(conn, &id, live.version, false)?;
+            write_back(conn, &id, &live, fields, &slices)
         }
         Write::Delete {
             model,
@@ -589,7 +564,9 @@ pub fn apply_write(conn: &Connection, w: &Write) -> Result<(), DbError> {
             expect_version,
         } => {
             let id = codec::row_id_bytes(*row);
-            bump_version(conn, &id, *model, *expect_version, true)?;
+            let live = head(conn, &id)?;
+            live.check(*model, *expect_version)?;
+            set_version(conn, &id, live.version + 1, true)?;
             for sql in [
                 "DELETE FROM ostrel_fields WHERE row_id = ?1",
                 "DELETE FROM ostrel_collections WHERE row_id = ?1",
@@ -600,102 +577,226 @@ pub fn apply_write(conn: &Connection, w: &Write) -> Result<(), DbError> {
                     .and_then(|mut s| s.execute([&id[..]]))
                     .map_err(backend)?;
             }
+            Ok(())
         }
     }
-    Ok(())
 }
 
-/// Checks that `id` is a live row of `model` at `expect_version` and increases its version by
-/// one; `delete` also turns it into a tombstone.
-fn bump_version(
+/// Version and model of the live row `id`, without fields or collections: enough for
+/// [`LiveRow::check`], and [`LiveRow::update`] only overwrites the fields a write names (D148).
+/// A missing row and a tombstone are [`DbError::NotFound`].
+fn head(conn: &Connection, id: &[u8]) -> Result<LiveRow, DbError> {
+    let found: Option<(i64, i64)> = conn
+        .prepare_cached("SELECT model, version FROM ostrel_rows WHERE id = ?1 AND deleted = 0")
+        .and_then(|mut s| s.query_row([id], |r| Ok((r.get(0)?, r.get(1)?))).optional())
+        .map_err(backend)?;
+    let (model, version) = found.ok_or(DbError::NotFound)?;
+    Ok(LiveRow {
+        model: to_u32(model)?,
+        version: to_u64(version)?,
+        fields: BTreeMap::new(),
+        collections: BTreeMap::new(),
+    })
+}
+
+/// What of one collection field a write stores again: the entries under the order keys in
+/// `keys`, or the whole field when `keys` is `None` (new row, new kind or changed kind).
+struct Slice {
+    field: FieldId,
+    keys: Option<BTreeSet<Vec<u8>>>,
+}
+
+/// Loads into `live` the part of a collection field that `change` reads: its tags or entries
+/// whose order key is one the change names. That is enough because the changes only look at
+/// [`compare_key`](ostrel_db::api::compare_key) equal elements and keys, and order key equality
+/// is `compare_key` equality (D148). A field stored in the other kind, or not stored, is not
+/// loaded: the change starts it over empty and it is written whole.
+fn load_slice(
     conn: &Connection,
     id: &[u8],
-    model: ModelId,
-    expect_version: u64,
-    delete: bool,
-) -> Result<(), DbError> {
-    let found: Option<(i64, i64, i64)> = conn
-        .prepare_cached("SELECT model, version, deleted FROM ostrel_rows WHERE id = ?1")
-        .and_then(|mut s| {
-            s.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional()
-        })
+    field: FieldId,
+    change: &CollectionChange,
+    live: &mut LiveRow,
+) -> Result<Slice, DbError> {
+    let set = matches!(change, CollectionChange::Set(_));
+    let kind: Option<i64> = conn
+        .prepare_cached("SELECT kind FROM ostrel_collections WHERE row_id = ?1 AND field = ?2")
+        .and_then(|mut s| s.query_row(params![id, field], |r| r.get(0)).optional())
         .map_err(backend)?;
-    let version = match found {
-        Some((m, v, 0)) if m == i64::from(model) => to_u64(v)?,
-        _ => return Err(DbError::NotFound),
-    };
-    if version != expect_version {
-        return Err(DbError::VersionMismatch);
+    if kind != Some(if set { 0 } else { 1 }) {
+        return Ok(Slice { field, keys: None });
     }
-    let next = version
-        .checked_add(1)
-        .ok_or(DbError::Backend("row version exhausted".into()))?;
-    let next = to_i64(next)?;
+    let keys: BTreeSet<Vec<u8>> = match change {
+        CollectionChange::Set(changes) => changes
+            .iter()
+            .map(|c| {
+                let (SetChange::Add { elem, .. } | SetChange::Remove { elem, .. }) = c;
+                key(elem)
+            })
+            .collect::<Result<_, _>>()?,
+        CollectionChange::Map(entries) => entries
+            .iter()
+            .map(|e| key(&e.key))
+            .collect::<Result<_, _>>()?,
+    };
+    let state = if set {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT elem, tag_replica, tag_seq FROM ostrel_set_tags
+                 WHERE row_id = ?1 AND field = ?2 AND k = ?3 ORDER BY tag_replica",
+            )
+            .map_err(backend)?;
+        let mut tags = Vec::new();
+        for k in &keys {
+            let mut rows = stmt.query(params![id, field, k]).map_err(backend)?;
+            while let Some(r) = rows.next().map_err(backend)? {
+                let elem = codec::decode_value(&get::<Vec<u8>>(r, 0)?).map_err(corrupt)?;
+                let tag = codec::op_id_from(&get::<Vec<u8>>(r, 1)?, get(r, 2)?).map_err(corrupt)?;
+                tags.push(SetTag { elem, tag });
+            }
+        }
+        CollectionState::Set(tags)
+    } else {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT key, value, hlc FROM ostrel_map_entries
+                 WHERE row_id = ?1 AND field = ?2 AND k = ?3",
+            )
+            .map_err(backend)?;
+        let mut entries = Vec::new();
+        for k in &keys {
+            let mut rows = stmt.query(params![id, field, k]).map_err(backend)?;
+            while let Some(r) = rows.next().map_err(backend)? {
+                let value = get::<Option<Vec<u8>>>(r, 1)?
+                    .map(|b| codec::decode_value(&b))
+                    .transpose()
+                    .map_err(corrupt)?;
+                entries.push(MapEntry {
+                    key: codec::decode_value(&get::<Vec<u8>>(r, 0)?).map_err(corrupt)?,
+                    value,
+                    hlc: codec::hlc_from(&get::<Vec<u8>>(r, 2)?).map_err(corrupt)?,
+                });
+            }
+        }
+        CollectionState::Map(entries)
+    };
+    live.collections.insert(field, state);
+    Ok(Slice {
+        field,
+        keys: Some(keys),
+    })
+}
+
+/// Stores `version` of the row `id`; `delete` also turns it into a tombstone. Versions are
+/// stored as signed 64 bit integers, so the largest one cannot grow.
+fn set_version(conn: &Connection, id: &[u8], version: u64, delete: bool) -> Result<(), DbError> {
+    let version =
+        i64::try_from(version).map_err(|_| DbError::Backend("row version exhausted".into()))?;
     conn.prepare_cached("UPDATE ostrel_rows SET version = ?2, deleted = ?3 WHERE id = ?1")
-        .and_then(|mut s| s.execute(params![id, next, i64::from(delete)]))
+        .and_then(|mut s| s.execute(params![id, version, i64::from(delete)]))
         .map_err(backend)?;
     Ok(())
 }
 
-fn write_fields(conn: &Connection, id: &[u8], fields: &[(FieldId, Value)]) -> Result<(), DbError> {
+/// Writes the fields a write names and the collection slices, as `live` holds them after the
+/// write.
+fn write_back(
+    conn: &Connection,
+    id: &[u8],
+    live: &LiveRow,
+    fields: &[(FieldId, Value)],
+    slices: &[Slice],
+) -> Result<(), DbError> {
+    let named: BTreeSet<FieldId> = fields.iter().map(|(f, _)| *f).collect();
     let mut stmt = conn
         .prepare_cached(
             "INSERT INTO ostrel_fields (row_id, field, value) VALUES (?1, ?2, ?3)
              ON CONFLICT (row_id, field) DO UPDATE SET value = excluded.value",
         )
         .map_err(backend)?;
-    for (f, v) in fields {
+    for f in named {
+        let v = live.fields.get(&f).ok_or(corrupt(Corrupt))?;
         stmt.execute(params![id, f, stored(v)?]).map_err(backend)?;
+    }
+    for s in slices {
+        let state = live.collections.get(&s.field).ok_or(corrupt(Corrupt))?;
+        write_collection(conn, id, s, state)?;
     }
     Ok(())
 }
 
-/// Applies the changes of one collection field. A field stored as the other collection kind
-/// starts over as the new kind; the compiler never emits that.
-fn apply_collection(
+/// Replaces the stored entries of one collection slice with those of `state`. `state` holds
+/// only entries under the slice's order keys, because the change could add no others. A whole
+/// field also loses the entries of the other kind and gets its kind stored.
+fn write_collection(
     conn: &Connection,
     id: &[u8],
-    field: FieldId,
-    change: &CollectionChange,
+    slice: &Slice,
+    state: &CollectionState,
 ) -> Result<(), DbError> {
-    let kind: i64 = match change {
-        CollectionChange::Set(_) => 0,
-        CollectionChange::Map(_) => 1,
-    };
-    let old: Option<i64> = conn
-        .prepare_cached("SELECT kind FROM ostrel_collections WHERE row_id = ?1 AND field = ?2")
-        .and_then(|mut s| s.query_row(params![id, field], |r| r.get(0)).optional())
-        .map_err(backend)?;
-    if old != Some(kind) {
-        for sql in [
-            "DELETE FROM ostrel_set_tags WHERE row_id = ?1 AND field = ?2",
-            "DELETE FROM ostrel_map_entries WHERE row_id = ?1 AND field = ?2",
-        ] {
-            conn.prepare_cached(sql)
-                .and_then(|mut s| s.execute(params![id, field]))
-                .map_err(backend)?;
+    let field = slice.field;
+    match &slice.keys {
+        None => {
+            for sql in [
+                "DELETE FROM ostrel_set_tags WHERE row_id = ?1 AND field = ?2",
+                "DELETE FROM ostrel_map_entries WHERE row_id = ?1 AND field = ?2",
+            ] {
+                conn.prepare_cached(sql)
+                    .and_then(|mut s| s.execute(params![id, field]))
+                    .map_err(backend)?;
+            }
+            let kind: i64 = match state {
+                CollectionState::Set(_) => 0,
+                CollectionState::Map(_) => 1,
+            };
+            conn.prepare_cached(
+                "INSERT INTO ostrel_collections (row_id, field, kind) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (row_id, field) DO UPDATE SET kind = excluded.kind",
+            )
+            .and_then(|mut s| s.execute(params![id, field, kind]))
+            .map_err(backend)?;
         }
-        conn.prepare_cached(
-            "INSERT INTO ostrel_collections (row_id, field, kind) VALUES (?1, ?2, ?3)
-             ON CONFLICT (row_id, field) DO UPDATE SET kind = excluded.kind",
-        )
-        .and_then(|mut s| s.execute(params![id, field, kind]))
-        .map_err(backend)?;
-    }
-    match change {
-        CollectionChange::Set(changes) => {
-            for c in changes {
-                apply_set_change(conn, id, field, c)?;
+        Some(keys) => {
+            let sql = match state {
+                CollectionState::Set(_) => {
+                    "DELETE FROM ostrel_set_tags WHERE row_id = ?1 AND field = ?2 AND k = ?3"
+                }
+                CollectionState::Map(_) => {
+                    "DELETE FROM ostrel_map_entries WHERE row_id = ?1 AND field = ?2 AND k = ?3"
+                }
+            };
+            let mut stmt = conn.prepare_cached(sql).map_err(backend)?;
+            for k in keys {
+                stmt.execute(params![id, field, k]).map_err(backend)?;
             }
         }
-        CollectionChange::Map(entries) => {
+    }
+    match state {
+        CollectionState::Set(tags) => {
+            let mut stmt = conn
+                .prepare_cached(
+                    "INSERT INTO ostrel_set_tags (row_id, field, k, elem, tag_replica, tag_seq)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(backend)?;
+            for t in tags {
+                let replica = codec::replica_bytes(t.tag.replica);
+                stmt.execute(params![
+                    id,
+                    field,
+                    key(&t.elem)?,
+                    stored(&t.elem)?,
+                    &replica[..],
+                    t.tag.seq
+                ])
+                .map_err(backend)?;
+            }
+        }
+        CollectionState::Map(entries) => {
             let mut stmt = conn
                 .prepare_cached(
                     "INSERT INTO ostrel_map_entries (row_id, field, k, key, value, hlc)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT (row_id, field, k) DO UPDATE SET key = excluded.key,
-                       value = excluded.value, hlc = excluded.hlc",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )
                 .map_err(backend)?;
             for e in entries {
@@ -710,44 +811,6 @@ fn apply_collection(
                 ])
                 .map_err(backend)?;
             }
-        }
-    }
-    Ok(())
-}
-
-/// One tag change of a `Set` field: at most one live tag per (element, replica) (D49).
-fn apply_set_change(
-    conn: &Connection,
-    id: &[u8],
-    field: FieldId,
-    change: &SetChange,
-) -> Result<(), DbError> {
-    let (SetChange::Add { elem, tag } | SetChange::Remove { elem, tag }) = change;
-    let k = key(elem)?;
-    let replica = codec::replica_bytes(tag.replica);
-    match change {
-        SetChange::Add { .. } => {
-            let elem = stored(elem)?;
-            // A replay of this add or of an older add of the same replica changes nothing; a
-            // newer one replaces the tag and keeps the stored element.
-            conn.prepare_cached(
-                "INSERT INTO ostrel_set_tags (row_id, field, k, elem, tag_replica, tag_seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT (row_id, field, k, tag_replica) DO UPDATE SET tag_seq = excluded.tag_seq
-                 WHERE excluded.tag_seq > ostrel_set_tags.tag_seq",
-            )
-            .and_then(|mut s| s.execute(params![id, field, k, elem, &replica[..], tag.seq]))
-            .map_err(backend)?;
-        }
-        SetChange::Remove { .. } => {
-            // Only the full tuple (row, field, element, replica, seq) names a live tag; a tag of
-            // another element is ignored like an unknown one (D96).
-            conn.prepare_cached(
-                "DELETE FROM ostrel_set_tags
-                 WHERE row_id = ?1 AND field = ?2 AND k = ?3 AND tag_replica = ?4 AND tag_seq = ?5",
-            )
-            .and_then(|mut s| s.execute(params![id, field, k, &replica[..], tag.seq]))
-            .map_err(backend)?;
         }
     }
     Ok(())
