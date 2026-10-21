@@ -1,0 +1,17 @@
+// A file with comments in every place.
+
+
+
+fn helper() -> Int // returns one
+  // inside the body
+  return 1
+      // end of helper, too deep
+// about main
+fn main()
+// first line of the body
+  print(helper())   // trailing   
+  print(helper(
+// an item
+  ))
+
+

@@ -1,0 +1,14 @@
+fn sum(a: Int, b: Int, c: Int) -> Int
+  return a + b + c
+
+fn main()
+  print(sum(1,
+             2,
+   3
+      ))
+  print(sum(
+ sum(1, 2,
+         3),
+    4,
+        5
+))

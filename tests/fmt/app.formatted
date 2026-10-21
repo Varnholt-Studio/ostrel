@@ -1,0 +1,27 @@
+app Chat
+  auth paseto open
+
+data Room
+  name: Text
+  members: Set[User] = {me}
+  check name.len in 1..40
+  see if signed
+  make if members == {me}
+
+var current: Room?
+
+view Main
+  col
+    for r in Room sort name
+      button r.name selected: r == current on click current = r
+    entry hint: "New room" submit: "Create"
+      on submit current = make Room { name: it }
+
+style
+  .mine {
+    align-self: flex-end; /* right side
+       of the column */
+    background: url(//cdn.example/x.png);
+  }
+  /* between rules */
+  .b { color: red }
