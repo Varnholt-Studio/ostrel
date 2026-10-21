@@ -11,7 +11,15 @@
 //! A bare name resolves, first match wins: a field of the model in scope
 //! (rules, `check`, `where` and `sort` of a query, so fields win, G14), a
 //! contextual name of SYNTAX 6 where it has meaning, a local, a top level
-//! definition, an enum variant, the prelude.
+//! definition, an enum variant, the prelude. A name that only several enums
+//! declare as a variant, and an element attribute value that is a bare name,
+//! become [`ExprKind::Word`] without a diagnostic; `check` decides them by
+//! the expected type (D142).
+//!
+//! In a program whose `app` has `auth`, the std `User` of SYNTAX 4.1 is the
+//! first definition (`DefId(0)`). It is declared in Ostrel (`std/user.ostl`)
+//! and resolved like every other source, in the file [`STD_FILE`]. The
+//! implicit `author` has its type.
 //!
 //! `base.name` becomes [`ExprKind::Field`] when the model of `base` follows
 //! from declarations (a declared parameter type, a loop over a query, `make`,
@@ -53,10 +61,28 @@ pub(crate) const IMPLICIT_WRITE: Code = Code::new(208);
 /// A wrong number of type arguments (SPEC 12.6).
 pub(crate) const TYPE_ARGS: Code = Code::new(309);
 
+/// The file of the std sources; no source map entry has this id.
+pub(crate) const STD_FILE: FileId = FileId::from_raw(u32::MAX);
+/// The std `User` (SYNTAX 4.1, D142).
+const USER_SOURCE: &str = include_str!("std/user.ostl");
+
 /// Resolves the names of all files of one program and builds its HIR.
 pub(super) fn resolve(sources: &[Source<'_>]) -> (Program, Vec<Diagnostic>) {
-    let mut rx = Rx::default();
-    let items = rx.declare(sources);
+    let user = has_auth(sources).then(|| parse_std(USER_SOURCE));
+    let mut all = Vec::with_capacity(sources.len() + 1);
+    if let Some(module) = &user {
+        all.push(Source {
+            file: STD_FILE,
+            text: USER_SOURCE,
+            module,
+        });
+    }
+    all.extend_from_slice(sources);
+    let mut rx = Rx {
+        author: user.as_ref().map(|_| Ty::Ref(DefId(0))),
+        ..Rx::default()
+    };
+    let items = rx.declare(&all);
     for item in &items {
         rx.signature(item);
     }
@@ -64,6 +90,29 @@ pub(super) fn resolve(sources: &[Source<'_>]) -> (Program, Vec<Diagnostic>) {
         rx.body(item);
     }
     (rx.p, rx.diags)
+}
+
+/// True if the first `app` has an `auth` line; a second `app` is an error.
+fn has_auth(sources: &[Source<'_>]) -> bool {
+    let first_app = sources
+        .iter()
+        .flat_map(|s| s.module.items())
+        .find_map(|item| match item {
+            ast::Item::App(d) => Some(d),
+            _ => None,
+        });
+    first_app.is_some_and(|d| {
+        d.items
+            .iter()
+            .any(|l| matches!(l.kind, ast::AppItemKind::Auth { .. }))
+    })
+}
+
+/// Parses a std source. Std sources are fixed and parse without a
+/// diagnostic (tested), so diagnostics are not kept.
+fn parse_std(text: &str) -> ast::Module {
+    let (tokens, lexed) = ostrel_syntax::lex::lex(text, STD_FILE);
+    ostrel_syntax::parse::parse(text, STD_FILE, &tokens, &lexed).0
 }
 
 /// One top level declaration with the file it stands in.
@@ -94,9 +143,10 @@ struct Rx<'a> {
     variants: HashMap<&'a str, Vec<(DefId, u32)>>,
     /// Declared fields per model; a second field of a name is not listed.
     fields: HashMap<DefId, HashMap<&'a str, FieldId>>,
-    /// Whether the first `app` has an `auth` line; without it no model has
-    /// the implicit `author` (G8, SPEC 12.6).
-    auth: bool,
+    /// The type of the implicit `author`, a reference to the std `User`;
+    /// `None` when the first `app` has no `auth` line, so no model has
+    /// `author` (G8, SPEC 12.6).
+    author: Option<Ty>,
     /// Names of top level `var`s, which count as locals for SPEC 12.10.
     vars: Vec<&'a str>,
     /// Parameters of every function and view, bound when its body starts.
@@ -125,7 +175,7 @@ fn builtin_arity(name: &str) -> Option<usize> {
     match name {
         "Set" | "List" => Some(1),
         "Map" => Some(2),
-        "Bool" | "Int" | "Float" | "Text" | "Time" | "Bytes" | "Rank" => Some(0),
+        "Bool" | "Int" | "Float" | "Text" | "Time" | "Bytes" | "Rank" | "Url" => Some(0),
         _ => None,
     }
 }
@@ -182,7 +232,7 @@ impl<'a> Rx<'a> {
 
     /// The implicit field `name` names in this program.
     fn implicit(&self, name: &str) -> Option<ImplicitField> {
-        implicit_field(name).filter(|&f| f != ImplicitField::Author || self.auth)
+        implicit_field(name).filter(|&f| f != ImplicitField::Author || self.author.is_some())
     }
 
     fn field_ref(&self, model: DefId, name: &str) -> Option<FieldRef> {
@@ -195,7 +245,17 @@ impl<'a> Rx<'a> {
     fn field_ty(&self, model: DefId, field: FieldRef) -> Option<&Ty> {
         match field {
             FieldRef::Declared(f) => self.p.field(model, f).map(|f| &f.ty),
+            FieldRef::Implicit(ImplicitField::Author) => self.author.as_ref(),
             FieldRef::Implicit(_) => None,
+        }
+    }
+
+    /// The hint for `User` in a program without `auth` (D142).
+    fn user_hint(&self, name: &str) -> &'static str {
+        if name == "User" && self.author.is_none() {
+            "; the std `User` exists only when the `app` has `auth paseto`"
+        } else {
+            ""
         }
     }
 
@@ -228,10 +288,6 @@ impl<'a> Rx<'a> {
                             );
                         } else {
                             self.p.app = Some(def);
-                            self.auth = d
-                                .items
-                                .iter()
-                                .any(|l| matches!(l.kind, ast::AppItemKind::Auth { .. }));
                         }
                         (None, d.range)
                     }
@@ -246,12 +302,17 @@ impl<'a> Rx<'a> {
                     }
                 };
                 if let Some(name) = name {
-                    if self.defs.contains_key(&*name.text) {
-                        self.error(
-                            codes::DUPLICATE_FN,
-                            name.range,
-                            format!("`{}` is already declared", name.text),
-                        );
+                    if let Some(&first) = self.defs.get(&*name.text) {
+                        let std = self.p.def(first).is_some_and(|d| d.span.file == STD_FILE);
+                        let message = if std {
+                            format!(
+                                "`{}` is the std data type of `auth paseto`; rename this one",
+                                name.text
+                            )
+                        } else {
+                            format!("`{}` is already declared", name.text)
+                        };
+                        self.error(codes::DUPLICATE_FN, name.range, message);
                     } else {
                         self.defs.insert(&name.text, def);
                     }
@@ -549,7 +610,7 @@ impl<'a> Rx<'a> {
                     let message = if found.is_some() {
                         format!("`{other}` is not a type")
                     } else {
-                        format!("unknown type `{other}`")
+                        format!("unknown type `{other}`{}", self.user_hint(other))
                     };
                     self.error(codes::UNKNOWN_TYPE, name.range, message);
                     return Ty::Error;
@@ -580,6 +641,7 @@ impl<'a> Rx<'a> {
             "Time" => Ty::Time,
             "Bytes" => Ty::Bytes,
             "Rank" => Ty::Rank,
+            "Url" => Ty::Url,
             "Set" => Ty::Set(arg()),
             "List" => Ty::List(arg()),
             "Map" => {
@@ -1054,7 +1116,11 @@ impl<'a> Rx<'a> {
         for attr in e.attrs.iter() {
             match &attr.kind {
                 ast::AttrKind::Named { name, value } => {
-                    attrs.push((name.text.clone(), self.expr(*value)))
+                    let value = match self.word(*value) {
+                        Some(word) => word,
+                        None => self.expr(*value),
+                    };
+                    attrs.push((name.text.clone(), value));
                 }
                 ast::AttrKind::Style { name, cond } => {
                     styles.push((name.text.clone(), cond.map(|c| self.expr(c))));
@@ -1077,6 +1143,26 @@ impl<'a> Rx<'a> {
             handlers: handlers.into_boxed_slice(),
             children: children.into_boxed_slice(),
         }
+    }
+
+    /// An attribute value that is a bare name becomes a word whose `lexical`
+    /// is what the name binds here, without a diagnostic (D142).
+    fn word(&mut self, id: ast::ExprId) -> Option<ExprId> {
+        let expr = self.module?.expr(id)?;
+        let ast::ExprKind::Name(name) = &expr.kind else {
+            return None;
+        };
+        let mark = self.diags.len();
+        let lexical = match self.lookup(name) {
+            ExprKind::Name(res) => res,
+            _ => Res::Error,
+        };
+        self.diags.truncate(mark);
+        let word = ExprKind::Word {
+            name: name.text.clone(),
+            lexical,
+        };
+        Some(self.push_expr(word, expr.range))
     }
 
     fn handler(&mut self, h: &'a ast::Handler) -> Handler {
@@ -1129,7 +1215,7 @@ impl<'a> Rx<'a> {
                     })
                     .collect(),
             ),
-            ast::ExprKind::Name(name) => ExprKind::Name(self.lookup(name)),
+            ast::ExprKind::Name(name) => self.lookup(name),
             ast::ExprKind::Unary { op, operand } => ExprKind::Unary {
                 op: *op,
                 operand: self.expr(*operand),
@@ -1220,59 +1306,63 @@ impl<'a> Rx<'a> {
         self.push_expr(kind, range)
     }
 
-    /// Resolves a bare name in the current position.
-    fn lookup(&mut self, name: &ast::Ident) -> Res {
+    /// Resolves a bare name in the current position: a name or a word.
+    fn lookup(&mut self, name: &ast::Ident) -> ExprKind {
+        match self.bind_name(name) {
+            Some(res) => ExprKind::Name(res),
+            None => ExprKind::Word {
+                name: name.text.clone(),
+                lexical: Res::Error,
+            },
+        }
+    }
+
+    /// What a bare name binds; `None` for a name that only several enums
+    /// declare as a variant (D142).
+    fn bind_name(&mut self, name: &ast::Ident) -> Option<Res> {
         let text = &*name.text;
         if let Some(model) = self.field_scope
             && let Some(field) = self.field_ref(model, text)
         {
-            return Res::Field(model, field);
+            return Some(Res::Field(model, field));
         }
         if let Some(model) = self.field_scope
             && implicit_field(text).is_some()
         {
             self.unknown_field(model, name);
-            return Res::Error;
+            return Some(Res::Error);
         }
         if self.banned.contains(&text) {
-            return Res::Error;
+            return Some(Res::Error);
         }
         let ctx = self.ctx;
         match text {
-            "new" if ctx.new => return Res::Context(ContextName::New),
-            "added" if ctx.added => return Res::Context(ContextName::Added),
-            "removed" if ctx.added => return Res::Context(ContextName::Removed),
-            "it" if ctx.it => return Res::Context(ContextName::It),
+            "new" if ctx.new => return Some(Res::Context(ContextName::New)),
+            "added" if ctx.added => return Some(Res::Context(ContextName::Added)),
+            "removed" if ctx.added => return Some(Res::Context(ContextName::Removed)),
+            "it" if ctx.it => return Some(Res::Context(ContextName::It)),
             _ => {}
         }
         if let Some(&(_, local)) = self.scope.iter().rev().find(|(n, _)| *n == text) {
-            return Res::Local(local);
+            return Some(Res::Local(local));
         }
         if let Some(&def) = self.defs.get(text) {
-            return Res::Def(def);
+            return Some(Res::Def(def));
         }
         match self.variants.get(text).map(Vec::as_slice) {
-            Some(&[(def, index)]) => return Res::Variant(def, index),
-            Some([first, second, ..]) => {
-                let message = format!(
-                    "`{text}` is a variant of both `{}` and `{}`",
-                    self.def_name(first.0),
-                    self.def_name(second.0)
-                );
-                self.error(codes::UNKNOWN_NAME, name.range, message);
-                return Res::Error;
-            }
+            Some(&[(def, index)]) => return Some(Res::Variant(def, index)),
+            Some([_, _, ..]) => return None,
             _ => {}
         }
-        if text == "print" {
-            return Res::Std(StdName::Print);
+        match text {
+            "print" => return Some(Res::Std(StdName::Print)),
+            "sync" => return Some(Res::Std(StdName::Sync)),
+            "Url" => return Some(Res::Std(StdName::Url)),
+            _ => {}
         }
-        self.error(
-            codes::UNKNOWN_NAME,
-            name.range,
-            format!("unknown name `{text}`"),
-        );
-        Res::Error
+        let message = format!("unknown name `{text}`{}", self.user_hint(text));
+        self.error(codes::UNKNOWN_NAME, name.range, message);
+        Some(Res::Error)
     }
 
     fn make(&mut self, m: &'a ast::MakeExpr) -> ExprKind {
@@ -1339,7 +1429,8 @@ impl<'a> Rx<'a> {
                 } else if found.is_some() {
                     (unknown, format!("`{}` is not a type", name.text))
                 } else {
-                    (unknown, format!("unknown data type `{}`", name.text))
+                    let hint = self.user_hint(&name.text);
+                    (unknown, format!("unknown data type `{}`{hint}", name.text))
                 };
                 self.error(code, name.range, message);
                 None
@@ -1367,7 +1458,7 @@ impl<'a> Rx<'a> {
                 );
                 ExprKind::Name(Res::Error)
             }
-            _ => ExprKind::Name(self.lookup(&q.head)),
+            _ => self.lookup(&q.head),
         }
     }
 
@@ -1507,6 +1598,7 @@ impl<'a> Rx<'a> {
                 self.field_ty(*m, *f).and_then(ty_model)
             }
             ExprKind::Name(Res::Context(ContextName::New)) => self.data,
+            ExprKind::Me => self.author.as_ref().and_then(ty_model),
             ExprKind::Name(Res::Def(d)) => match self.def_kind(*d)? {
                 DefKind::Var(v) => v.ty.as_ref().and_then(ty_model),
                 _ => None,

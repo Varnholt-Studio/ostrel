@@ -381,11 +381,8 @@ fn query_heads_name_models_enums_or_values() {
             .iter()
             .any(|e| matches!(&e.kind, ExprKind::Query(q) if q.filter.is_some()))
     );
-    // A variant name shared by two enums is ambiguous.
-    assert_eq!(
-        diags("enum A = x\nenum B = x\nfn f()\n  print(x)\n"),
-        ["E0200 4:9"]
-    );
+    // A variant name shared by two enums is a word, see
+    // `shared_variant_names_are_words_and_single_ones_stay_variants`.
 }
 
 #[test]
@@ -488,9 +485,10 @@ fn files_share_one_program_in_file_order() {
 #[test]
 fn app_lines_are_validated() {
     let p = clean("app A\n  auth paseto invite\n  home Start\nview Start\n  col\n");
+    let start = def(&p, "Start");
     assert!(matches!(
-        &p.defs[0].kind,
-        DefKind::App(a) if a.auth == Some(Registration::Invite) && a.home == Some(DefId(1))
+        &p.defs[p.app.unwrap().index()].kind,
+        DefKind::App(a) if a.auth == Some(Registration::Invite) && a.home == Some(start)
     ));
     assert_eq!(diags("app A\n  auth jwt open\n"), ["E0200 2:8"]);
     assert_eq!(diags("app A\n  auth paseto closed\n"), ["E0200 2:15"]);
@@ -522,4 +520,153 @@ fn every_example_resolves_without_panic() {
         }
     }
     assert!(seen > 10);
+}
+
+const AUTH: &str = "app A\n  auth paseto open\n";
+
+fn words(p: &Program) -> Vec<(&str, Res)> {
+    p.exprs
+        .iter()
+        .filter_map(|e| match &e.kind {
+            ExprKind::Word { name, lexical } => Some((&**name, *lexical)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn std_user_is_a_model_only_with_auth() {
+    let p = clean(AUTH);
+    let user = def(&p, "User");
+    assert_eq!(user, DefId(0));
+    assert_eq!(p.defs[0].span.file, super::STD_FILE);
+    let m = model(&p, "User");
+    let fields: Vec<&str> = m.fields.iter().map(|f| &*f.name).collect();
+    assert_eq!(fields, ["handle", "name"]);
+    assert_eq!(m.fields[0].mode, FieldMode::Fixed);
+    let ops: Vec<RuleOp> = m.rules.iter().map(|r| r.op).collect();
+    assert_eq!(ops, [RuleOp::See, RuleOp::Edit]);
+    // `me` is a `User`, so `me.handle` in its edit rule is a field.
+    assert!(p.exprs.iter().any(|e| matches!(
+        e.kind,
+        ExprKind::Field { field: (m, FieldRef::Declared(FieldId(0))), .. } if m == user
+    )));
+    let p = clean(&format!("{AUTH}data Room\n  members: Set[User]\n"));
+    assert_eq!(
+        model(&p, "Room").fields[0].ty,
+        Ty::Set(Box::new(Ty::Ref(user)))
+    );
+
+    // Without `auth` there is no `User`; every position names `auth paseto`.
+    for (src, want) in [
+        ("fn f(u: User)\n  1\n", "E0203 1:9"),
+        ("fn f()\n  make User { name: \"x\" }\n", "E0203 2:8"),
+        (
+            "fn f()\n  for u in User sort name\n    print(1)\n",
+            "E0200 2:12",
+        ),
+        ("fn f()\n  for u in User\n    print(1)\n", "E0200 2:12"),
+    ] {
+        assert_eq!(diags(src), [want], "{src}");
+        let (_, d) = run(src);
+        assert!(d[0].message.contains("auth paseto"), "{}", d[0].message);
+    }
+    let p = clean("data User\n  name: Text\n");
+    assert_eq!(def(&p, "User"), DefId(0));
+    assert_ne!(p.defs[0].span.file, super::STD_FILE);
+
+    // A declared `User` beside `auth` is E0201 at its name.
+    let src = format!("{AUTH}data User\n  name: Text\n");
+    assert_eq!(diags(&src), ["E0201 3:6"]);
+    let (_, d) = run(&src);
+    assert!(d[0].message.contains("auth paseto"), "{}", d[0].message);
+}
+
+#[test]
+fn std_user_source_parses_without_diagnostics() {
+    let _ = parse(super::USER_SOURCE);
+}
+
+#[test]
+fn author_is_a_reference_to_the_std_user() {
+    let src = format!("{AUTH}data Note\n  title: Text\nfn f(n: Note) -> Text\n  n.author.handle\n");
+    let p = clean(&src);
+    let user = def(&p, "User");
+    let note = def(&p, "Note");
+    assert!(p.exprs.iter().any(|e| matches!(
+        e.kind,
+        ExprKind::Field { field: (m, FieldRef::Implicit(ImplicitField::Author)), .. } if m == note
+    )));
+    assert!(p.exprs.iter().any(|e| matches!(
+        e.kind,
+        ExprKind::Field { field: (m, FieldRef::Declared(FieldId(0))), .. } if m == user
+    )));
+    let src = format!("{AUTH}data Note\n  title: Text\nfn f(n: Note) -> Text\n  n.author.nope\n");
+    assert_eq!(diags(&src), ["E0204 6:12"]);
+}
+
+#[test]
+fn sync_and_url_are_std_names_and_url_is_a_type() {
+    let p = clean("fn f(t: Text) -> Url?\n  print(sync.state)\n  return Url.parse(t)\n");
+    assert!(names(&p).contains(&Res::Std(StdName::Sync)));
+    assert!(names(&p).contains(&Res::Std(StdName::Url)));
+    match &p.defs[0].kind {
+        DefKind::Fn(f) => assert_eq!(f.result, Ty::Optional(Box::new(Ty::Url))),
+        other => panic!("{other:?}"),
+    }
+    assert!(Ty::Url.is_field_type());
+    assert_eq!(diags("fn f()\n  make Url { a: 1 }\n"), ["E0205 2:8"]);
+    // A declaration wins over a std name.
+    let p = clean("var sync = 1\nfn f() -> Int\n  sync\n");
+    assert!(!names(&p).contains(&Res::Std(StdName::Sync)));
+}
+
+#[test]
+fn bare_attribute_values_are_words() {
+    let p =
+        clean("view V(d: Text)\n  col scroll: end\n    text d look: strong\n    input bind: d\n");
+    let local = match &p.defs[0].kind {
+        DefKind::View(v) => v.params[0],
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        words(&p),
+        [
+            ("end", Res::Error),
+            ("strong", Res::Error),
+            ("d", Res::Local(local)),
+        ]
+    );
+    // A variant of one enum is still only the lexical meaning of the word.
+    let p = clean("enum Look = strong\nview V\n  text \"x\" look: strong\n");
+    assert_eq!(words(&p), [("strong", Res::Variant(def(&p, "Look"), 0))]);
+    // Only a bare name is a word; other values resolve as usual.
+    assert_eq!(diags("view V\n  text \"x\" look: nope.x\n"), ["E0200 2:18"]);
+}
+
+#[test]
+fn shared_variant_names_are_words_and_single_ones_stay_variants() {
+    let p = clean("enum A = x | y\nenum B = x\nfn f()\n  print(x)\n  print(y)\n");
+    assert_eq!(words(&p), [("x", Res::Error)]);
+    assert!(names(&p).contains(&Res::Variant(def(&p, "A"), 1)));
+    // A local binds first, so the name is no word.
+    let p = clean("enum A = x\nenum B = x\nfn f(x: Int)\n  print(x)\n");
+    assert!(words(&p).is_empty());
+}
+
+#[test]
+fn chat_example_resolves_without_diagnostics() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/chat/chat.ostl");
+    let src = std::fs::read_to_string(path).unwrap();
+    // The lexer of the `style` body is not this task's; only `resolve` counts.
+    let (tokens, lexed) = ostrel_syntax::lex::lex(&src, FILE);
+    let (module, _) = ostrel_syntax::parse::parse(&src, FILE, &tokens, &lexed);
+    let (p, d) = resolve(&[Source {
+        file: FILE,
+        text: &src,
+        module: &module,
+    }]);
+    assert!(d.is_empty(), "{d:?}");
+    let found: Vec<&str> = words(&p).iter().map(|(n, _)| *n).collect();
+    assert_eq!(found, ["muted", "title", "end", "strong", "muted", "muted"]);
 }
