@@ -55,8 +55,15 @@ pub enum TokenKind {
     Dedent,
     /// End of the input. Always the last token. Span: empty, at the end.
     Eof,
-    /// A `//` comment up to, not including, the line end. Trivia.
+    /// A `//` comment up to, not including, the line end. Inside a `style`
+    /// body a `/* */` comment from `/*` through `*/`, which may span lines.
+    /// Trivia.
     Comment,
+    /// A run of CSS text inside a `style` body: from its first non blank
+    /// character up to the next `/*` comment or the line end, without trailing
+    /// blanks. The lexer does not split or check CSS beyond the rules of the
+    /// CSS mode in `lex/css.rs`.
+    Css,
     /// An identifier: an ASCII letter followed by ASCII letters, digits and `_`
     /// (SPEC 12.2), that is not a keyword.
     Ident,

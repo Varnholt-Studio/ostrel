@@ -36,6 +36,9 @@ pub const DEEP_INDENT: Code = Code::new(13);
 /// (D84, SPEC 12.6). The lexer reads `&str` and never sees such a file; the
 /// caller that decodes the bytes reports it with [`msg_invalid_utf8`].
 pub const INVALID_UTF8: Code = Code::new(14);
+/// `/*` comment in a `style` body without its closing `*/` before the end of
+/// that body (SYNTAX 3, B-F21).
+pub const UNTERMINATED_CSS_COMMENT: Code = Code::new(15);
 
 /// Deepest accepted interpolation brace depth (G1, SPEC 12.1).
 pub const MAX_INTERPOLATION_DEPTH: u32 = 32;
@@ -62,6 +65,9 @@ pub const MSG_LONE_CLOSE_BRACE: &str = "`}` in a string literal must be written 
 /// Message of [`DEEP_INDENT`] (ARCHITECTURE 3.5).
 pub const MSG_DEEP_INDENT: &str =
     "indentation is more than one level deeper than the line above; indent a block by two spaces";
+/// Message of [`UNTERMINATED_CSS_COMMENT`].
+pub const MSG_UNTERMINATED_CSS_COMMENT: &str =
+    "unterminated `/*` comment in a `style` block; close it with `*/`";
 
 /// Message of [`UNEXPECTED_CHAR`] for the character `c`.
 ///
