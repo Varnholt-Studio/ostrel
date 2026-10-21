@@ -6,8 +6,10 @@
 // generator, that:
 //   * text reaches the DOM only as one text node whose data equals the input exactly;
 //   * a text attribute keeps its name and its exact value, and no other attribute appears;
-//   * a URL attribute is either left unset or, resolved the way a browser resolves it
-//     (WHATWG URL parser, `new URL(value, base)`), has the scheme http, https or mailto;
+//   * a URL attribute is either left unset or, resolved the way a browser resolves it,
+//     has the scheme http, https or mailto. The test uses `new URL(value, base)` here only
+//     as an independent model of the browser; the sinks themselves apply the narrower host
+//     rule H of safe/url.js (ARCHITECTURE 7.5, D144) and never call the WHATWG parser;
 //   * the DOM is touched only through a small set of methods that never parse markup.
 //
 // The DOM used here is a strict stand in: reading or writing any property outside its
