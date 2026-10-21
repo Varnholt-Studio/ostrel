@@ -115,10 +115,12 @@ Consequences (ARCHITECTURE 16, risk 13 (c)):
 
 ### 2.2 KPI A and the hold time
 
-KPI A allows a p99 of 20 ms for engine and render (ARCHITECTURE 5.4, 5.8). An app whose KPI path
-calls elevated functions pays one audit sync per call in the hold time of the write lock, and so
-in the latency of every write that waits behind it. A p99 hold time above 20 ms in the KPI A
-setup is a blocker (ARCHITECTURE 16, risk 12).
+KPI A requires a p99 of at most 50 ms for engine plus render, with 10 000 issues, 3 editors and
+the network excluded (ARCHITECTURE 1, D2). Separately, the hold time of the write lock is
+measured in the KPI A setup, and a p99 hold time above 20 ms there is a blocker (ARCHITECTURE
+5.4, ARCHITECTURE 16 risk 12). An app whose KPI path calls elevated functions pays one audit sync
+per call in the hold time of the write lock, and so in the latency of every write that waits
+behind it.
 
 Measurement rules for this limit:
 
