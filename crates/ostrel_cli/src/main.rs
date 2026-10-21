@@ -58,7 +58,17 @@ fn main() -> ExitCode {
             let _ = writeln!(io::stdout().lock(), "ostrel {}", env!("CARGO_PKG_VERSION"));
             Exit::Success.code()
         }
-        Command::Check { file } => on_pipeline_thread(Mode::Check, file),
+        Command::Check {
+            file,
+            list_elevated,
+        } => {
+            let mode = if list_elevated {
+                Mode::ListElevated
+            } else {
+                Mode::Check
+            };
+            on_pipeline_thread(mode, file)
+        }
         Command::Run { file, max_steps } => {
             let mut limits = Limits::default();
             if let Some(steps) = max_steps {

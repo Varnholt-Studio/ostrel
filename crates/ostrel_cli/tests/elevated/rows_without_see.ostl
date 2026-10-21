@@ -1,0 +1,28 @@
+app Teams
+  auth paseto open
+
+data Team
+  name: Text
+  owners: Set[User]
+  see if me in owners
+
+data Note
+  team: Team fixed
+  text: Text
+  see if me in team.owners
+
+server fn exportNotes(t: Team) -> List[Note] as system
+  call if me in t.owners
+  return exportNotes(t)
+
+server fn firstNote(t: Team) -> Note? as system
+  call if me in t.owners
+  return none
+
+fn collect(t: Team) -> List[Note]
+  return exportNotes(t)
+
+server fn report(t: Team) -> Int
+  call if me in t.owners
+  let notes = collect(t)
+  return 0

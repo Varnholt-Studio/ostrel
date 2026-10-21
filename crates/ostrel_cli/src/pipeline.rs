@@ -17,6 +17,11 @@
 //!   checker (`ostrel_sema::hir::check`). An app under `run` takes the script
 //!   path, because `run` only runs script programs.
 //!
+//! `ostrel check --list-elevated` ([`Mode::ListElevated`]) checks like
+//! `check` and, when the program is accepted, prints the elevated functions
+//! (AC-32, AC-54) to stdout. An accepted app gets one warning per elevated
+//! function that returns rows without `see` (D99) under both modes.
+//!
 //! Output contract:
 //! * Program output goes through the [`Host`] given by the caller.
 //! * Diagnostics, runtime errors and internal errors are appended to an error
@@ -27,6 +32,7 @@
 use std::fmt::Write as _;
 
 use ostrel_core::{Diagnostic, FileId, SourceMap, Span};
+use ostrel_sema::elevated::{self, Elevated};
 use ostrel_sema::hir;
 use ostrel_syntax::ast::{Item, Module};
 use ostrel_syntax::lex::codes::{INVALID_UTF8, msg_invalid_utf8};
@@ -65,6 +71,8 @@ impl Exit {
 pub enum Mode {
     /// Stop after the checker.
     Check,
+    /// Stop after the checker and list the elevated functions on stdout.
+    ListElevated,
     /// Run `fn main()` within these limits.
     Run(Limits),
 }
@@ -133,16 +141,22 @@ pub fn execute_module(
     err: &mut String,
 ) -> Exit {
     let src = map.text(file).unwrap_or_default();
-    if mode == Mode::Check && is_app(module) {
-        return check_app(map, file, src, module, err);
+    if !matches!(mode, Mode::Run(_)) && is_app(module) {
+        return check_app(mode, map, file, src, module, host, err);
     }
     let (checked, diags) = ostrel_sema::check(module, file, src);
     report(map, &diags, err);
     if has_error(&diags) {
         return Exit::Failure;
     }
-    let Mode::Run(limits) = mode else {
-        return Exit::Success;
+    let limits = match mode {
+        Mode::Run(limits) => limits,
+        Mode::Check => return Exit::Success,
+        Mode::ListElevated => {
+            // A script program has no server functions (SPEC 2).
+            list_elevated(map, &hir::Program::default(), &[], host);
+            return Exit::Success;
+        }
     };
     let program = match ostrel_ir::lower(module, &checked, file) {
         Ok(program) => program,
@@ -178,8 +192,18 @@ fn is_app(module: &Module) -> bool {
 
 /// `ostrel check` of an app: name resolution into the HIR, then the HIR
 /// checker. The checker runs only on a program that resolved without error,
-/// so one fault never gives a second diagnostic (SPEC 12.1).
-fn check_app(map: &SourceMap, file: FileId, src: &str, module: &Module, err: &mut String) -> Exit {
+/// so one fault never gives a second diagnostic (SPEC 12.1). An accepted app
+/// gets the warnings of `ostrel_sema::elevated`, and under
+/// [`Mode::ListElevated`] the list of its elevated functions.
+fn check_app(
+    mode: Mode,
+    map: &SourceMap,
+    file: FileId,
+    src: &str,
+    module: &Module,
+    host: &mut dyn Host,
+    err: &mut String,
+) -> Exit {
     let sources = [hir::Source {
         file,
         text: src,
@@ -190,12 +214,64 @@ fn check_app(map: &SourceMap, file: FileId, src: &str, module: &Module, err: &mu
     if has_error(&diags) {
         return Exit::Failure;
     }
-    let diags = hir::check(&mut program);
-    report(map, &diags, err);
+    let mut diags = hir::check(&mut program);
     if has_error(&diags) {
+        report(map, &diags, err);
         return Exit::Failure;
     }
+    diags.extend(elevated::warnings(&program));
+    report(map, &diags, err);
+    if mode == Mode::ListElevated {
+        list_elevated(map, &program, &elevated::list(&program), host);
+    }
     Exit::Success
+}
+
+/// Prints the elevated functions, one header line and per function one line
+/// with its position, name and result, then one line per client path:
+///
+/// ```text
+/// elevated functions: 1
+/// app.ostl:12:1: `export` -> List[Note]: returns rows without see
+///   client path: report -> export
+/// ```
+fn list_elevated(map: &SourceMap, program: &hir::Program, list: &[Elevated], host: &mut dyn Host) {
+    host.print(&format!("elevated functions: {}", list.len()));
+    for e in list {
+        let (path, line, column) = match (
+            map.path(e.span.file),
+            map.location(e.span.file, e.span.start),
+        ) {
+            (Some(path), Some(loc)) => (path, loc.line, loc.column),
+            _ => ("<unknown>", 0, 0),
+        };
+        let mut head = format!("{}:{line}:{column}: `{}`", escape(path), escape(&e.name));
+        if e.result != hir::Ty::Unit {
+            let _ = write!(
+                head,
+                " -> {}",
+                escape(&elevated::type_name(program, &e.result))
+            );
+        }
+        if e.unfiltered.is_some() {
+            head.push_str(": returns rows without see");
+        }
+        host.print(&head);
+        if e.paths.is_empty() {
+            host.print("  client path: none");
+        }
+        for p in &e.paths {
+            let names: Vec<String> = p
+                .iter()
+                .map(|d| {
+                    program
+                        .def(*d)
+                        .map_or_else(|| "?".to_string(), |d| escape(&d.name))
+                })
+                .collect();
+            host.print(&format!("  client path: {}", names.join(" -> ")));
+        }
+    }
 }
 
 fn has_error(diags: &[Diagnostic]) -> bool {

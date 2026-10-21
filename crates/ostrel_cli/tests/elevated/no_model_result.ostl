@@ -1,0 +1,23 @@
+app Teams
+  auth paseto open
+
+data Team
+  name: Text
+  owners: Set[User]
+  see if me in owners
+
+server fn countTeams(t: Team) -> Int as system
+  call if me in t.owners
+  return 1
+
+server fn rename(t: Team, name: Text) as system
+  call if me in t.owners
+  t.name = name
+
+server fn renameAll(t: Team, name: Text)
+  call if me in t.owners
+  rename(t, name)
+
+server fn teamNames(t: Team) -> List[Team]
+  call if me in t.owners
+  return []

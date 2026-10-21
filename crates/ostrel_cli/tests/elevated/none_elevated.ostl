@@ -1,0 +1,11 @@
+app Notes
+
+data Note
+  title: Text
+  see if true
+  make if true
+
+view Main
+  col
+    for n in Note sort title
+      text n.title

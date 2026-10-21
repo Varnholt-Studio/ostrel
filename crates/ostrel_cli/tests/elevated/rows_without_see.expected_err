@@ -1,0 +1,2 @@
+crates/ostrel_cli/tests/elevated/rows_without_see.ostl:14:46: warning[E0314]: `exportNotes` returns rows without see: `as system` does not filter its result `List[Note]` by the `see` rule of `Note`
+crates/ostrel_cli/tests/elevated/rows_without_see.ostl:18:39: warning[E0314]: `firstNote` returns rows without see: `as system` does not filter its result `Note?` by the `see` rule of `Note`
