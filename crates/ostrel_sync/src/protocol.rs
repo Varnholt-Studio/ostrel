@@ -36,10 +36,16 @@ pub use ostrel_db::api::{FieldId, ModelId, Query, Row};
 /// Version carried in every frame. JSON v0.
 pub const PROTOCOL_VERSION: u32 = 0;
 
-/// Subscription id, chosen by the client, unique within one session.
+/// Subscription id, chosen by the client in ascending order per session and never
+/// reused within one session (not after `Unsubscribe`, an `Error` naming it, a reset,
+/// or any other end of the subscription). A frame naming a subscription that is not
+/// open is dropped without effect. The server does not track closed ids.
 pub type SubId = u32;
 
-/// Server function call id, chosen by the client, unique within one session.
+/// Server function call id, chosen by the client in ascending order per session and
+/// never reused within one session (not after its `Return`, nor after the call ended
+/// as `OutcomeUnknown`). A late `Return` for a call that is not open is dropped
+/// without effect.
 pub type CallId = u32;
 
 /// Index of a server function in the compiled program.
@@ -240,6 +246,9 @@ pub enum OpFault {
     Tags { field: FieldId },
     /// The canonical encoding of the op is over [`Limits::op_bytes`] (D109).
     TooLarge { bytes: usize },
+    /// The body names two or more kinds, for example `add` and `remove`. Only this op is
+    /// `Reject Invalid`; the connection stays open (D147, ARCHITECTURE 5.6).
+    SeveralKinds,
 }
 
 /// Why a received value does not fit the type of its place (D132).
