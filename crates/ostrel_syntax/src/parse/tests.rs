@@ -635,6 +635,9 @@ golden!(parse_brace_block);
 golden!(parse_colon_block_head);
 golden!(parse_else_if_one_line);
 golden!(parse_unclosed_paren);
+golden!(parse_continuation_bracket_same_column);
+golden!(parse_continuation_brace_same_column);
+golden!(parse_continuation_paren_not_deeper);
 golden!(parse_keyword_as_name);
 // `parse_comparison_chain` (E0027) belongs to the expression parser (T1-3b).
 
@@ -1257,10 +1260,33 @@ fn compound_assignment_after_let() -> R {
 }
 
 #[test]
-fn unclosed_paren_swallowing_the_file_is_one_diagnostic() -> R {
+fn an_unclosed_bracket_never_swallows_the_file() -> R {
+    // D164: an open bracket no longer takes the rest of the file into one
+    // logical line. Lines at the same column are lines of their own, so each
+    // real fault keeps its own diagnostic (SPEC 12.1), one per line.
+    for open in ["(", "[", "{"] {
+        let mut src = format!("fn main()\n  let a = {open}1\n");
+        for _ in 0..1_000 {
+            src.push_str(&format!("  let x = {open}\n"));
+        }
+        let (_, diags) = parse(&src);
+        assert_eq!(diags.len(), 1_001, "{open}");
+        assert!(
+            diags.iter().all(|d| d.code == codes::UNCLOSED_PAREN),
+            "{diags:?}"
+        );
+        let last = diags.last().must()?;
+        assert_eq!(
+            last.span.start as usize,
+            src.rfind(open).unwrap_or(0),
+            "{open}"
+        );
+    }
+    // Deeper lines continue the open bracket: one fault, one diagnostic,
+    // however long the continuation is.
     let mut src = String::from("fn main()\n  print(1\n");
     for _ in 0..1_000 {
-        src.push_str("  let if = (\n");
+        src.push_str("    let if = (\n");
     }
     let (_, diags) = parse(&src);
     assert_eq!(diags.len(), 1, "{diags:?}");

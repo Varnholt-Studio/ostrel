@@ -471,11 +471,14 @@ fn faults_in_data() {
     // Types: arguments are bracketed and not empty.
     for (src, needle, n) in [
         ("data A\n  f: Set[]\n", "]", 0),
-        ("data A\n  f: Set[Int\n", "\n", 1),
+        // D164: an unclosed `[` is E0025 at the `[` (formerly E0028 at the
+        // line end).
+        ("data A\n  f: Set[Int\n", "[", 0),
         ("data A\n  f: Map[Int Int]\n", "Int]", 0),
         ("data A\n  f: 1\n", "1", 0),
     ] {
-        assert_eq!(codes_at(src), [(28, at(src, needle, n))], "{src:?}");
+        let code = if src.contains("[Int\n") { 25 } else { 28 };
+        assert_eq!(codes_at(src), [(code, at(src, needle, n))], "{src:?}");
     }
 }
 
@@ -563,8 +566,15 @@ fn faults_in_function_heads() {
         codes_at(src),
         [(28, at(src, "(", 0)), (28, at(src, "=", 0))]
     );
+    // D164 (3): `)` pops the `[`, so the `(` stays open and the deeper body
+    // line continues the head; E0025 at the `(` (formerly E0028 at the `)`).
+    // ASSUMPTION (T209): this follows D164 literally; the message names the
+    // `(` although the missing closer is the `]` (FINDING to henrik).
     let src = "fn f(a: Set[Int)\n  print(1)\n";
-    assert_eq!(codes_at(src), [(28, at(src, ")", 0))]);
+    assert_eq!(codes_at(src), [(25, at(src, "(", 0))]);
+    // With the `]` the head is fine and the body is parsed.
+    let src = "fn f(a: Set[Int])\n  print(1\n  x\n";
+    assert_eq!(codes_at(src), [(25, at(src, "(", 1))]);
     let src = "client fn f()\n";
     assert_eq!(
         diags(src),

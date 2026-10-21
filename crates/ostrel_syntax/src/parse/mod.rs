@@ -44,8 +44,10 @@
 //!   [`parse_with`], never from the shape of the tokens, so every fault the
 //!   lexer reports (an `Error` token, a tab, a jump of indentation and so on)
 //!   is covered the same way.
-//! * A `(` that is not closed on its logical line is reported once at the
-//!   `(` (E0025) before anything else on that line.
+//! * A `(`, `[` or `{` that is not closed on its logical line is reported
+//!   once at the outermost such bracket (E0025, D164) before anything else on
+//!   that line. The lexer ends a continuation at a line that is not deeper,
+//!   so an open bracket never takes the rest of the file.
 //! * After `{` at the end of a block head (E0022), the matching lone `}` line
 //!   is skipped without a diagnostic.
 //!
@@ -71,7 +73,7 @@ use crate::ast::{
     AstError, BlockId, CallRule, Cond, ExprId, ExprKind, Ident, Limits, Module, StmtId, StmtKind,
     TextRange,
 };
-use crate::lex::{Keyword, Token, TokenKind};
+use crate::lex::{self, Keyword, Token, TokenKind};
 use ostrel_core::{Code, Diagnostic, FileId, Span};
 use std::borrow::Cow;
 
@@ -130,9 +132,9 @@ pub enum Stop {
 /// * Every `(` it opens goes through [`Parser::enter`] and [`Parser::leave`],
 ///   and every node through [`Parser::add_expr`]. A [`Stop::File`] from these
 ///   is returned unchanged.
-/// * The statement parser has already reported a `(` that is not closed on
-///   the logical line (E0025), so the expression parser always finds the
-///   `)` of every `(` before the end of the line.
+/// * The statement parser has already reported a `(`, `[` or `{` that is not
+///   closed on the logical line (E0025), so the expression parser always
+///   finds a closer for every bracket before the end of the line.
 pub trait ExprParse {
     /// Parses one expression starting at the current token of `p`.
     fn expr(&self, p: &mut Parser<'_>) -> Result<ExprId, Stop>;
@@ -177,7 +179,8 @@ pub struct Parser<'a> {
     toks: Tokens<'a>,
     /// Logical line of every token, as an index into `unclosed`.
     line_of: Vec<u32>,
-    /// Per logical line: token index of the outermost `(` not closed on it.
+    /// Per logical line: token index of the outermost `(`, `[` or `{` not
+    /// closed on it.
     unclosed: Vec<Option<u32>>,
     /// Byte ranges `start..end` (end exclusive) of the logical lines the
     /// lexer has already reported, sorted and disjoint.
@@ -399,13 +402,13 @@ impl<'a> Parser<'a> {
         tok.kind == TokenKind::Ident && self.text(tok) == word
     }
 
-    /// Reports E0025 if the rest of the current logical line has a `(`
-    /// without its `)`.
+    /// Reports E0025 if the rest of the current logical line has a `(`, `[`
+    /// or `{` without its closer, once, at the outermost one (D164).
     fn check_unclosed(&mut self) -> Result<(), Stop> {
         match self.unclosed_on_line(self.pos) {
             Some(index) if index as usize >= self.pos => {
                 let at = self.toks.get(index as usize).unwrap_or(self.current());
-                Err(self.report(codes::UNCLOSED_PAREN, at, codes::MSG_UNCLOSED_PAREN))
+                Err(self.report(codes::UNCLOSED_PAREN, at, codes::msg_unclosed(at.kind)))
             }
             _ => Ok(()),
         }
@@ -1066,21 +1069,31 @@ fn scan_lines(src: &str, toks: &Tokens<'_>, lexed: &[Diagnostic]) -> Lines {
     let mut ranges: Vec<(u32, u32)> = Vec::new();
     let mut start: Option<u32> = None;
     let mut open: Vec<u32> = Vec::new();
+    // The last two code tokens of the logical line, for `brace_opens_level`.
+    let mut before: (Option<TokenKind>, Option<TokenKind>) = (None, None);
     for (index, tok) in toks.iter().enumerate() {
         let line = u32::try_from(lines.unclosed.len()).unwrap_or(u32::MAX);
         lines.line_of.push(line);
         let index = u32::try_from(index).unwrap_or(u32::MAX);
         start = Some(start.map_or(tok.span.start, |s| s.min(tok.span.start)));
+        // One stack for all three kinds, as the lexer counts its levels
+        // (D164): a closer pops the top whatever its kind, and a `{` that is
+        // not in operand position opens nothing (it is E0022 at a block head).
         match tok.kind {
-            TokenKind::LParen => open.push(index),
-            TokenKind::RParen => {
+            TokenKind::LParen | TokenKind::LBracket => open.push(index),
+            TokenKind::LBrace if lex::brace_opens_level(before.0, before.1) => open.push(index),
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
                 open.pop();
             }
             _ => {}
         }
+        if !lex::is_not_code(tok.kind) {
+            before = (Some(tok.kind), before.0);
+        }
         if matches!(tok.kind, TokenKind::Nl | TokenKind::Eof) {
             lines.unclosed.push(open.first().copied());
             open.clear();
+            before = (None, None);
             let first = start.unwrap_or(tok.span.start);
             let prev = ranges.last().map_or(0, |&(_, end)| end);
             let from = src

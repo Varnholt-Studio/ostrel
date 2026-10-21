@@ -1,0 +1,2 @@
+tests/errors/parse_continuation_paren_not_deeper.ostl:2:8: error[E0025]: unclosed `(`
+tests/errors/parse_continuation_paren_not_deeper.ostl:4:11: error[E0025]: unclosed `(`

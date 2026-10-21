@@ -1147,6 +1147,33 @@ mod tests {
     }
 
     #[test]
+    fn deeper_lines_continue_brackets_and_operand_braces() {
+        // D164: multi line literals, records and calls whose lines stand
+        // deeper than the start of the logical line, or start with a closer,
+        // parse without a diagnostic and keep the block structure around them.
+        let src = concat!(
+            "fn main()\n",
+            "  let a = [\n    1,\n    2\n  ]\n",
+            "  let m = [\n    \"k\": {\n      1\n    }\n]\n",
+            "  let r = make Room {\n    name: \"a\",\n    size: f(\n      1\n    )\n  }\n",
+            "  if a == {\n    1\n  }\n    print(1)\n",
+            "  print(a)\n",
+        );
+        assert_eq!(diags_of(src, ParseLimits::DEFAULT), vec![]);
+        let (m, _, _) = parse_src(src, ParseLimits::DEFAULT);
+        assert_eq!(let_values(&m).len(), 3);
+        // A block brace after a complete head is still E0022 with its lone
+        // `}` skipped, also when the head has an operand `{` before it.
+        let src = "fn main()\n  if a == {1} {\n    print(1)\n  }\n  print(2)\n";
+        let found: Vec<(u16, u32)> = diags_of(src, ParseLimits::DEFAULT)
+            .into_iter()
+            .map(|(code, at, _)| (code, at))
+            .collect();
+        let brace = src.rfind(" {\n").map_or(0, |i| i + 1);
+        assert_eq!(found, vec![(22, u32::try_from(brace).unwrap_or(0))]);
+    }
+
+    #[test]
     fn faulty_v0_2_expressions_report_once() {
         let msg = codes::MSG_COMPARISON_CHAIN.to_string();
         assert_eq!(one_error("a in b in c"), (27, 7, msg.clone()));
@@ -1178,7 +1205,6 @@ mod tests {
                 "end of line",
             ),
             ("a.", 2, "a field or property name after `.`", "end of line"),
-            ("a[1", 3, "`]`", "end of line"),
             ("{1 2}", 3, "`,` or `}`", "`2`"),
             ("[1, 2: 3]", 5, "`,` or `]`", "`:`"),
             (
@@ -1188,7 +1214,6 @@ mod tests {
                 "`]`",
             ),
             ("[1 2]", 3, "`,`, `:` or `]`", "`2`"),
-            ("[:", 2, "`]` after `[:`", "end of line"),
             ("make", 4, "a data type name after `make`", "end of line"),
             (
                 "make M(a)",
@@ -1202,6 +1227,19 @@ mod tests {
         for (expr, at, what, found) in cases {
             let expected = (28, at, codes::msg_expected(what, found));
             assert_eq!(one_error(expr), expected, "{expr}");
+        }
+        // D164: a `[` or `{` not closed on its logical line is E0025 at the
+        // outermost open bracket, like `(`, not an expected closer at the
+        // line end (formerly E0028 for `a[1` and `[:`).
+        for (expr, at, msg) in [
+            ("a[1", 1, codes::MSG_UNCLOSED_BRACKET),
+            ("[:", 0, codes::MSG_UNCLOSED_BRACKET),
+            ("{1, 2", 0, codes::MSG_UNCLOSED_BRACE),
+            ("make M { a: 1", 7, codes::MSG_UNCLOSED_BRACE),
+            ("f([1, {2", 1, codes::MSG_UNCLOSED_PAREN),
+            ("[1, f(2", 0, codes::MSG_UNCLOSED_BRACKET),
+        ] {
+            assert_eq!(one_error(expr), (25, at, msg.to_string()), "{expr}");
         }
         assert_eq!(
             one_error("a.if"),

@@ -320,7 +320,10 @@ fn dedent_by_several_levels_and_multi_level_indent() {
 
 #[test]
 fn open_paren_continues_the_line() {
-    let src = "fn main()\n  print(add(1,\n2,\n      3))\n  x\n";
+    // D164: the continuation lines stand deeper than `print`; how much deeper
+    // is not checked. A line at column 0 would end the line (see
+    // `a_line_that_is_not_deeper_ends_the_continuation`).
+    let src = "fn main()\n  print(add(1,\n   2,\n      3))\n  x\n";
     assert_eq!(
         kinds(src),
         vec![
@@ -351,11 +354,400 @@ fn open_paren_continues_the_line() {
 }
 
 #[test]
-fn brackets_and_braces_do_not_continue_a_line_in_v0_1() {
+fn brackets_and_braces_continue_a_line() {
+    // SYNTAX 3, SPEC 12.2, D164: a deeper line continues inside open `(`,
+    // `[` and a `{` in operand position.
     assert!(continues_line('('));
-    assert!(!continues_line('['));
-    assert!(!continues_line('{'));
-    assert_eq!(kinds("a [\nb\n"), vec![Ident, LBracket, Nl, Ident, Nl, Eof]);
+    assert!(continues_line('['));
+    assert!(continues_line('{'));
+    assert!(!continues_line('<'));
+    assert_eq!(kinds("a [\n  b\n"), vec![Ident, LBracket, Ident, Nl, Eof]);
+    assert_eq!(
+        kinds("a = {\n  b\n"),
+        vec![Ident, Eq, LBrace, Ident, Nl, Eof]
+    );
+    assert_eq!(
+        kinds("a [\n  b\n]\nc\n"),
+        vec![Ident, LBracket, Ident, RBracket, Nl, Ident, Nl, Eof]
+    );
+    assert_eq!(
+        kinds("a = {\n  b\n}\nc\n"),
+        vec![Ident, Eq, LBrace, Ident, RBrace, Nl, Ident, Nl, Eof]
+    );
+}
+
+#[test]
+fn a_multi_line_map_keeps_the_block_structure() {
+    // The lines of the literal produce no layout tokens; the line after the
+    // closing `]` is lexed as a line of the enclosing block again.
+    let src = "fn main()\n  let m = [\n    \"a\": 1,\n    \"b\": 2,\n  ]\n  m\nx\n";
+    assert_eq!(
+        kinds(src),
+        vec![
+            kw(Keyword::Fn),
+            Ident,
+            LParen,
+            RParen,
+            Nl,
+            Indent,
+            kw(Keyword::Let),
+            Ident,
+            Eq,
+            LBracket,
+            Str,
+            Colon,
+            Int,
+            Comma,
+            Str,
+            Colon,
+            Int,
+            Comma,
+            RBracket,
+            Nl,
+            Ident,
+            Nl,
+            Dedent,
+            Ident,
+            Nl,
+            Eof,
+        ]
+    );
+}
+
+#[test]
+fn a_multi_line_record_after_make_name_continues() {
+    // D164: the `{` of `make Name {` is in operand position.
+    let src = "fn main()\n  make Room {\n    name: \"a\"\n  }\n  x\n";
+    let k = kinds(src);
+    assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 3, "{k:?}");
+    assert_eq!(k.iter().filter(|&&t| t == Indent).count(), 1, "{k:?}");
+}
+
+#[test]
+fn a_brace_opens_a_level_only_in_operand_position() {
+    // D164 (1): the `{` continues the line after these tokens ...
+    for head in [
+        "", "a = ", "f(", "[", "{", "a, ", "a: ", "a + ", "a - ", "a * ", "a / ", "a % ", "a == ",
+        "a != ", "a < ", "a <= ", "a > ", "a >= ", "a .. ", "a ?? ", "if ", "return ", "x in ",
+        "not ", "a and ", "a or ", "make M ",
+    ] {
+        let src = format!("{head}{{\n  b\n");
+        let k = kinds(&src);
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 1, "{src:?}: {k:?}");
+        assert!(!k.contains(&Indent), "{src:?}: {k:?}");
+    }
+    // ... and opens no level after anything else, so a block brace ends its
+    // line and the parser reports E0022 (`fn main() {`, `col {`).
+    for head in [
+        "fn main() ",
+        "col ",
+        "a ",
+        "Room ",
+        "1 ",
+        "\"s\" ",
+        "a[1] ",
+        "a = {} ",
+        "T? ",
+        "else ",
+        "true ",
+        "for x in r ",
+        "a.",
+        "f() -> ",
+        "~x ",
+        "a | ",
+    ] {
+        let src = format!("{head}{{\n  b\n}}\n");
+        let (tokens, _) = lex(&src);
+        let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 3, "{src:?}: {k:?}");
+        assert!(k.contains(&Indent), "{src:?}: {k:?}");
+    }
+    // The decision is shared with the parser.
+    assert!(brace_opens_level(None, None));
+    assert!(brace_opens_level(Some(Ident), Some(kw(Keyword::Make))));
+    assert!(!brace_opens_level(Some(Ident), Some(kw(Keyword::Let))));
+    assert!(!brace_opens_level(Some(RParen), None));
+    assert!(!brace_opens_level(Some(Question), None));
+    assert!(!brace_opens_level(Some(kw(Keyword::Else)), None));
+    assert!(brace_opens_level(Some(StrHead), None));
+}
+
+#[test]
+fn a_line_that_is_not_deeper_ends_the_continuation() {
+    // D164 (2): inside an open level a line at the column of the start of
+    // the logical line (or shallower) drops every level and gets its `Nl`.
+    for (src, nl) in [
+        ("a [\nb\n", 2),
+        ("a = {\nb\n", 2),
+        ("f(\nb\n", 2),
+        ("f([{\nb\n", 2),
+        ("fn f()\n  a [\n  b\n", 3),
+        ("fn f()\n  a [\nb\n", 3),
+        ("fn f()\n  a [\n   b\n", 2),
+    ] {
+        let k = kinds(src);
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), nl, "{src:?}: {k:?}");
+    }
+    // The ending line is laid out as usual: here it closes the block.
+    assert_eq!(
+        kinds("fn f()\n  a [\nb\n"),
+        vec![
+            kw(Keyword::Fn),
+            Ident,
+            LParen,
+            RParen,
+            Nl,
+            Indent,
+            Ident,
+            LBracket,
+            Nl,
+            Dedent,
+            Ident,
+            Nl,
+            Eof,
+        ]
+    );
+    // Its indentation is checked again: a tab there is E0001.
+    let (_, diags) = lex("a [\n\tb\n");
+    assert!(diags.is_empty(), "a tab is deeper than column 0: {diags:?}");
+    let (_, diags) = lex("  a [\n\tb\n");
+    assert_eq!(first(&diags), Some((codes::TAB_INDENT, 6)));
+}
+
+#[test]
+fn a_closer_at_the_line_start_continues_at_any_column() {
+    assert_eq!(
+        kinds("fn f()\n  a = [\n    1,\n]\n  b\n"),
+        vec![
+            kw(Keyword::Fn),
+            Ident,
+            LParen,
+            RParen,
+            Nl,
+            Indent,
+            Ident,
+            Eq,
+            LBracket,
+            Int,
+            Comma,
+            RBracket,
+            Nl,
+            Ident,
+            Nl,
+            Dedent,
+            Eof,
+        ]
+    );
+    for closer in [")", "]", "}"] {
+        let src = format!("a = f([{{\n{closer}\n");
+        let k = kinds(&src);
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 1, "{src:?}: {k:?}");
+    }
+}
+
+#[test]
+fn blank_and_comment_lines_inside_a_level_are_not_judged() {
+    assert_eq!(
+        kinds("a [\n\n// c\n\t\n  b\n]\nc\n"),
+        vec![
+            Ident, LBracket, Comment, Ident, RBracket, Nl, Ident, Nl, Eof
+        ]
+    );
+    // The `Nl` of an ending continuation comes after such lines.
+    let src = "a [\n// c\nb\n";
+    let (tokens, _) = lex(src);
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert_eq!(k, vec![Ident, LBracket, Comment, Nl, Ident, Nl, Eof]);
+    let nl = tokens.get(3).map(|t| (t.span.start, t.span.end));
+    assert_eq!(nl, Some((8, 9)), "{tokens:?}");
+}
+
+#[test]
+fn the_column_of_the_logical_line_is_its_first_token() {
+    // After a `;` the logical line starts in the middle of the physical one.
+    // `f` stands at column 3: a line at column 4 continues, one at column 2
+    // (deeper than the physical line, not than `f`) ends the line.
+    let (tokens, diags) = lex("a; f(\n    b)\n");
+    assert_eq!(first(&diags), Some((codes::SEMICOLON, 1)));
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert_eq!(k, vec![Ident, Nl, Ident, LParen, Ident, RParen, Nl, Eof]);
+    let (tokens, _) = lex("a; f(\n  b)\n");
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert_eq!(
+        k,
+        vec![
+            Ident, Nl, Ident, LParen, Nl, Indent, Ident, RParen, Nl, Dedent, Eof
+        ]
+    );
+    // A byte order mark is not a column of line 1.
+    assert_eq!(
+        kinds("\u{FEFF}a [\n b\n"),
+        vec![Ident, LBracket, Ident, Nl, Eof]
+    );
+}
+
+#[test]
+fn indentation_inside_brackets_and_braces_is_not_checked() {
+    // Inside an open bracket the indentation of a deeper line is ignored, as
+    // inside `(`: a tab, an odd column or a jump by several levels is no
+    // fault there.
+    for open in ["[", "= {"] {
+        let close = if open == "[" { "]" } else { "}" };
+        let src = format!("a {open}\n\tb,\n   c,\n        d\n{close}\ne\n");
+        let (tokens, diags) = lex(&src);
+        assert!(diags.is_empty(), "{src:?}: {diags:?}");
+        let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+        assert!(!k.contains(&Indent), "{src:?}: {k:?}");
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 2, "{src:?}: {k:?}");
+    }
+}
+
+#[test]
+fn mixed_nesting_over_several_lines() {
+    assert_eq!(
+        kinds("f([\n  {\n    1\n  }\n])\ng\n"),
+        vec![
+            Ident, LParen, LBracket, LBrace, Int, RBrace, RBracket, RParen, Nl, Ident, Nl, Eof,
+        ]
+    );
+}
+
+#[test]
+fn a_mismatched_closer_still_closes_one_level() {
+    // The lexer does not match bracket kinds (the parser reports the
+    // mismatch). Any closer ends one level, so a typo cannot pull the rest of
+    // the file into one logical line.
+    for src in [
+        "a (]\n  b\n",
+        "a [)\n  b\n",
+        "a = {)\n  b\n",
+        "a (}\n  b\n",
+        "a [}\n  b\n",
+    ] {
+        let k = kinds(src);
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 2, "{src:?}: {k:?}");
+    }
+}
+
+#[test]
+fn stray_closers_do_not_break_layout_or_cancel_a_later_opener() {
+    assert_eq!(kinds("a]\nb\n"), vec![Ident, RBracket, Nl, Ident, Nl, Eof]);
+    assert_eq!(kinds("a}\nb\n"), vec![Ident, RBrace, Nl, Ident, Nl, Eof]);
+    // A stray closer before an opener does not make the opener a no-op.
+    assert_eq!(
+        kinds("a } ] [\n  b\n]\nc\n"),
+        vec![
+            Ident, RBrace, RBracket, LBracket, Ident, RBracket, Nl, Ident, Nl, Eof
+        ]
+    );
+}
+
+#[test]
+fn interpolation_braces_do_not_continue_a_line() {
+    // The `{` of an interpolation is not a bracket of the code around it, and
+    // brackets inside an interpolation never leak out of the string.
+    assert_eq!(
+        kinds("a \"{x}\"\nb\n"),
+        vec![Ident, StrHead, Ident, StrTail, Nl, Ident, Nl, Eof]
+    );
+    assert_eq!(
+        kinds("a \"{[x}\"\nb\n"),
+        vec![Ident, StrHead, LBracket, Ident, StrTail, Nl, Ident, Nl, Eof]
+    );
+    assert_eq!(
+        kinds("a \"{{x}}\"\nb\n"),
+        vec![
+            Ident, StrHead, LBrace, Ident, RBrace, StrTail, Nl, Ident, Nl, Eof
+        ]
+    );
+    // A closer inside an interpolation does not close a bracket opened
+    // before the string.
+    assert_eq!(
+        kinds("a [\"{]}\"\n  b]\nc\n"),
+        vec![
+            Ident, LBracket, StrHead, RBracket, StrTail, Ident, RBracket, Nl, Ident, Nl, Eof
+        ]
+    );
+}
+
+#[test]
+fn unterminated_string_ends_an_open_bracket_or_brace() {
+    // As for `(`: the line end that cuts a string ends the logical line, so
+    // a missing quote does not pull the following lines into the literal.
+    for (src, at) in [("a [\"x\n  b\n", 3), ("a = {\"x\n  b\n", 5)] {
+        let (tokens, diags) = lex(src);
+        assert_eq!(
+            first(&diags),
+            Some((codes::UNTERMINATED_STRING, at)),
+            "{src:?}"
+        );
+        assert_eq!(diags.len(), 1, "{src:?}: {diags:?}");
+        let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+        assert_eq!(k.last(), Some(&Eof));
+        assert!(k.contains(&Indent), "{src:?}: {k:?}");
+    }
+}
+
+#[test]
+fn a_line_joined_by_string_recovery_is_not_judged() {
+    // SPEC 12.6 (c): the next line closes the cut string; it is part of the
+    // same physical fault and its column is not judged (D164 (2)).
+    let src = "a [\"x\n\" , 1\n  ]\nb\n";
+    let (tokens, diags) = lex(src);
+    assert_eq!(first(&diags), Some((codes::UNTERMINATED_STRING, 3)));
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert_eq!(
+        k,
+        vec![
+            Ident, LBracket, Error, Comma, Int, RBracket, Nl, Ident, Nl, Eof
+        ]
+    );
+}
+
+#[test]
+fn semicolon_and_comments_inside_brackets() {
+    // A `;` inside an open bracket is reported once and ends no line.
+    let (tokens, diags) = lex("a [1; 2\n]\nb\n");
+    assert_eq!(first(&diags), Some((codes::SEMICOLON, 4)));
+    assert_eq!(diags.len(), 1);
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert_eq!(
+        k,
+        vec![Ident, LBracket, Int, Int, RBracket, Nl, Ident, Nl, Eof]
+    );
+    // A comment inside an open brace is trivia, the line goes on.
+    assert_eq!(
+        kinds("a = { // c\n  b\n}\nd\n"),
+        vec![
+            Ident, Eq, LBrace, Comment, Ident, RBrace, Nl, Ident, Nl, Eof
+        ]
+    );
+}
+
+#[test]
+fn a_style_line_inside_an_open_brace_starts_no_css_body() {
+    // `style` inside an open bracket is not a line of its own, so no CSS mode
+    // starts and `//` stays a code comment.
+    let (tokens, diags) = lex("a = {\n  style\n    // x\n}\nb\n");
+    assert!(diags.is_empty(), "{diags:?}");
+    let k: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+    assert!(!k.contains(&Css), "{k:?}");
+    assert!(k.contains(&Comment), "{k:?}");
+}
+
+#[test]
+fn an_open_bracket_on_every_line_stays_linear() {
+    // Hostile: every line opens a level that the next line ends. Each line
+    // is judged once, and the column of its logical line is computed once.
+    let src = "a [\n".repeat(20_000);
+    let (tokens, diags) = lex(&src);
+    assert!(diags.is_empty());
+    assert_eq!(tokens.iter().filter(|t| t.kind == Nl).count(), 20_000);
+    // One long logical line after many `;`, continued over many lines.
+    let src = format!("{}f(\n{}x)\n", "a;".repeat(20_000), " \n ".repeat(20_000));
+    let (tokens, _) = lex(&src);
+    assert_eq!(tokens.last().map(|t| t.kind), Some(Eof));
 }
 
 #[test]
@@ -957,7 +1349,14 @@ fn hostile_inputs_end_with_eof_and_valid_spans() {
         " \t \t".into(),
         "{{{{}}}}".into(),
         "\"{{{{\"}}}}".into(),
+        "[[[[\n\t\n".into(),
+        "]]]]\n}}}}\n".into(),
+        "{\n  \"{]\n".into(),
+        "[\nstyle\n  /* x\n".into(),
+        "fn f()\n  a [\nb\n    ]\n      c\n".into(),
     ];
+    cases.push(format!("{}\n", "[".repeat(100_000)));
+    cases.push(format!("{}\nx\n", "]{".repeat(50_000)));
     cases.push(format!("\"{}", "{".repeat(100_000)));
     cases.push(format!("{}x", " ".repeat(100_001)));
     cases.push("a\n".repeat(10_000) + &"  ".repeat(5_000) + "b");

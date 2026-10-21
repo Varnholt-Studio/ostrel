@@ -1,0 +1,2 @@
+tests/errors/parse_continuation_bracket_same_column.ostl:2:11: error[E0025]: unclosed `[`
+tests/errors/parse_continuation_bracket_same_column.ostl:4:8: error[E0025]: unclosed `(`

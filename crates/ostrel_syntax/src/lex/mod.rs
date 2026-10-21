@@ -21,8 +21,19 @@
 //!   stack rules above without a further diagnostic.
 //! * Blank lines and lines holding only a comment produce no `Nl`, `Indent` or
 //!   `Dedent`, and their leading whitespace is not checked (SPEC 12.2).
-//! * While a `(` is open, line ends and indentation are ignored. From v0.2 `[`
-//!   and `{` continue lines as well (SPEC 12.2); see [`continues_line`].
+//! * A logical line continues over a line end inside an open `(`, `[` or `{`
+//!   (SYNTAX 3, SPEC 12.2, D164); see [`continues_line`]. The lexer counts
+//!   open levels of all three kinds together: `(` and `[` always open one, a
+//!   `{` only in operand position ([`brace_opens_level`]), any closing
+//!   bracket closes one, and a closing bracket with nothing open changes
+//!   nothing. Matching kinds is the parser's job.
+//! * While a level is open, a physical line continues the logical line only
+//!   if its first token stands deeper than the first token of the logical
+//!   line or is `)`, `]` or `}`. Any other line drops every open level, gets
+//!   an `Nl` before it and is laid out like any line, so an open bracket never
+//!   takes the rest of the file into one logical line (D164). Blank and
+//!   comment only lines are not judged, nor is a line that the string
+//!   recovery of SPEC 12.6 (c) joins to the line before.
 //! * At the end of the input the lexer closes the last line with `Nl`, emits a
 //!   `Dedent` for every open block and ends with `Eof`. A last line without a
 //!   line end is valid, and an empty input gives only `Eof`.
@@ -143,6 +154,10 @@ pub fn lex_with<L: LiteralScan + ?Sized>(
         diags: Vec::new(),
         indents: vec![0],
         open: 0,
+        judge: false,
+        held_end: (0, 0),
+        line_first_at: 0,
+        line_col: None,
         line_has_tokens: false,
         at_line_start: true,
         in_string: false,
@@ -156,9 +171,81 @@ pub fn lex_with<L: LiteralScan + ?Sized>(
 
 /// True if an open `bracket` lets a logical line continue over a line end.
 ///
-/// v0.1: only `(` (SPEC 12.2). From v0.2 `[` and `{` also continue a line.
+/// `(`, `[` and `{` continue a line (SYNTAX 3, SPEC 12.2: from v0.2, when
+/// lists, sets and maps exist). The `{` that opens an interpolation inside a
+/// string is not a bracket here; the string scanner counts it on its own.
 pub const fn continues_line(bracket: char) -> bool {
-    matches!(bracket, '(')
+    matches!(bracket, '(' | '[' | '{')
+}
+
+/// True if a `{` opens a continuation level (D164, ARCHITECTURE 3.5).
+///
+/// `before` is the kind of the last code token before the `{` on its logical
+/// line and `before2` the one before that (comments, `Indent` and `Dedent`
+/// are skipped; `None` if there is none). A `{` is in operand position, where
+/// a set literal or a record can start, when it is the first token of the
+/// logical line, follows an operator, `=`, `(`, `[`, `{`, `,`, `:`, the
+/// keywords `if`, `return`, `in`, `not`, `and`, `or`, the text of a string up
+/// to an interpolation, or is the `{` of `make Name {`. Any other `{` (after
+/// a name, a type name, a literal, `)`, `]`, `}`, `?`, `else` or another
+/// keyword) opens no level, so a block brace such as `fn main() {` stays the
+/// parser's E0022 and its line ends at the line end.
+///
+/// ASSUMPTION (T209): "operator" means the binary and unary operators of
+/// expressions (`+ - * / % == != < <= > >= .. ??`); `.`, `->`, `?`, `|` and
+/// `~` are not, because no set literal or record can follow them.
+///
+/// The lexer and the parser both decide with this function, so the parser's
+/// bracket stack always matches the lexer's levels.
+pub fn brace_opens_level(before: Option<TokenKind>, before2: Option<TokenKind>) -> bool {
+    use TokenKind as T;
+    let Some(before) = before else {
+        return true;
+    };
+    match before {
+        T::Plus
+        | T::Minus
+        | T::Star
+        | T::Slash
+        | T::Percent
+        | T::EqEq
+        | T::BangEq
+        | T::Lt
+        | T::Le
+        | T::Gt
+        | T::Ge
+        | T::DotDot
+        | T::QuestionQuestion
+        | T::Eq
+        | T::LParen
+        | T::LBracket
+        | T::LBrace
+        | T::Comma
+        | T::Colon
+        | T::StrHead
+        | T::StrMid => true,
+        T::Kw(kw) => matches!(
+            kw,
+            Keyword::If | Keyword::Return | Keyword::In | Keyword::Not | Keyword::And | Keyword::Or
+        ),
+        T::Ident => before2 == Some(T::Kw(Keyword::Make)),
+        _ => false,
+    }
+}
+
+/// True for tokens that are not code of a logical line: comments and layout.
+pub(crate) const fn is_not_code(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Comment | TokenKind::Indent | TokenKind::Dedent
+    )
+}
+
+/// Layout width of `text` (the start of a physical line): a tab counts two
+/// columns, as in the recovery of E0001, every other character one.
+fn width_of(text: &str) -> u32 {
+    text.chars()
+        .fold(0u32, |w, c| w.saturating_add(if c == '\t' { 2 } else { 1 }))
 }
 
 struct Lexer<'a, L: ?Sized> {
@@ -173,6 +260,16 @@ struct Lexer<'a, L: ?Sized> {
     indents: Vec<u32>,
     /// Number of open brackets that continue a line.
     open: u32,
+    /// A line end passed while a level was open: the next physical line with
+    /// code is judged by [`Self::judge_continuation`].
+    judge: bool,
+    /// Span of the last line end passed while a level was open; the `Nl` that
+    /// ends a continuation takes it.
+    held_end: (usize, usize),
+    /// Offset of the first token of the current logical line.
+    line_first_at: usize,
+    /// Layout width before that token, once computed.
+    line_col: Option<u32>,
     /// The current logical line has a token other than trivia.
     line_has_tokens: bool,
     /// The next character is the first of a physical line outside brackets.
@@ -197,6 +294,9 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             self.pos = '\u{FEFF}'.len_utf8();
         }
         loop {
+            if self.judge && self.open > 0 {
+                self.judge_continuation();
+            }
             if self.at_line_start && self.open == 0 {
                 self.line_start();
             }
@@ -329,14 +429,52 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         let start = self.pos;
         self.pos += len;
         if self.open == 0 {
-            if self.line_has_tokens {
-                self.end_logical_line();
-                self.push(TokenKind::Nl, start, self.pos);
-                self.line_first = self.tokens.len();
-            }
-            self.line_has_tokens = false;
-            self.at_line_start = true;
+            self.judge = false;
+            self.end_line(start, self.pos);
+        } else {
+            self.judge = true;
+            self.held_end = (start, self.pos);
         }
+    }
+
+    /// Ends the logical line with an `Nl` spanning `start..end` (if it has
+    /// code); the next character starts a physical line outside brackets.
+    fn end_line(&mut self, start: usize, end: usize) {
+        if self.line_has_tokens {
+            self.end_logical_line();
+            self.push(TokenKind::Nl, start, end);
+            self.line_first = self.tokens.len();
+        }
+        self.line_has_tokens = false;
+        self.at_line_start = true;
+    }
+
+    /// At the start of a physical line inside an open level (D164): the line
+    /// continues the logical line only if its first token stands deeper than
+    /// the first token of the logical line or is a closing bracket. Otherwise
+    /// every open level is dropped and the logical line ends before this
+    /// line, which is then laid out as usual. Blank and comment only lines
+    /// are left to the next line.
+    fn judge_continuation(&mut self) {
+        let rest = self.src.get(self.pos..).unwrap_or("");
+        let code = rest.trim_start_matches([' ', '\t']);
+        if code.is_empty() || code.starts_with('\n') || code.starts_with("\r\n") {
+            return;
+        }
+        if code.starts_with("//") {
+            return;
+        }
+        self.judge = false;
+        if code.starts_with([')', ']', '}']) {
+            return;
+        }
+        let indent = rest.get(..rest.len() - code.len()).unwrap_or("");
+        if width_of(indent) > self.logical_column() {
+            return;
+        }
+        self.open = 0;
+        let (start, end) = self.held_end;
+        self.end_line(start, end);
     }
 
     /// Notes a logical line that holds only the keyword `style`: the block
@@ -372,22 +510,12 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             '/' if self.peek_at(1) == Some('/') => return self.comment(),
             '0'..='9' => return self.int(),
             'a'..='z' | 'A'..='Z' => return self.ident(),
-            '(' => {
-                if continues_line('(') {
-                    self.open = self.open.saturating_add(1);
-                }
-                single(TokenKind::LParen)
-            }
-            ')' => {
-                if continues_line('(') {
-                    self.open = self.open.saturating_sub(1);
-                }
-                single(TokenKind::RParen)
-            }
-            '[' => single(TokenKind::LBracket),
-            ']' => single(TokenKind::RBracket),
-            '{' => single(TokenKind::LBrace),
-            '}' => single(TokenKind::RBrace),
+            '(' => self.open_bracket('(', TokenKind::LParen),
+            ')' => self.close_bracket('(', TokenKind::RParen),
+            '[' => self.open_bracket('[', TokenKind::LBracket),
+            ']' => self.close_bracket('[', TokenKind::RBracket),
+            '{' => self.open_bracket('{', TokenKind::LBrace),
+            '}' => self.close_bracket('{', TokenKind::RBrace),
             ',' => single(TokenKind::Comma),
             ':' => single(TokenKind::Colon),
             '|' => single(TokenKind::Pipe),
@@ -424,6 +552,37 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         };
         self.pos += len;
         self.push_code(kind, start, self.pos);
+    }
+
+    /// An opening bracket: one more open level if `bracket` continues a line,
+    /// for `{` only in operand position ([`brace_opens_level`]).
+    fn open_bracket(&mut self, bracket: char, kind: TokenKind) -> (TokenKind, usize) {
+        let opens = bracket != '{' || {
+            let mut code = self
+                .tokens
+                .get(self.line_first..)
+                .unwrap_or(&[])
+                .iter()
+                .rev()
+                .map(|t| t.kind)
+                .filter(|&k| !is_not_code(k));
+            let before = code.next();
+            brace_opens_level(before, code.next())
+        };
+        if opens && continues_line(bracket) {
+            self.open = self.open.saturating_add(1);
+        }
+        (kind, 1)
+    }
+
+    /// A closing bracket for the opening `bracket`: one open level less. With
+    /// nothing open it changes nothing, so a stray closer never ends a line
+    /// early or lets a later opener leak.
+    fn close_bracket(&mut self, bracket: char, kind: TokenKind) -> (TokenKind, usize) {
+        if continues_line(bracket) {
+            self.open = self.open.saturating_sub(1);
+        }
+        (kind, 1)
     }
 
     /// One or two character token: `two` if the next character is `next`.
@@ -528,7 +687,7 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         let quote = self.pos;
         let first_token = self.tokens.len();
         let open_before = self.open;
-        self.line_has_tokens = true;
+        self.mark_code(quote);
         let (end, stop) = self.text(quote + 1);
         self.pos = end;
         match stop {
@@ -826,8 +985,40 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
 
     /// Pushes a token that belongs to the code of the current line.
     fn push_code(&mut self, kind: TokenKind, start: usize, end: usize) {
-        self.line_has_tokens = true;
+        self.mark_code(start);
         self.push(kind, start, end);
+    }
+
+    /// Notes code at `start` on the current logical line. The first code of a
+    /// logical line is the position that continuation lines must be deeper
+    /// than; its column is computed only when a line is judged.
+    fn mark_code(&mut self, start: usize) {
+        if !self.line_has_tokens {
+            self.line_first_at = start;
+            self.line_col = None;
+        }
+        self.line_has_tokens = true;
+    }
+
+    /// Layout width before the first token of the current logical line, once
+    /// per logical line.
+    fn logical_column(&mut self) -> u32 {
+        if let Some(col) = self.line_col {
+            return col;
+        }
+        let before = self.src.get(..self.line_first_at).unwrap_or("");
+        let line = before
+            .rfind('\n')
+            .map_or(before, |i| before.get(i + 1..).unwrap_or(""));
+        // The byte order mark at byte 0 is not part of line 1.
+        let line = if line.len() == before.len() {
+            line.strip_prefix('\u{FEFF}').unwrap_or(line)
+        } else {
+            line
+        };
+        let col = width_of(line);
+        self.line_col = Some(col);
+        col
     }
 
     fn error(&mut self, code: ostrel_core::Code, start: usize, end: usize, msg: impl Into<String>) {

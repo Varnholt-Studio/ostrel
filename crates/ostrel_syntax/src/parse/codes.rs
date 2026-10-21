@@ -19,7 +19,8 @@ pub const BRACE_BLOCK: Code = Code::new(22);
 pub const COLON_BLOCK_HEAD: Code = Code::new(23);
 /// `else if` on one line (SPEC 12.2).
 pub const ELSE_IF_ONE_LINE: Code = Code::new(24);
-/// `(` without its `)` before the end of the logical line.
+/// `(`, `[` or `{` without its closer before the end of the logical line
+/// (D164: one code for all three kinds).
 pub const UNCLOSED_PAREN: Code = Code::new(25);
 /// Keyword where a name is expected (G4).
 pub const KEYWORD_AS_NAME: Code = Code::new(26);
@@ -63,8 +64,21 @@ pub const MSG_COLON_BLOCK_HEAD: &str = "block heads have no `:`; remove it and i
 /// Message of [`ELSE_IF_ONE_LINE`].
 pub const MSG_ELSE_IF_ONE_LINE: &str =
     "`else` ends its line; put the `if` on the next line and indent it";
-/// Message of [`UNCLOSED_PAREN`].
+/// Message of [`UNCLOSED_PAREN`] for a `(`.
 pub const MSG_UNCLOSED_PAREN: &str = "unclosed `(`";
+/// Message of [`UNCLOSED_PAREN`] for a `[`.
+pub const MSG_UNCLOSED_BRACKET: &str = "unclosed `[`";
+/// Message of [`UNCLOSED_PAREN`] for a `{`.
+pub const MSG_UNCLOSED_BRACE: &str = "unclosed `{`";
+
+/// Message of [`UNCLOSED_PAREN`] for the opening bracket `kind`.
+pub fn msg_unclosed(kind: crate::lex::TokenKind) -> &'static str {
+    match kind {
+        crate::lex::TokenKind::LBracket => MSG_UNCLOSED_BRACKET,
+        crate::lex::TokenKind::LBrace => MSG_UNCLOSED_BRACE,
+        _ => MSG_UNCLOSED_PAREN,
+    }
+}
 /// Message of [`COMPARISON_CHAIN`].
 pub const MSG_COMPARISON_CHAIN: &str = "comparisons do not chain; write `a < b and b < c`";
 /// Message of [`UNEXPECTED_INDENT`].

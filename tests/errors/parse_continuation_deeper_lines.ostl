@@ -1,0 +1,9 @@
+fn main()
+  let a = [
+    1,
+    2
+  ]
+  let s = {
+    1
+  }
+  print(a[0]
