@@ -204,6 +204,7 @@ async fn run_case(case: &Case, fresh: &Fresh<'_>) -> Vec<(usize, String)> {
             Action::Tx(calls) => run_tx(conn.as_mut(), calls, &step.expect).await,
             Action::LastSeq(replica) => run_last_seq(conn.as_mut(), *replica, &step.expect).await,
             Action::Replay(op) => run_replay(conn.as_mut(), *op, &step.expect).await,
+            Action::OpsSince(after) => run_ops_since(conn.as_mut(), *after, &step.expect).await,
             Action::Query(q) => match (conn.query(q).await, &step.expect) {
                 (Ok(rows), Expect::Rows(want)) => Ok(compare_rows(&rows.0, want)),
                 (Err(e), _) => Ok(Some(format!("query failed with {e:?}"))),
@@ -259,13 +260,16 @@ async fn run_tx(
                 .map_err(|e| format!("commit failed with {e:?}"))?;
             return Ok(None);
         }
-        (Expect::Ok, Some((j, e))) => Some(format!("write {j} failed with {e:?}")),
+        (Expect::Ok | Expect::Rollback, Some((j, e))) => {
+            Some(format!("write {j} failed with {e:?}"))
+        }
+        (Expect::Rollback, None) => None,
         (Expect::Error(want), Some((_, e))) if same_error(e, want) => None,
         (Expect::Error(want), Some((j, e))) => {
             Some(format!("expected {want:?}, write {j} failed with {e:?}"))
         }
         (Expect::Error(want), None) => Some(format!("expected {want:?}, every write succeeded")),
-        (_, _) => Some("a transaction expects \"ok\" or an error".to_string()),
+        (_, _) => Some("a transaction expects \"ok\", \"rollback\" or an error".to_string()),
     };
     tx.rollback()
         .await
@@ -320,6 +324,75 @@ async fn run_replay(
         .await
         .map_err(|e| format!("rollback failed with {e:?}"))?;
     Ok(verdict)
+}
+
+/// Most ops an `ops_since` step reads. A case file holds far fewer, so a driver that returns
+/// more than the expected ops is caught without reading an unbounded log.
+const LOG_READ_MAX: u32 = 1000;
+
+/// Runs `Transaction::ops_since` in a transaction that is rolled back and compares the ops in
+/// order. Positions must be above `after` and strictly increasing; their values are not
+/// compared, because a position of a rolled back transaction may be given again or be left out
+/// (the position contract of `append_ops`, D154).
+async fn run_ops_since(
+    conn: &mut dyn Connection,
+    after: ostrel_db::api::ServerSeq,
+    expect: &Expect,
+) -> Result<Option<String>, String> {
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| format!("begin failed with {e:?}"))?;
+    let verdict = match (tx.ops_since(after, LOG_READ_MAX).await, expect) {
+        (Ok(got), Expect::Log(want)) => compare_log(after, &got, want),
+        (Err(e), _) => Some(format!("ops_since failed with {e:?}")),
+        (Ok(_), _) => Some("an ops_since step expects a list of ops".to_string()),
+    };
+    tx.rollback()
+        .await
+        .map_err(|e| format!("rollback failed with {e:?}"))?;
+    Ok(verdict)
+}
+
+fn compare_log(
+    after: ostrel_db::api::ServerSeq,
+    got: &[ostrel_db::api::StoredOp],
+    want: &[ostrel_db::api::NewOp],
+) -> Option<String> {
+    let positions: Vec<u64> = got.iter().map(|o| o.seq.0).collect();
+    let ids: Vec<String> = got
+        .iter()
+        .map(|o| format!("{}/{}", o.op.id.replica.0, o.op.id.seq))
+        .collect();
+    let mut last = after.0;
+    for (k, o) in got.iter().enumerate() {
+        if o.seq.0 <= last {
+            return Some(format!(
+                "op {k}: position {} is not above {last} (positions {})",
+                o.seq.0,
+                show(&format!("{positions:?}"))
+            ));
+        }
+        last = o.seq.0;
+    }
+    if got.len() != want.len() {
+        return Some(format!(
+            "expected {} ops, got {} (ops {})",
+            want.len(),
+            got.len(),
+            show(&format!("{ids:?}"))
+        ));
+    }
+    for (k, (g, w)) in got.iter().zip(want).enumerate() {
+        if g.op != *w {
+            return Some(format!(
+                "op {k}: expected {}, got {}",
+                show(&format!("{w:?}")),
+                show(&format!("{:?}", g.op))
+            ));
+        }
+    }
+    None
 }
 
 /// Compares returned rows with the expected rows in order; fields as a map by `FieldId`.

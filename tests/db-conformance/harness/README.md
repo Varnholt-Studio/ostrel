@@ -43,6 +43,9 @@ fn ac_18_conformance_memory() {
   error variant are reported.
 * `append_ops` and `reject` items of a `tx` step are one `append_ops` or `record_reject` call
   each, in order with the writes. An expected `Invalid` matches any rule text.
+* A `tx` step with `"rollback"` runs every call, which must succeed, and then rolls back.
+* Each `ops_since` step runs begin, `ops_since`, rollback and compares the ops in order; the
+  positions must be above the given one and strictly increase, their values are not compared.
 * Each `last_seq` step runs begin, `last_seq`, rollback; each `replay` step runs
   begin, `Transaction::replay_outcome`, rollback and compares the whole outcome, for an
   accepted op the position and every field of the stored op.
@@ -62,6 +65,7 @@ values that do not fit the field type and `text_repeat` values over 16 MiB make 
 `selftest.rs` runs in every test target that includes the harness. It runs small suites against
 a reference driver with one injected fault each (upsert, reused tombstone id, missing version
 increase, lost NUL, UTF-16 order, rollback that keeps writes, ignored limit, `last_seq` not
-raised by `append_ops`, a second outcome for one op) and checks that exactly the affected cases
-fail. It also runs the shared case files against the fault free
-reference driver, once through the entry shown above.
+raised by `append_ops`, a second outcome for one op, committed positions given again, a log
+read in the wrong order) and checks that exactly the affected cases fail. A driver that leaves
+a gap after a rollback, as a PostgreSQL sequence does, must still pass. It also runs the shared
+case files against the fault free reference driver, once through the entry shown above.
