@@ -212,7 +212,10 @@ impl ServerFns for Fns {
                     Pause(&probe.pause_invoke).await;
                     // One read transaction for the one query, ended before the body goes on.
                     let rows = reader.query(&Query::all(0)).await.map_err(db)?;
-                    probe.log.borrow_mut().push(format!("read {}", rows.0.len()));
+                    probe
+                        .log
+                        .borrow_mut()
+                        .push(format!("read {}", rows.0.len()));
                     Pause(&probe.pause_after_read).await;
                     let kind = host
                         .extern_call("mail", "send", &[])

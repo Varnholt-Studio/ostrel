@@ -19,8 +19,6 @@ pub mod call;
 pub mod fifo;
 pub mod session;
 
-pub use call::{
-    CallDb, CallServer, CommitFailed, FnFault, LOCKED_CALL_STEPS, ReadDb, ServerFns,
-};
+pub use call::{CallDb, CallServer, CommitFailed, FnFault, LOCKED_CALL_STEPS, ReadDb, ServerFns};
 pub use fifo::{FifoGuard, FifoLock};
 pub use session::{CallJob, Incoming, OpenCalls, Session};
