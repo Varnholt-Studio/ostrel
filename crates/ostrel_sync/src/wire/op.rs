@@ -29,9 +29,15 @@
 //!
 //! Whether a `make` names every declared field (D116) is checked by the server in step 6, not
 //! here.
+//!
+//! The schema also resolves the implicit fields `made`, `changed` and `author`, because rows and
+//! queries name them (D186). Only the server stamps them, so a body that names one of them is
+//! read as if the name were unknown ([`OpFault::UnknownField`]), and [`encode_op`] refuses an op
+//! that writes one.
 
 use ostrel_core::canon::{encode, encode_object, encode_str};
 use ostrel_core::ids::OpId;
+use ostrel_db::api::is_implicit_field;
 
 use super::frame::{Fields, array, hex, hlc, op_id, row_id, string};
 use super::json::Json;
@@ -86,27 +92,26 @@ pub fn decode_op(json: Json, schema: &dyn WireSchema) -> Result<DecodedOp, WireE
 /// Writes one op as the canonical object that stands in an `ops` array.
 ///
 /// Fails with [`WireError::NotInSchema`] when the schema does not know a model or field id of
-/// the op: that is a defect of the caller, never of the peer.
+/// the op, or when the op writes an implicit field (D186): that is a defect of the caller,
+/// never of the peer.
 pub fn encode_op(op: &Op, schema: &dyn WireSchema) -> Result<String, WireError> {
     let model = schema
         .model_name(op.model)
         .ok_or(WireError::NotInSchema("model"))?;
-    let field = |id: FieldId| {
+    let name = |id: FieldId| {
+        if is_implicit_field(id) {
+            return Err(WireError::NotInSchema("field"));
+        }
         schema
             .field_name(op.model, id)
-            .map(encode_str)
             .ok_or(WireError::NotInSchema("field"))
     };
+    let field = |id: FieldId| name(id).map(encode_str);
     let (kind, body) = match &op.body {
         OpBody::Make { fields } => {
             let names = fields
                 .iter()
-                .map(|(id, value)| {
-                    let name = schema
-                        .field_name(op.model, *id)
-                        .ok_or(WireError::NotInSchema("field"))?;
-                    Ok((name, encode(value)))
-                })
+                .map(|(id, value)| Ok((name(*id)?, encode(value))))
                 .collect::<Result<Vec<_>, WireError>>()?;
             ("make", object(&names)?)
         }
@@ -270,11 +275,13 @@ fn any(_: &'static str, json: Json) -> Result<Json, WireError> {
 }
 
 impl RawBody {
-    /// Resolves names and reads values against the schema.
+    /// Resolves names and reads values against the schema. A name of an implicit field is
+    /// refused like an unknown name, so no op writes a stamp or the author (D186, D116).
     fn typed(self, model: ModelId, schema: &dyn WireSchema) -> Result<OpBody, OpFault> {
         let field = |name: &str| -> Result<(FieldId, &WireTy), OpFault> {
             schema
                 .field_id(model, name)
+                .filter(|id| !is_implicit_field(*id))
                 .and_then(|id| schema.field_ty(model, id).map(|ty| (id, ty)))
                 .ok_or_else(|| OpFault::UnknownField(clip(name)))
         };
@@ -376,4 +383,197 @@ fn remove_tags(json: Option<Json>) -> Option<Vec<OpId>> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ostrel_core::ids::{Hlc, ReplicaId, RowId};
+    use ostrel_core::value::Value;
+    use ostrel_db::api::{FIELD_AUTHOR, FIELD_CHANGED, FIELD_MADE, FIRST_IMPLICIT_FIELD};
+
+    use super::super::json;
+    use crate::protocol::FnId;
+
+    /// Model 0 `Note` with the declared `title` (0) and `tags` (1), and the implicit fields
+    /// resolved as D186 asks a schema to resolve them.
+    struct Schema;
+
+    const TAGS: WireTy = WireTy::Text;
+
+    fn declared(field: FieldId) -> Option<(&'static str, WireTy)> {
+        match field {
+            0 => Some(("title", WireTy::Text)),
+            1 => Some(("tags", WireTy::Set(Box::new(TAGS)))),
+            FIELD_MADE => Some(("made", WireTy::Time)),
+            FIELD_CHANGED => Some(("changed", WireTy::Time)),
+            FIELD_AUTHOR => Some(("author", WireTy::Ref(0))),
+            _ => None,
+        }
+    }
+
+    const FIELDS: [FieldId; 5] = [0, 1, FIELD_MADE, FIELD_CHANGED, FIELD_AUTHOR];
+
+    // Built once, so that `field_ty` can hand out a reference.
+    fn types() -> &'static [WireTy] {
+        use std::sync::OnceLock;
+        static TYPES: OnceLock<Vec<WireTy>> = OnceLock::new();
+        TYPES.get_or_init(|| {
+            FIELDS
+                .iter()
+                .filter_map(|f| declared(*f).map(|(_, ty)| ty))
+                .collect()
+        })
+    }
+
+    impl WireSchema for Schema {
+        fn model_id(&self, name: &str) -> Option<ModelId> {
+            (name == "Note").then_some(0)
+        }
+
+        fn model_name(&self, model: ModelId) -> Option<&str> {
+            (model == 0).then_some("Note")
+        }
+
+        fn field_id(&self, model: ModelId, name: &str) -> Option<FieldId> {
+            let found = FIELDS
+                .into_iter()
+                .find(|f| declared(*f).is_some_and(|(n, _)| n == name));
+            (model == 0).then_some(found)?
+        }
+
+        fn field_name(&self, model: ModelId, field: FieldId) -> Option<&str> {
+            (model == 0).then(|| declared(field).map(|(n, _)| n))?
+        }
+
+        fn field_ty(&self, model: ModelId, field: FieldId) -> Option<&WireTy> {
+            let at = FIELDS.iter().position(|f| *f == field)?;
+            (model == 0).then(|| types().get(at))?
+        }
+
+        fn function_id(&self, _: &str) -> Option<FnId> {
+            None
+        }
+
+        fn function_name(&self, _: FnId) -> Option<&str> {
+            None
+        }
+
+        fn function_params(&self, _: FnId) -> Option<&[WireTy]> {
+            None
+        }
+
+        fn function_result(&self, _: FnId) -> Option<&WireTy> {
+            None
+        }
+    }
+
+    const HEAD: &str = r#""hlc":"00010203040500070123456789abcdef","id":"0123456789abcdef00000001","model":"Note","row":"00010203040500070123456789abcdef""#;
+
+    fn decode(body: &str) -> Result<DecodedOp, String> {
+        let text = format!(r#"{{"body":{body},{HEAD}}}"#);
+        let json = json::parse(text.as_bytes()).map_err(|e| format!("{e:?}"))?;
+        decode_op(json, &Schema).map_err(|e| format!("{e:?}"))
+    }
+
+    fn unknown_field(decoded: &DecodedOp) -> Option<&str> {
+        match decoded {
+            DecodedOp::Invalid {
+                fault: OpFault::UnknownField(name),
+                ..
+            } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_test_schema_resolves_implicit_names() {
+        assert_eq!(Schema.field_id(0, "made"), Some(FIELD_MADE));
+        assert_eq!(Schema.field_ty(0, FIELD_AUTHOR), Some(&WireTy::Ref(0)));
+        assert_eq!(Schema.field_name(0, FIELD_CHANGED), Some("changed"));
+    }
+
+    /// A body that writes `made`, `changed` or `author` is `UnknownField`, whatever its kind
+    /// (D186), exactly as a name the schema does not know.
+    #[test]
+    fn an_op_that_writes_an_implicit_field_is_unknown_field() -> Result<(), String> {
+        for name in ["made", "changed", "author"] {
+            let value = if name == "author" {
+                r#""00010203040500070123456789abcdef""#
+            } else {
+                "5"
+            };
+            let bodies = [
+                format!(r#"{{"set":{{"field":"{name}","value":{value}}}}}"#),
+                format!(r#"{{"make":{{"{name}":{value},"title":"x"}}}}"#),
+                format!(r#"{{"add":{{"field":"{name}","elem":{value}}}}}"#),
+                format!(
+                    r#"{{"remove":{{"elem":{value},"field":"{name}","tags":["0123456789abcdef00000001"]}}}}"#
+                ),
+                format!(r#"{{"put":{{"field":"{name}","key":{value},"value":{value}}}}}"#),
+                format!(r#"{{"remove_key":{{"field":"{name}","key":{value}}}}}"#),
+            ];
+            for body in bodies {
+                let decoded = decode(&body)?;
+                assert_eq!(unknown_field(&decoded), Some(name), "{body}: {decoded:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The guard does not touch declared fields.
+    #[test]
+    fn declared_fields_still_decode() -> Result<(), String> {
+        let decoded = decode(r#"{"set":{"field":"title","value":"x"}}"#)?;
+        assert!(matches!(decoded, DecodedOp::Valid(_)), "{decoded:?}");
+        let decoded = decode(r#"{"add":{"elem":"a","field":"tags"}}"#)?;
+        assert!(matches!(decoded, DecodedOp::Valid(_)), "{decoded:?}");
+        Ok(())
+    }
+
+    /// Writing an op that sets an implicit field is a defect of the caller, never a frame.
+    #[test]
+    fn encode_refuses_an_op_that_writes_an_implicit_field() -> Result<(), String> {
+        let replica = ReplicaId(0x0123_4567_89ab_cdef);
+        let hlc = Hlc::new(0x0001_0203_0405, 7, replica).map_err(|e| format!("{e:?}"))?;
+        let op = |body| Op {
+            id: OpId { replica, seq: 1 },
+            hlc,
+            model: 0,
+            row: RowId::new(hlc),
+            body,
+        };
+        let time = Value::time(5).map_err(|e| format!("{e:?}"))?;
+        for field in [
+            FIELD_MADE,
+            FIELD_CHANGED,
+            FIELD_AUTHOR,
+            FIRST_IMPLICIT_FIELD + 7,
+        ] {
+            let set = op(OpBody::Set {
+                field,
+                value: time.clone(),
+            });
+            assert_eq!(
+                encode_op(&set, &Schema),
+                Err(WireError::NotInSchema("field")),
+                "{field:#x}"
+            );
+            let make = op(OpBody::Make {
+                fields: vec![(0, Value::Text("x".into())), (field, time.clone())],
+            });
+            assert_eq!(
+                encode_op(&make, &Schema),
+                Err(WireError::NotInSchema("field")),
+                "{field:#x}"
+            );
+        }
+        let title = op(OpBody::Set {
+            field: 0,
+            value: Value::Text("x".into()),
+        });
+        assert!(encode_op(&title, &Schema).is_ok());
+        Ok(())
+    }
 }

@@ -9,13 +9,17 @@
 //! Every lookup is a hash map lookup on a name received from a client, so a frame full of
 //! unknown names costs no more than one with known names.
 //!
-//! Only declared fields are part of the schema. The implicit fields (`id`, `made`, `changed`,
-//! and `author` in a program with `auth`) are never written by an op (the `make` body names
-//! every declared field once, D116), so a name of an implicit field in an op body is an
-//! unknown field. Because rows carry the implicit fields under the same names, a declared
-//! field may not use one of them ([`SchemaError::ReservedField`]). A program without `auth`
-//! has no implicit `author`, so there a declared field `author` is an ordinary field
-//! (SPEC 12.6, G8).
+//! The implicit fields `made` and `changed` (`Time`), and `author` (a reference to the std
+//! `User`) in a program with `auth`, are resolved too, because `snapshot` rows and queries name
+//! them (`sort made`, `where author == me`). They have the fixed reserved ids
+//! [`FIELD_MADE`], [`FIELD_CHANGED`] and [`FIELD_AUTHOR`] of `ostrel_db::api` (D186), so a
+//! declared field added later never relabels a stored stamp. Every declared position stays
+//! below [`ostrel_db::api::FIRST_IMPLICIT_FIELD`] ([`SchemaError::TooMany`]). The implicit
+//! `id` has no field id; it is the row id. No op writes an implicit field: the op decoder
+//! refuses their names as unknown fields (D116). Because rows carry the implicit fields under
+//! the same names, a declared field may not use one of them ([`SchemaError::ReservedField`]).
+//! A program without `auth` has no implicit `author`, so there a declared field `author` is an
+//! ordinary field (SPEC 12.6, G8).
 //!
 //! Server functions are numbered the same way: the position of a function in the list given
 //! to [`ServerSchema::new`] is its [`FnId`]. A function carries the wire types of its
@@ -30,6 +34,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
 
+use ostrel_db::api::{FIELD_AUTHOR, FIELD_CHANGED, FIELD_MADE, is_implicit_field};
 use ostrel_sync::protocol::{FieldId, FnId, ModelId};
 use ostrel_sync::wire::{WireSchema, WireTy};
 
@@ -44,15 +49,49 @@ pub const AUTHOR_FIELD: &str = "author";
 pub enum Auth {
     /// The `app` has no `auth` line: rows have no implicit `author`.
     Off,
-    /// The `app` has an `auth` line: rows carry the implicit `author`.
-    On,
+    /// The `app` has an `auth` line: rows carry the implicit `author`, a reference to `user`,
+    /// the std `User` model (G8, D142).
+    On { user: ModelId },
 }
 
 impl Auth {
     /// Whether `name` is an implicit field of every row of a program with this setting.
     pub fn is_implicit(self, name: &str) -> bool {
-        IMPLICIT_FIELDS.contains(&name) || (self == Auth::On && name == AUTHOR_FIELD)
+        IMPLICIT_FIELDS.contains(&name) || (matches!(self, Auth::On { .. }) && name == AUTHOR_FIELD)
     }
+
+    /// The implicit fields that have a field id, with their reserved ids and wire types
+    /// (D186). `id` has none.
+    fn stamped_fields(self) -> Vec<Implicit> {
+        let mut fields = vec![
+            Implicit {
+                id: FIELD_MADE,
+                name: "made",
+                ty: WireTy::Time,
+            },
+            Implicit {
+                id: FIELD_CHANGED,
+                name: "changed",
+                ty: WireTy::Time,
+            },
+        ];
+        if let Auth::On { user } = self {
+            fields.push(Implicit {
+                id: FIELD_AUTHOR,
+                name: AUTHOR_FIELD,
+                ty: WireTy::Ref(user),
+            });
+        }
+        fields
+    }
+}
+
+/// An implicit field with a reserved id (D186).
+#[derive(Clone, Debug)]
+struct Implicit {
+    id: FieldId,
+    name: &'static str,
+    ty: WireTy,
 }
 
 /// One model as the compiler declares it: its name and its declared fields in order.
@@ -100,7 +139,8 @@ pub enum SchemaError {
     /// A reference in this place names a model the schema does not have. The place is
     /// `Model.field`, or `fn name` for a parameter or the result of a function.
     UnknownRefTarget { place: String, target: ModelId },
-    /// More models, more fields in one model, or more functions than an id can number.
+    /// More models or functions than an id can number, or a declared field whose position
+    /// would reach the ids reserved for implicit fields (D186).
     TooMany,
 }
 
@@ -141,6 +181,8 @@ pub struct ServerSchema {
     model_ids: HashMap<String, ModelId>,
     functions: Vec<FnDecl>,
     function_ids: HashMap<String, FnId>,
+    /// The implicit fields every model of this program has, `author` only with `auth`.
+    implicit: Vec<Implicit>,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +232,7 @@ impl ServerSchema {
             model_ids,
             functions,
             function_ids,
+            implicit: auth.stamped_fields(),
         };
         schema.check_ref_targets()?;
         Ok(schema)
@@ -218,6 +261,12 @@ impl ServerSchema {
                 })?;
             }
         }
+        for field in &self.implicit {
+            check_ref_target(&field.ty, count).map_err(|target| SchemaError::UnknownRefTarget {
+                place: format!("implicit {}", field.name),
+                target,
+            })?;
+        }
         for function in &self.functions {
             for ty in function.params.iter().chain([&function.result]) {
                 check_ref_target(ty, count).map_err(|target| SchemaError::UnknownRefTarget {
@@ -238,9 +287,25 @@ impl ServerSchema {
         self.models.get(usize::try_from(model).ok()?)
     }
 
-    fn field(&self, model: ModelId, field: FieldId) -> Option<&FieldDecl> {
-        self.model(model)?.fields.get(usize::try_from(field).ok()?)
+    /// The name and wire type of a declared or implicit field of an existing model.
+    fn field(&self, model: ModelId, field: FieldId) -> Option<(&str, &WireTy)> {
+        let entry = self.model(model)?;
+        if is_implicit_field(field) {
+            let implicit = self.implicit.iter().find(|f| f.id == field)?;
+            return Some((implicit.name, &implicit.ty));
+        }
+        let declared = entry.fields.get(usize::try_from(field).ok()?)?;
+        Some((declared.name.as_str(), &declared.ty))
     }
+}
+
+/// The field id of the declared field at position `at`: the position itself, which must stay
+/// below the ids reserved for implicit fields (D186).
+fn declared_field_id(at: usize) -> Result<FieldId, SchemaError> {
+    FieldId::try_from(at)
+        .ok()
+        .filter(|id| !is_implicit_field(*id))
+        .ok_or(SchemaError::TooMany)
 }
 
 /// The first reference target in `ty` that is not below `models`, the number of models.
@@ -273,7 +338,7 @@ impl ModelEntry {
     fn new(model: ModelDecl, auth: Auth) -> Result<Self, SchemaError> {
         let mut field_ids = HashMap::with_capacity(model.fields.len());
         for (at, field) in model.fields.iter().enumerate() {
-            let id = FieldId::try_from(at).map_err(|_| SchemaError::TooMany)?;
+            let id = declared_field_id(at)?;
             if field.name.is_empty() {
                 return Err(SchemaError::EmptyFieldName { model: model.name });
             }
@@ -307,16 +372,22 @@ impl WireSchema for ServerSchema {
         Some(self.model(model)?.name.as_str())
     }
 
+    /// Every readable name: a declared field, or `made`, `changed` and (with `auth`) `author`
+    /// under their reserved ids (D186). The op decoder refuses the implicit ones.
     fn field_id(&self, model: ModelId, name: &str) -> Option<FieldId> {
-        self.model(model)?.field_ids.get(name).copied()
+        let entry = self.model(model)?;
+        if let Some(id) = entry.field_ids.get(name) {
+            return Some(*id);
+        }
+        self.implicit.iter().find(|f| f.name == name).map(|f| f.id)
     }
 
     fn field_name(&self, model: ModelId, field: FieldId) -> Option<&str> {
-        Some(self.field(model, field)?.name.as_str())
+        Some(self.field(model, field)?.0)
     }
 
     fn field_ty(&self, model: ModelId, field: FieldId) -> Option<&WireTy> {
-        Some(&self.field(model, field)?.ty)
+        Some(self.field(model, field)?.1)
     }
 
     fn function_id(&self, name: &str) -> Option<FnId> {
@@ -339,6 +410,8 @@ impl WireSchema for ServerSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use ostrel_db::api::FIRST_IMPLICIT_FIELD;
 
     use ostrel_core::ids::{Hlc, OpId, ReplicaId, RowId};
     use ostrel_core::value::Value;
@@ -448,14 +521,143 @@ mod tests {
         Ok(())
     }
 
+    /// `Room` (1) stands in for the std `User` of a program with `auth`.
+    const WITH_AUTH: Auth = Auth::On { user: 1 };
+
+    /// `made` and `changed` resolve to their reserved ids in every model, `author` only with
+    /// `auth`, and `id` never: it is the row id (D186).
     #[test]
-    fn implicit_fields_are_not_declared_fields() -> Result<(), SchemaError> {
-        for auth in [Auth::Off, Auth::On] {
+    fn implicit_fields_resolve_to_reserved_ids() -> Result<(), SchemaError> {
+        for auth in [Auth::Off, WITH_AUTH] {
             let s = ServerSchema::new(chat(), Vec::new(), auth)?;
-            for name in IMPLICIT_FIELDS.into_iter().chain([AUTHOR_FIELD]) {
-                assert_eq!(s.field_id(0, name), None, "{name} {auth:?}");
+            for model in 0..3 {
+                assert_eq!(s.field_id(model, "made"), Some(FIELD_MADE), "{auth:?}");
+                assert_eq!(
+                    s.field_id(model, "changed"),
+                    Some(FIELD_CHANGED),
+                    "{auth:?}"
+                );
+                assert_eq!(s.field_id(model, "id"), None, "{auth:?}");
+                assert_eq!(s.field_name(model, FIELD_MADE), Some("made"));
+                assert_eq!(s.field_name(model, FIELD_CHANGED), Some("changed"));
+                assert_eq!(s.field_ty(model, FIELD_MADE), Some(&WireTy::Time));
+                assert_eq!(s.field_ty(model, FIELD_CHANGED), Some(&WireTy::Time));
+            }
+            // Implicit fields belong to existing models only.
+            assert_eq!(s.field_id(3, "made"), None);
+            assert_eq!(s.field_name(3, FIELD_MADE), None);
+            assert_eq!(s.field_ty(3, FIELD_CHANGED), None);
+            // The rest of the reserved range is no field.
+            for unused in [FIELD_AUTHOR + 1, FieldId::MAX] {
+                assert_eq!(s.field_name(0, unused), None);
+                assert_eq!(s.field_ty(0, unused), None);
             }
         }
+        let off = ServerSchema::new(chat(), Vec::new(), Auth::Off)?;
+        assert_eq!(off.field_id(0, "author"), None);
+        assert_eq!(off.field_name(0, FIELD_AUTHOR), None);
+        assert_eq!(off.field_ty(0, FIELD_AUTHOR), None);
+        let on = ServerSchema::new(chat(), Vec::new(), WITH_AUTH)?;
+        assert_eq!(on.field_id(0, "author"), Some(FIELD_AUTHOR));
+        assert_eq!(on.field_name(0, FIELD_AUTHOR), Some("author"));
+        assert_eq!(on.field_ty(0, FIELD_AUTHOR), Some(&WireTy::Ref(1)));
+        // Declared positions are unchanged by the implicit fields.
+        assert_eq!(on.field_id(0, "text"), Some(0));
+        assert_eq!(on.field_id(0, "tags"), Some(2));
+        Ok(())
+    }
+
+    /// The reserved ids are the ones D186 fixes in `ostrel_db::api`.
+    #[test]
+    fn reserved_ids_are_fixed() {
+        assert_eq!(FIRST_IMPLICIT_FIELD, 0xFFFF_FF00);
+        assert_eq!(FIELD_MADE, 0xFFFF_FF00);
+        assert_eq!(FIELD_CHANGED, 0xFFFF_FF01);
+        assert_eq!(FIELD_AUTHOR, 0xFFFF_FF02);
+        assert!(!is_implicit_field(0));
+        assert!(!is_implicit_field(FIRST_IMPLICIT_FIELD - 1));
+        for id in [FIELD_MADE, FIELD_CHANGED, FIELD_AUTHOR, FieldId::MAX] {
+            assert!(is_implicit_field(id), "{id:#x}");
+        }
+    }
+
+    /// A declared position never reaches the reserved range.
+    #[test]
+    fn declared_positions_stay_below_the_reserved_ids() {
+        assert_eq!(declared_field_id(0), Ok(0));
+        let last = FIRST_IMPLICIT_FIELD - 1;
+        assert_eq!(declared_field_id(last as usize), Ok(last));
+        assert_eq!(
+            declared_field_id(FIRST_IMPLICIT_FIELD as usize),
+            Err(SchemaError::TooMany)
+        );
+        assert_eq!(declared_field_id(usize::MAX), Err(SchemaError::TooMany));
+    }
+
+    /// The target of the implicit `author` must be a model of the schema.
+    #[test]
+    fn author_target_must_be_a_model() {
+        assert_eq!(
+            ServerSchema::new(chat(), Vec::new(), Auth::On { user: 3 }).err(),
+            Some(SchemaError::UnknownRefTarget {
+                place: "implicit author".into(),
+                target: 3
+            })
+        );
+    }
+
+    /// An op that writes `made` (or another implicit field) is `UnknownField`, the same fault
+    /// as an unknown name (D186, D116), in every body kind that names a field.
+    #[test]
+    fn an_op_that_writes_made_is_unknown_field() -> Result<(), String> {
+        let s = ServerSchema::new(chat(), Vec::new(), WITH_AUTH).map_err(|e| e.to_string())?;
+        let sent = op(
+            1,
+            OpBody::Set {
+                field: 0,
+                value: Value::Text("Lobby".into()),
+            },
+        )?;
+        let text = encode_op(&sent, &s).map_err(|e| format!("{e:?}"))?;
+        let row = room_row()?.to_hex();
+        for name in ["made", "changed", "author"] {
+            let value = if name == "author" {
+                format!("\"{row}\"")
+            } else {
+                "5".into()
+            };
+            let set = text.replace(
+                r#"{"set":{"field":"title","value":"Lobby"}}"#,
+                &format!(r#"{{"set":{{"field":"{name}","value":{value}}}}}"#),
+            );
+            let make = text.replace(
+                r#"{"set":{"field":"title","value":"Lobby"}}"#,
+                &format!(r#"{{"make":{{"{name}":{value},"title":"Lobby"}}}}"#),
+            );
+            for frame in [set, make] {
+                assert_ne!(frame, text);
+                let decoded = decode_op(
+                    json::parse(frame.as_bytes()).map_err(|e| format!("{e:?}"))?,
+                    &s,
+                )
+                .map_err(|e| format!("{e:?}"))?;
+                let shown = format!("{decoded:?}");
+                assert!(shown.starts_with("Invalid"), "{frame}: {shown}");
+                assert!(
+                    shown.contains(&format!(r#"UnknownField("{name}")"#)),
+                    "{frame}: {shown}"
+                );
+            }
+        }
+        // Writing such an op is a defect of the caller.
+        let stamp = op(
+            1,
+            OpBody::Set {
+                field: FIELD_MADE,
+                value: Value::time(5).map_err(|e| format!("{e:?}"))?,
+            },
+        )?;
+        assert!(encode_op(&stamp, &s).is_err());
         Ok(())
     }
 
@@ -498,7 +700,7 @@ mod tests {
     fn declared_author_with_auth_is_reserved() {
         let reserved = vec![model("Note", vec![field("author", WireTy::Text)])];
         assert_eq!(
-            ServerSchema::new(reserved, Vec::new(), Auth::On).err(),
+            ServerSchema::new(reserved, Vec::new(), Auth::On { user: 0 }).err(),
             Some(SchemaError::ReservedField {
                 model: "Note".into(),
                 field: "author".into()
@@ -510,11 +712,11 @@ mod tests {
     fn only_author_depends_on_auth() {
         for name in IMPLICIT_FIELDS {
             assert!(Auth::Off.is_implicit(name), "{name}");
-            assert!(Auth::On.is_implicit(name), "{name}");
+            assert!(WITH_AUTH.is_implicit(name), "{name}");
         }
         assert!(!Auth::Off.is_implicit(AUTHOR_FIELD));
-        assert!(Auth::On.is_implicit(AUTHOR_FIELD));
-        assert!(!Auth::On.is_implicit("title"));
+        assert!(WITH_AUTH.is_implicit(AUTHOR_FIELD));
+        assert!(!WITH_AUTH.is_implicit("title"));
     }
 
     #[test]
@@ -547,7 +749,7 @@ mod tests {
             })
         );
 
-        for auth in [Auth::Off, Auth::On] {
+        for auth in [Auth::Off, WITH_AUTH] {
             for name in IMPLICIT_FIELDS {
                 let reserved = vec![model("Room", vec![field(name, WireTy::Text)])];
                 assert_eq!(

@@ -51,10 +51,31 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// Index of a model in the compiled schema.
 pub type ModelId = u32;
 
-/// Index of a field within its model in the compiled schema. The implicit fields `made`,
-/// `changed` and `author` have field ids like every declared field; the row id has none and is
-/// addressed by [`Expr::RowId`] and [`Row::id`].
+/// Index of a field within its model in the compiled schema. A declared field has its position
+/// in the model, which stays below [`FIRST_IMPLICIT_FIELD`]. The implicit fields `made`,
+/// `changed` and `author` have the fixed reserved ids [`FIELD_MADE`], [`FIELD_CHANGED`] and
+/// [`FIELD_AUTHOR`] (D186); the row id has none and is addressed by [`Expr::RowId`] and
+/// [`Row::id`]. Drivers treat field ids as opaque numbers.
 pub type FieldId = u32;
+
+/// First field id reserved for the implicit fields (D186). Every declared field has a
+/// position below it.
+pub const FIRST_IMPLICIT_FIELD: FieldId = 0xFFFF_FF00;
+
+/// Field id of the implicit `made`, the accepted stamp of the `make` of a row (D186).
+pub const FIELD_MADE: FieldId = 0xFFFF_FF00;
+
+/// Field id of the implicit `changed`, the accepted stamp of the last write of a row (D186).
+pub const FIELD_CHANGED: FieldId = 0xFFFF_FF01;
+
+/// Field id of the implicit `author`, which rows carry only in an app with `auth` (D186).
+pub const FIELD_AUTHOR: FieldId = 0xFFFF_FF02;
+
+/// Whether `field` lies in the range reserved for implicit fields (D186). No op ever writes
+/// such a field: only the server stamps it.
+pub fn is_implicit_field(field: FieldId) -> bool {
+    field >= FIRST_IMPLICIT_FIELD
+}
 
 /// Errors a driver reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
