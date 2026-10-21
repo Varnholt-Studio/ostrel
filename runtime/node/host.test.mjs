@@ -309,10 +309,16 @@ test("a cancelled call is not answered when it settles later", async () => {
   host.send({ jsonrpc: "2.0", method: "cancel", params: { id: 1 } });
   host.send(callRequest(2, "bad", "throws", []));
   assert.equal((await host.nextMessage()).id, 2);
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.deepEqual(await host.call(3, "math", "add", [1, 1]), { jsonrpc: "2.0", id: 3, result: 2 });
+  // Wait for an event, not for time (D74). The marker call starts after the
+  // cancelled one with the same delay, and Node fires timers of equal duration
+  // in the order they were created, draining microtasks after each one. So
+  // when the marker is answered, the cancelled call has already settled, and
+  // an answer to it would have been written first.
+  host.send(callRequest(3, "math", "slowEcho", ["marker", 200]));
+  assert.deepEqual(await host.nextMessage(), { jsonrpc: "2.0", id: 3, result: "marker" });
+  assert.deepEqual(await host.call(4, "math", "add", [1, 1]), { jsonrpc: "2.0", id: 4, result: 2 });
+  assert.equal(await host.stop(), 0);
   assert.equal(host.rawLines.length, 0);
-  await host.stop();
 });
 
 test("cancel with an unknown or malformed id is ignored", async () => {

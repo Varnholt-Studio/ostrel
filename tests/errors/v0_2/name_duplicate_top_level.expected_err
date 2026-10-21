@@ -1,0 +1,1 @@
+tests/errors/v0_2/name_duplicate_top_level.ostl:6:4: error[E0201]: `f` is already declared

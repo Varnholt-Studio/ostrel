@@ -1,0 +1,1 @@
+tests/errors/v0_2/name_rule_unknown.ostl:5:10: error[E0200]: unknown name `nope`

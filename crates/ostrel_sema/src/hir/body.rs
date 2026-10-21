@@ -49,6 +49,11 @@ pub enum ContextName {
 pub enum StdName {
     /// `print`, script programs only.
     Print,
+    /// `sync`, the sync state of the client (SYNTAX 4.7).
+    Sync,
+    /// `Url`, as in `Url.parse(t)` (SYNTAX 4.8); in a type position it is
+    /// [`Ty::Url`].
+    Url,
 }
 
 /// An expression with its source position and, after `check`, its type.
@@ -74,6 +79,17 @@ pub enum ExprKind {
     Str(Box<[StrPart]>),
     /// A resolved name.
     Name(Res),
+    /// A bare word whose meaning follows from the expected type (D142): an
+    /// element attribute value that is a bare name, or a name that only
+    /// several enums declare as a variant. `resolve` reports nothing for it;
+    /// `check` replaces it with [`ExprKind::Name`].
+    Word {
+        /// The word.
+        name: Box<str>,
+        /// What the name binds at its position; [`Res::Error`] if nothing
+        /// or only several enums bind it.
+        lexical: Res,
+    },
     /// A prefix operator.
     Unary {
         /// The operator.

@@ -1,0 +1,4 @@
+app Golden
+
+fn f()
+  make Int { a: 1 }

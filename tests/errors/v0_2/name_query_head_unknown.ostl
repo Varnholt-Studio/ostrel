@@ -1,0 +1,5 @@
+app Golden
+
+fn f()
+  for x in Nope limit 1
+    print(1)

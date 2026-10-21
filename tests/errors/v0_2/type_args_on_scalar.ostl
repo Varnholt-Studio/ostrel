@@ -1,0 +1,4 @@
+app Golden
+
+data Post
+  n: Int[Text]

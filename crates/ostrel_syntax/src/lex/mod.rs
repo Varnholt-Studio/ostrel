@@ -1,4 +1,4 @@
-//! Lexer for the v0.1 token set (ARCHITECTURE 3, WP T1-2).
+//! Lexer for the v0.1 token set and the CSS mode of `style` (ARCHITECTURE 3, WP T1-2).
 //!
 //! The lexer turns source text into [`Token`]s and never fails: every fault is a
 //! [`Diagnostic`] plus, where source is dropped, a [`TokenKind::Error`] token.
@@ -27,6 +27,10 @@
 //!   `Dedent` for every open block and ends with `Eof`. A last line without a
 //!   line end is valid, and an empty input gives only `Eof`.
 //!
+//! * The block under a line that holds only `style` is lexed in CSS mode
+//!   (SYNTAX 3, B-F21): `/* */` comments, `//` is CSS text, one
+//!   [`TokenKind::Css`] token per run of text. See `css.rs`.
+//!
 //! # Line ends and code points
 //!
 //! * `\r\n` is a line end like `\n`; mixed line ends are allowed. A lone
@@ -51,6 +55,7 @@
 //! line end, so the statements on both sides still parse.
 
 pub mod codes;
+mod css;
 mod literal;
 mod token;
 
@@ -141,6 +146,9 @@ pub fn lex_with<L: LiteralScan + ?Sized>(
         line_has_tokens: false,
         at_line_start: true,
         in_string: false,
+        line_first: 0,
+        css_pending: None,
+        css: None,
     };
     lexer.run();
     (lexer.tokens, lexer.diags)
@@ -171,6 +179,14 @@ struct Lexer<'a, L: ?Sized> {
     at_line_start: bool,
     /// The lexer is inside an interpolation.
     in_string: bool,
+    /// Index of the first token of the current logical line.
+    line_first: usize,
+    /// The last logical line held only `style`; its block column. The next
+    /// line that opens a block starts the CSS body.
+    css_pending: Option<u32>,
+    /// Inside a CSS body: the block column of its `style` line. A line at that
+    /// column or shallower ends the body.
+    css: Option<u32>,
 }
 
 impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
@@ -189,6 +205,7 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
                 '\n' => self.line_end(1),
                 '\r' if self.peek_at(1) == Some('\n') => self.line_end(2),
                 ' ' | '\t' => self.pos += 1,
+                _ if self.css.is_some() => self.css_token(),
                 _ => self.token(c),
             }
         }
@@ -224,24 +241,11 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             self.pos += 1;
         }
         let rest = self.src.get(self.pos..).unwrap_or("");
-        if rest.is_empty()
-            || rest.starts_with('\n')
-            || rest.starts_with("\r\n")
-            || rest.starts_with("//")
-        {
-            // Blank or comment only line: no layout tokens, nothing checked.
+        if rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n") {
+            // Blank line: no layout tokens, nothing checked.
             return;
         }
-        let ws_end = self.pos;
-        let faulty = if let Some(tab) = first_tab {
-            self.error(codes::TAB_INDENT, tab, tab + 1, codes::MSG_TAB_INDENT);
-            true
-        } else if !width.is_multiple_of(2) {
-            self.error(codes::ODD_INDENT, start, ws_end, codes::MSG_ODD_INDENT);
-            true
-        } else {
-            false
-        };
+        let faulty = first_tab.is_some() || !width.is_multiple_of(2);
         // Recovery for E0001 and E0002: the column rounded up to a multiple of
         // two. The stack rules below then hold without a second diagnostic.
         let column = if faulty {
@@ -249,7 +253,41 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         } else {
             width
         };
+        // A line not deeper than its `style` line ends the CSS body, also when
+        // it holds only a comment (D137). The blocks of the body close on that
+        // same line, so mode end and DEDENT coincide (SYNTAX 3).
+        let ends_css = self.css.is_some_and(|style| column <= style);
+        if ends_css {
+            self.css = None;
+        }
         let top = self.top();
+        let opens_css = self.css.is_none() && column > top && self.css_pending.is_some();
+        if opens_css {
+            // The first line deeper than a `style` line starts its CSS body.
+            self.css = self.css_pending.take();
+        }
+        let comment_only = if self.css.is_some() {
+            self.css_comment_only_line()
+        } else {
+            rest.starts_with("//")
+        };
+        // The first line of a CSS body opens its block even when it holds only
+        // a comment, so the line that ends the body always closes it (D138).
+        if comment_only && !opens_css {
+            // Comment only line: no layout tokens, nothing checked, unless it
+            // ends a CSS body; then only the closing DEDENTs, still unchecked.
+            if ends_css {
+                self.close_blocks(column);
+            }
+            return;
+        }
+        self.css_pending = None;
+        let ws_end = self.pos;
+        if let Some(tab) = first_tab {
+            self.error(codes::TAB_INDENT, tab, tab + 1, codes::MSG_TAB_INDENT);
+        } else if faulty {
+            self.error(codes::ODD_INDENT, start, ws_end, codes::MSG_ODD_INDENT);
+        }
         if column > top {
             if !faulty && column - top > 2 {
                 self.error(codes::DEEP_INDENT, start, ws_end, codes::MSG_DEEP_INDENT);
@@ -258,14 +296,27 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             // lines of that block are not reported again (D68).
             self.push(TokenKind::Indent, start, ws_end);
             self.indents.push(column);
+            if comment_only {
+                // A CSS body opened by a comment line: the line still ends
+                // with NL, so its block never shares a logical line with the
+                // line after the body.
+                self.line_has_tokens = true;
+            }
             return;
         }
-        while self.top() > column {
-            self.indents.pop();
-            self.push(TokenKind::Dedent, ws_end, ws_end);
-        }
+        self.close_blocks(column);
         // A column between two stack entries can only follow a recovery; the
         // line belongs to the block that is now on top, without a diagnostic.
+    }
+
+    /// Closes every open block deeper than `column` with a DEDENT at the
+    /// current position (the end of the line's indentation).
+    fn close_blocks(&mut self, column: u32) {
+        let at = self.pos;
+        while self.top() > column {
+            self.indents.pop();
+            self.push(TokenKind::Dedent, at, at);
+        }
     }
 
     /// The column of the innermost open block.
@@ -279,11 +330,35 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         self.pos += len;
         if self.open == 0 {
             if self.line_has_tokens {
+                self.end_logical_line();
                 self.push(TokenKind::Nl, start, self.pos);
+                self.line_first = self.tokens.len();
             }
             self.line_has_tokens = false;
             self.at_line_start = true;
         }
+    }
+
+    /// Notes a logical line that holds only the keyword `style`: the block
+    /// under it is lexed in CSS mode (SYNTAX 3, grammar `styleDecl`).
+    fn end_logical_line(&mut self) {
+        if self.css.is_some() {
+            return;
+        }
+        let mut code = self
+            .tokens
+            .get(self.line_first..)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::Comment | TokenKind::Indent | TokenKind::Dedent
+                )
+            });
+        let style_only = code.next().map(|t| t.kind) == Some(TokenKind::Kw(Keyword::Style))
+            && code.next().is_none();
+        self.css_pending = style_only.then(|| self.top());
     }
 
     // ----- tokens -----
@@ -335,6 +410,7 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
                 if self.open == 0 && self.line_has_tokens && !self.in_string {
                     self.push(TokenKind::Nl, start, self.pos);
                     self.line_has_tokens = false;
+                    self.line_first = self.tokens.len();
                 }
                 return;
             }

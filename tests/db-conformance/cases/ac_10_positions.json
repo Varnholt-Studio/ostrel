@@ -1,0 +1,420 @@
+{
+ "format": 1,
+ "ac": "AC-10",
+ "schema": [
+  {
+   "model": 0,
+   "name": "Note",
+   "fields": [
+    {
+     "field": 0,
+     "name": "title",
+     "type": "Text"
+    }
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "name": "ac_10_append_positions_after_rollback",
+   "doc": "D154: a transaction that appended ops and rolled back leaves no op in the log; its positions may be given again or be left out. Transactions that commit after it get positions above every committed position, increasing within a call and from one commit to the next, and a committed position is never given again.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "1",
+         "seq": 1,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "a1"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "2",
+         "seq": 1,
+         "wall": 12,
+         "model": 0,
+         "row": "1",
+         "body": "b1"
+        }
+       ]
+      }
+     ],
+     "expect": "rollback"
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "3",
+         "seq": 1,
+         "wall": 13,
+         "model": 0,
+         "row": "1",
+         "body": "c1"
+        },
+        {
+         "replica": "3",
+         "seq": 2,
+         "wall": 14,
+         "model": 0,
+         "row": "1",
+         "body": "c2"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "4",
+         "seq": 1,
+         "wall": 15,
+         "model": 0,
+         "row": "1",
+         "body": "d1"
+        }
+       ]
+      }
+     ],
+     "expect": "rollback"
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "2",
+         "seq": 1,
+         "wall": 12,
+         "model": 0,
+         "row": "1",
+         "body": "b1"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "ops_since": 0,
+     "expect": [
+      {
+       "replica": "1",
+       "seq": 1,
+       "wall": 10,
+       "model": 0,
+       "row": "1",
+       "body": "a1"
+      },
+      {
+       "replica": "3",
+       "seq": 1,
+       "wall": 13,
+       "model": 0,
+       "row": "1",
+       "body": "c1"
+      },
+      {
+       "replica": "3",
+       "seq": 2,
+       "wall": 14,
+       "model": 0,
+       "row": "1",
+       "body": "c2"
+      },
+      {
+       "replica": "2",
+       "seq": 1,
+       "wall": 12,
+       "model": 0,
+       "row": "1",
+       "body": "b1"
+      }
+     ]
+    },
+    {
+     "replay": {
+      "replica": "4",
+      "seq": 1
+     },
+     "expect": null
+    },
+    {
+     "last_seq": "4",
+     "expect": 0
+    }
+   ]
+  },
+  {
+   "name": "ac_10_append_positions_after_commit",
+   "doc": "D154: when transaction A commits before transaction B calls append_ops and B commits, every position of B is above every position of A, also when B appends in several calls and writes rows in between.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "1",
+         "seq": 1,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "a1"
+        },
+        {
+         "replica": "1",
+         "seq": 2,
+         "wall": 11,
+         "model": 0,
+         "row": "1",
+         "body": "a2"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "2",
+         "seq": 1,
+         "wall": 12,
+         "model": 0,
+         "row": "1",
+         "body": "b1"
+        }
+       ]
+      },
+      {
+       "insert": {
+        "model": 0,
+        "row": "1",
+        "fields": {
+         "0": {
+          "text": "x"
+         }
+        }
+       }
+      },
+      {
+       "append_ops": [
+        {
+         "replica": "3",
+         "seq": 1,
+         "wall": 13,
+         "model": 0,
+         "row": "1",
+         "body": "c1"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "append_ops": []
+      },
+      {
+       "append_ops": [
+        {
+         "replica": "3",
+         "seq": 2,
+         "wall": 14,
+         "model": 0,
+         "row": "1",
+         "body": "c2"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "ops_since": 0,
+     "expect": [
+      {
+       "replica": "1",
+       "seq": 1,
+       "wall": 10,
+       "model": 0,
+       "row": "1",
+       "body": "a1"
+      },
+      {
+       "replica": "1",
+       "seq": 2,
+       "wall": 11,
+       "model": 0,
+       "row": "1",
+       "body": "a2"
+      },
+      {
+       "replica": "2",
+       "seq": 1,
+       "wall": 12,
+       "model": 0,
+       "row": "1",
+       "body": "b1"
+      },
+      {
+       "replica": "3",
+       "seq": 1,
+       "wall": 13,
+       "model": 0,
+       "row": "1",
+       "body": "c1"
+      },
+      {
+       "replica": "3",
+       "seq": 2,
+       "wall": 14,
+       "model": 0,
+       "row": "1",
+       "body": "c2"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "ac_10_append_positions_after_failed_call",
+   "doc": "D154: a transaction that fails after append_ops, by a later write or by a refused append_ops call, rolls back; a later commit still gets positions above every committed one, and the log holds only committed ops.",
+   "steps": [
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "1",
+         "seq": 1,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "a1"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "2",
+         "seq": 1,
+         "wall": 12,
+         "model": 0,
+         "row": "1",
+         "body": "b1"
+        }
+       ]
+      },
+      {
+       "delete": {
+        "model": 0,
+        "row": "9",
+        "expect_version": 1
+       }
+      }
+     ],
+     "expect": {
+      "error": "NotFound"
+     }
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "3",
+         "seq": 1,
+         "wall": 13,
+         "model": 0,
+         "row": "1",
+         "body": "c1"
+        }
+       ]
+      },
+      {
+       "append_ops": [
+        {
+         "replica": "1",
+         "seq": 1,
+         "wall": 10,
+         "model": 0,
+         "row": "1",
+         "body": "a1"
+        }
+       ]
+      }
+     ],
+     "expect": {
+      "error": "Conflict"
+     }
+    },
+    {
+     "tx": [
+      {
+       "append_ops": [
+        {
+         "replica": "4",
+         "seq": 1,
+         "wall": 15,
+         "model": 0,
+         "row": "1",
+         "body": "d1"
+        }
+       ]
+      }
+     ],
+     "expect": "ok"
+    },
+    {
+     "ops_since": 0,
+     "expect": [
+      {
+       "replica": "1",
+       "seq": 1,
+       "wall": 10,
+       "model": 0,
+       "row": "1",
+       "body": "a1"
+      },
+      {
+       "replica": "4",
+       "seq": 1,
+       "wall": 15,
+       "model": 0,
+       "row": "1",
+       "body": "d1"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

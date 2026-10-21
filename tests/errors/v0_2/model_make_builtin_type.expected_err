@@ -1,0 +1,1 @@
+tests/errors/v0_2/model_make_builtin_type.ostl:4:8: error[E0205]: `make` needs a data type; `Int` is not one
