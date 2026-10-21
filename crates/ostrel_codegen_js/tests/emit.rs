@@ -10,12 +10,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use ostrel_codegen_js::{APP_MODULE, EmitError, JsBundle, emit};
 use ostrel_core::{FileId, Span};
+use ostrel_ir::full::view::View;
 use ostrel_ir::full::{
     App, BinOp, Block, Const, Enum, EnumId, Field, FieldId, FieldMode, FieldRef, FnKind, FuncId,
     Function, ImplicitField, Inst, InstKind, Local, Merge, Model, ModelId, Placement, Program,
     Prologue, Registration, Terminator, Ty, UnOp, Var, ViewId,
 };
-use ostrel_ir::full::view::View;
 
 fn span(at: u32) -> Span {
     Span::new(FileId::from_raw(0), at, at + 1)
