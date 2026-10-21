@@ -124,7 +124,7 @@ pub trait WireSchema {
     /// The name of a server function, for writing.
     fn function_name(&self, function: FnId) -> Option<&str>;
     /// The wire types of the parameters of a server function, in declaration order. A model
-    /// parameter is a [`WireTy::Ref`].
+    /// parameter is a [`WireTy::Ref`] to that model.
     fn function_params(&self, function: FnId) -> Option<&[WireTy]>;
     /// The wire type of the result of a server function.
     fn function_result(&self, function: FnId) -> Option<&WireTy>;
@@ -226,6 +226,11 @@ pub enum WireError {
     /// failed with `OutcomeUnknown`; the client drops it (ARCHITECTURE 5.7). On writing a
     /// successful `return`, a defect of the caller.
     UnknownCall(CallId),
+    /// An `error` whose fields do not fit its code ([`ProtocolError::is_well_formed`]): a
+    /// `retry_after_ms` beside any code but `RateLimited`, a `RateLimited` without
+    /// subscription or delay, or a session code with a subscription. Fatal on reading; on
+    /// writing a defect of the caller.
+    IllFormedError(ErrorCode),
 }
 
 impl WireError {
@@ -262,14 +267,10 @@ impl WireError {
                 call: *call,
                 result: Err(error.clone()),
             },
-            WireError::InvalidQuery { sub, .. } => ServerMsg::Error(ProtocolError {
-                sub: Some(*sub),
-                code: self.code(),
-            }),
-            _ => ServerMsg::Error(ProtocolError {
-                sub: None,
-                code: self.code(),
-            }),
+            WireError::InvalidQuery { sub, .. } => {
+                ServerMsg::Error(ProtocolError::of_subscription(*sub, self.code()))
+            }
+            _ => ServerMsg::Error(ProtocolError::fatal(self.code())),
         }
     }
 }
@@ -331,6 +332,9 @@ impl fmt::Display for WireError {
             }
             WireError::UnknownSubscription(sub) => write!(f, "no subscription {sub}"),
             WireError::UnknownCall(call) => write!(f, "no call {call} is waiting"),
+            WireError::IllFormedError(code) => {
+                write!(f, "error fields do not fit the code {code:?}")
+            }
         }
     }
 }

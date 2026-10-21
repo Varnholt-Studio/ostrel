@@ -1,0 +1,14 @@
+// SPEC 12.10: `last 0` is valid (it gives no rows).
+app Golden
+
+data Post
+  pos: Int
+  text: Text
+  see if true
+  drop if true
+
+fn f()
+  for p in Post sort pos last 0
+    let x = 1
+  for p in Post limit 0
+    let y = 1

@@ -1,0 +1,1 @@
+tests/errors/style_comment_body_block_comment.ostl:3:1: error[E0028]: expected a declaration such as `fn main()`, found `/`

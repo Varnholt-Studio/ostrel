@@ -21,6 +21,7 @@ use std::fmt;
 
 mod bytecode;
 mod exec;
+pub mod float;
 pub mod host;
 mod output;
 pub mod url;
@@ -65,7 +66,7 @@ impl Default for Limits {
     }
 }
 
-/// The kinds of runtime error of v0.1 (ARCHITECTURE 3.4).
+/// The kinds of runtime error (ARCHITECTURE 3.4); `FloatOverflow` was added by D185.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeErrorKind {
     /// An `Int` result left [`ostrel_ir::INT_MIN`, `ostrel_ir::INT_MAX`] (D24).
@@ -83,6 +84,9 @@ pub enum RuntimeErrorKind {
     /// A `print` would bring the output of the run above 268435456 bytes, newlines
     /// included (D113). The limit is fixed; the refused `print` writes nothing.
     OutputLimit,
+    /// A `Float` result is not finite, for any reason other than a zero divisor of
+    /// `/` or `%`, which is `DivisionByZero` (D185, ARCHITECTURE 7.4).
+    FloatOverflow,
 }
 
 impl RuntimeErrorKind {
@@ -96,6 +100,7 @@ impl RuntimeErrorKind {
             RuntimeErrorKind::HeapLimit => "HeapLimit",
             RuntimeErrorKind::TextLimit => "TextLimit",
             RuntimeErrorKind::OutputLimit => "OutputLimit",
+            RuntimeErrorKind::FloatOverflow => "FloatOverflow",
         }
     }
 
@@ -115,6 +120,7 @@ impl RuntimeErrorKind {
             RuntimeErrorKind::HeapLimit => "VM heap would grow beyond 268435456 bytes",
             RuntimeErrorKind::TextLimit => "`Text` value would be longer than 16777216 bytes",
             RuntimeErrorKind::OutputLimit => "program output would exceed 268435456 bytes",
+            RuntimeErrorKind::FloatOverflow => "`Float` result is not a finite number",
         }
     }
 }
@@ -200,6 +206,7 @@ mod tests {
             RuntimeErrorKind::HeapLimit,
             RuntimeErrorKind::TextLimit,
             RuntimeErrorKind::OutputLimit,
+            RuntimeErrorKind::FloatOverflow,
         ]
         .iter()
         .map(ToString::to_string)
@@ -213,7 +220,8 @@ mod tests {
                 "StepLimit",
                 "HeapLimit",
                 "TextLimit",
-                "OutputLimit"
+                "OutputLimit",
+                "FloatOverflow"
             ]
         );
     }
@@ -228,6 +236,7 @@ mod tests {
             RuntimeErrorKind::HeapLimit,
             RuntimeErrorKind::TextLimit,
             RuntimeErrorKind::OutputLimit,
+            RuntimeErrorKind::FloatOverflow,
         ]
         .iter()
         .map(|kind| kind.message())
@@ -242,6 +251,7 @@ mod tests {
                 "VM heap would grow beyond 268435456 bytes",
                 "`Text` value would be longer than 16777216 bytes",
                 "program output would exceed 268435456 bytes",
+                "`Float` result is not a finite number",
             ]
         );
     }

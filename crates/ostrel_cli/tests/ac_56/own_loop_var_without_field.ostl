@@ -1,0 +1,13 @@
+// SPEC 12.10: a bare use of the own loop variable inside its own query is the rename
+// error, also without a field of that name and with an outer local of that name.
+app Golden
+
+data Post
+  pos: Int
+  text: Text
+  see if true
+  drop if true
+
+fn f(q: Int)
+  for q in Post where q == 1
+    let x = q

@@ -1,0 +1,2 @@
+tests/errors/style_comment_body_open.ostl:2:3: error[E0015]: unterminated `/*` comment in a `style` block; close it with `*/`
+tests/errors/style_comment_body_open.ostl:4:1: error[E0032]: unexpected indentation; only a block head such as `fn`, `if` or `else` opens a block

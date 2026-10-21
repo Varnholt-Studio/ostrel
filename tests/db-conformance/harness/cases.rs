@@ -1,7 +1,8 @@
 //! Decodes a case file (format 1, `tests/db-conformance/cases/README.md`) into driver calls.
 //!
-//! Format 1 grew the op log steps of D110 (`append_ops`, `reject`, `last_seq`, `replay`)
-//! without a new version number: they only add keys, every older file reads as before.
+//! Format 1 grew the op log steps of D110 (`append_ops`, `reject`, `last_seq`, `replay`) and of
+//! D154 (`ops_since`, the expectation `"rollback"`) without a new version number: they only add
+//! keys and values, every older file reads as before.
 //!
 //! Every key is checked: an unknown or missing key, a value that does not fit its field type,
 //! or an insert that does not set every field makes the whole file invalid. Decoding never
@@ -41,6 +42,8 @@ pub enum Action {
     LastSeq(ReplicaId),
     /// `Transaction::replay_outcome` in a transaction that is rolled back.
     Replay(OpId),
+    /// `Transaction::ops_since` after this position in a transaction that is rolled back.
+    OpsSince(ServerSeq),
 }
 
 /// One call inside a transaction step.
@@ -55,11 +58,16 @@ pub enum Call {
 
 pub enum Expect {
     Ok,
+    /// Every call succeeds, then the transaction is rolled back on purpose.
+    Rollback,
     /// A failure with this variant; the text of [`DbError::Invalid`] is not compared.
     Error(DbError),
     Rows(Vec<Row>),
     LastSeq(u32),
     Outcome(Option<ReplayOutcome>),
+    /// The ops of the log in position order. Positions are not compared, only their order: a
+    /// position of a rolled back transaction may be given again or left out (D154).
+    Log(Vec<NewOp>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -189,6 +197,7 @@ fn decode_step(json: &Json, schema: &[Model]) -> Result<Step> {
         }
         let expect = match get(&s, "expect") {
             Json::String(s) if s == "ok" => Expect::Ok,
+            Json::String(s) if s == "rollback" => Expect::Rollback,
             e @ Json::Object(_) => {
                 let e = object(e, &["error"], &[], "expect")?;
                 Expect::Error(match string(get(&e, "error"), "expect.error")? {
@@ -199,7 +208,7 @@ fn decode_step(json: &Json, schema: &[Model]) -> Result<Step> {
                     other => return Err(format!("expect.error: unknown error {other:?}")),
                 })
             }
-            _ => return Err("expect: \"ok\" or {\"error\": ...}".to_string()),
+            _ => return Err("expect: \"ok\", \"rollback\" or {\"error\": ...}".to_string()),
         };
         Ok(Step {
             action: Action::Tx(calls),
@@ -213,6 +222,17 @@ fn decode_step(json: &Json, schema: &[Model]) -> Result<Step> {
         Ok(Step {
             action: Action::LastSeq(replica),
             expect: Expect::LastSeq(want),
+        })
+    } else if members.iter().any(|(k, _)| k == "ops_since") {
+        let s = object(json, &["ops_since", "expect"], &[], "step")?;
+        let after = ServerSeq(number(get(&s, "ops_since"), "ops_since")?);
+        let mut ops = Vec::new();
+        for (i, o) in array(get(&s, "expect"), "expect")?.iter().enumerate() {
+            ops.push(decode_op(o, schema).map_err(|e| format!("expect[{i}].{e}"))?);
+        }
+        Ok(Step {
+            action: Action::OpsSince(after),
+            expect: Expect::Log(ops),
         })
     } else if members.iter().any(|(k, _)| k == "replay") {
         let s = object(json, &["replay", "expect"], &[], "step")?;

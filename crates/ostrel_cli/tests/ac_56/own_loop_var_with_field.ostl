@@ -1,0 +1,12 @@
+// SPEC 12.10: the loop variable of a `for` counts as a local in scope at its own query.
+app Golden
+
+data Post
+  pos: Int
+  text: Text
+  see if true
+  drop if true
+
+fn f()
+  for pos in Post where pos == 1
+    let x = 1

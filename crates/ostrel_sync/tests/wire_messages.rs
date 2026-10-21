@@ -37,16 +37,16 @@ fn fields(model: ModelId) -> &'static [(&'static str, WireTy)] {
             vec![
                 ("name", Text),
                 ("topic", Optional(Box::new(Text))),
-                ("owner", Ref),
-                ("members", Set(Box::new(Ref))),
-                ("roles", Map(Box::new(Ref), Box::new(level))),
+                ("owner", Ref(PERSON)),
+                ("members", Set(Box::new(Ref(PERSON)))),
+                ("roles", Map(Box::new(Ref(PERSON)), Box::new(level))),
                 ("made", Time),
                 ("size", Int),
                 ("keys", List(Box::new(Int))),
             ],
             vec![
                 ("handle", Text),
-                ("home", Optional(Box::new(Ref))),
+                ("home", Optional(Box::new(Ref(ROOM)))),
                 ("age", Int),
             ],
         ]
@@ -61,7 +61,11 @@ fn functions() -> &'static [(&'static str, Vec<WireTy>, WireTy)] {
     static FUNCTIONS: OnceLock<Vec<(&'static str, Vec<WireTy>, WireTy)>> = OnceLock::new();
     FUNCTIONS.get_or_init(|| {
         vec![
-            ("rename", vec![WireTy::Ref, WireTy::Text], WireTy::Bool),
+            (
+                "rename",
+                vec![WireTy::Ref(ROOM), WireTy::Text],
+                WireTy::Bool,
+            ),
             ("count", vec![], WireTy::Int),
             ("names", vec![], WireTy::List(Box::new(WireTy::Text))),
         ]
@@ -317,6 +321,36 @@ fn subscribe_travels_with_names_in_canonical_form() {
     );
 }
 
+/// A hop follows a reference to the model it names, also through an optional reference, and
+/// the hop and the typed `row_id` survive a round trip (D165).
+#[test]
+fn a_hop_follows_its_reference_to_the_named_model() {
+    let home = Hop {
+        field: field(PERSON, "home"),
+        model: ROOM,
+    };
+    let owner = Hop {
+        field: field(ROOM, "owner"),
+        model: PERSON,
+    };
+    let query = Query {
+        model: PERSON,
+        filter: Some(Expr::Cmp(
+            CmpOp::Eq,
+            Box::new(Expr::RowId(vec![home, owner])),
+            Box::new(Expr::Const(Value::Ref(row(7)))),
+        )),
+        order: Vec::new(),
+        limit: None,
+        after: None,
+    };
+    let frame = client_round_trip(ClientMsg::Subscribe { sub: 5, query });
+    assert!(
+        frame.contains(r#"[["home","Room"],["owner","Person"]]"#),
+        "{frame}"
+    );
+}
+
 /// A `subscribe` frame for subscription 4 with `query` as its query text.
 fn subscribe(query: &str) -> String {
     format!(r#"{{"query":{query},"sub":4,"t":"subscribe","v":0}}"#)
@@ -383,6 +417,22 @@ fn a_query_that_does_not_fit_answers_only_its_subscription() {
             room_filter(r#"{"row_id":[["owner","Gone"]]}"#),
             QueryFault::UnknownModel("Gone".into()),
         ),
+        // `owner` refers to `Person`; a hop that names `Room` would read the wrong rows (D165).
+        (
+            room_filter(r#"{"row_id":[["owner","Room"]]}"#),
+            QueryFault::WrongField("owner".into()),
+        ),
+        (
+            room_filter(
+                r#"{"cmp":["eq",{"field":{"field":"handle","hops":[["owner","Room"]]}},{"const":"x"}]}"#,
+            ),
+            QueryFault::WrongField("owner".into()),
+        ),
+        // The second hop of a valid first hop is checked against its own target.
+        (
+            room_filter(r#"{"row_id":[["owner","Person"],["home","Person"]]}"#),
+            QueryFault::WrongField("home".into()),
+        ),
         (
             subscribe(
                 r#"{"after":{"id":"00000000000000000000000000000001","values":[]},"filter":null,"limit":null,"model":"Room","order":[["name","asc"]]}"#,
@@ -424,10 +474,7 @@ fn a_query_that_does_not_fit_answers_only_its_subscription() {
         assert!(!error.closes_connection());
         assert_eq!(
             error.reply(),
-            ServerMsg::Error(ProtocolError {
-                sub: Some(4),
-                code: ErrorCode::Protocol
-            })
+            ServerMsg::Error(ProtocolError::of_subscription(4, ErrorCode::Protocol))
         );
     }
 }
@@ -456,10 +503,7 @@ fn a_filter_over_the_node_limit_is_filter_too_large() {
     assert_eq!(error.code(), ErrorCode::FilterTooLarge);
     assert_eq!(
         error.reply(),
-        ServerMsg::Error(ProtocolError {
-            sub: Some(4),
-            code: ErrorCode::FilterTooLarge
-        })
+        ServerMsg::Error(ProtocolError::of_subscription(4, ErrorCode::FilterTooLarge))
     );
 }
 

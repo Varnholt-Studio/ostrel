@@ -23,7 +23,9 @@
 //! | `map_get` | `[path, key]` |
 //! | `coalesce` | `[e, {"const": value}]` |
 //!
-//! A hop names a reference field of the current model and the model it points to. A constant
+//! A hop names a reference field of the current model and the model it points to; a field that
+//! is no reference, or one whose target is another model, is [`QueryFault::WrongField`]
+//! (D165). An optional reference is a valid hop. A constant
 //! has no type of its own on the wire; it takes the type of its place: the other side of a
 //! `cmp`, the element type of the `Set` of an `in_set`, the key type of the `Map` of an
 //! `in_map` or `map_get`, the type of the first operand of a `coalesce`, and `Bool` where a
@@ -60,7 +62,7 @@ pub enum QueryFault {
     /// The model has no field of this name (cut to [`super::MAX_ECHO_BYTES`]).
     UnknownField(String),
     /// This field stands where its type does not fit: a hop through a field that is not a
-    /// reference, an `in_set` on a field that is not a `Set`, or an `in_map` or `map_get` on
+    /// reference or that refers to another model than the hop names, an `in_set` on a field that is not a `Set`, or an `in_map` or `map_get` on
     /// one that is not a `Map` (cut to [`super::MAX_ECHO_BYTES`]).
     WrongField(String),
     /// A constant does not fit the type of its place.
@@ -235,8 +237,8 @@ impl Reader<'_> {
                 (Expr::Field(path), Some(ty))
             }
             "row_id" => {
-                let (hops, _) = self.hops(body, model)?;
-                (Expr::RowId(hops), Some(WireTy::Ref))
+                let (hops, end) = self.hops(body, model)?;
+                (Expr::RowId(hops), Some(WireTy::Ref(end)))
             }
             "cmp" => {
                 let [op, a, b] = triple(body, "cmp")?;
@@ -333,10 +335,13 @@ impl Reader<'_> {
             let [field, target] = pair(item, "hops")?;
             let name = string("hops", field)?;
             let (field, ty) = self.field(current, &name)?;
-            if *bare(&ty) != WireTy::Ref {
+            let named = self.model(&string("hops", target)?)?;
+            // The hop must follow the reference to the model it names (D165); a hop that
+            // names another model would read rows of the wrong table.
+            if *bare(&ty) != WireTy::Ref(named) {
                 return Err(QueryFault::WrongField(clip(&name)));
             }
-            current = self.model(&string("hops", target)?)?;
+            current = named;
             hops.push(Hop {
                 field,
                 model: current,

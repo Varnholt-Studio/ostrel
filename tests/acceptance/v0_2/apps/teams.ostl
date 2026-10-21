@@ -1,0 +1,45 @@
+// Fixture app of the rule bypass suite (AC-11, AC-31, AC-32, AC-54).
+// Teams own tasks. Only members of a team see its tasks, a task names its owner, only the
+// owner renames it, and only an admin of the team drops an unlocked task. Three server
+// functions cover the call paths: with a call rule, without one, and elevated.
+
+app Teams
+  auth paseto open
+
+enum Role = guest | member | admin
+
+data Team
+  name: Text
+  roles: Map[User, Role] = [me: admin]
+  check name.len in 1..80
+  see if me in roles
+  make if roles == [me: admin]
+  edit name if roles[me] == admin
+  edit roles if roles[me] == admin
+
+data Task
+  team: Team fixed
+  title: Text
+  owner: User
+  locked: Bool = false
+  check title.len in 1..200
+  see if me in team.roles
+  make if owner == me and (team.roles[me] ?? guest) >= member
+  edit title if owner == me
+  drop if team.roles[me] == admin and not locked
+
+server fn clearTasks(t: Team)
+  call if t.roles[me] == admin
+  drop Task where team == t
+
+server fn purgeTasks(t: Team)
+  drop Task where team == t
+
+server fn archiveTeam(t: Team) as system
+  call if t.roles[me] == admin
+  drop Task where team == t
+
+view Main
+  col
+    for t in Team sort name
+      text t.name

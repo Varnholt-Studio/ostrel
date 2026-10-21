@@ -1,0 +1,12 @@
+// SPEC 12.10: a local that names no field may stand in `n`.
+app Golden
+
+data Post
+  pos: Int
+  text: Text
+  see if true
+  drop if true
+
+fn f(n: Int)
+  for p in Post sort pos last n
+    let x = 1

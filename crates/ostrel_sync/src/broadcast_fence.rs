@@ -1,37 +1,61 @@
-//! Broadcast queue of one server process (ARCHITECTURE 5.6, D126).
+//! Broadcast queue of one server process (ARCHITECTURE 5.4, 5.6, D126, D156 to D162).
 //!
-//! Row writers serialise writes, never sends. Two commits under different row writers can
-//! finish in any order, so a commit that holds a later log position may be ready before an
-//! earlier one. If the later commit were sent at once, its `see` filter would run against a
-//! state that misses the earlier commit: a revocation at position k would not yet filter a
-//! message at m > k, and the revoked reader would receive it (finding F10 of the T125 review).
+//! The write lock of the process (D156) serialises writes, never sends. The `see` filter of an
+//! op must run against a state that contains every commit up to the op's commit: if it ran
+//! earlier, a revocation at position k would not yet filter a message at m > k, and the revoked
+//! reader would receive it (finding F10 of the T125 review).
 //!
-//! [`BroadcastFence`] closes that gap. It releases commits strictly in [`ServerSeq`] order and
-//! holds every commit whose earlier positions are not all known yet. For each released commit
-//! it
+//! [`BroadcastFence`] releases commits strictly in [`ServerSeq`] order. For each released
+//! commit it
 //!
 //! 1. asks the [`CommittedScope`] for the subscriptions whose rows left the reader's scope and
 //!    emits their `Evict` pages (or `Reset`) before anything else,
-//! 2. then evaluates the `see` filter of every op of the commit, when it leaves the queue,
-//!    against committed state that contains every commit up to the commit's last position,
-//!    and emits one `Ops` message per admitted session.
+//! 2. then evaluates the `see` filter of every op of the commit against committed state that
+//!    contains every commit up to the commit's **last** position, also for an op that lies
+//!    earlier in the same commit, and emits one `Ops` message per admitted session.
 //!
-//! A revocation at k < m therefore always filters m. An op at m < k was visible when it was
-//! committed and may be sent; when k committed before m left the queue, the committed state
-//! already contains k and m is filtered as well, which never shows a reader more than D126
-//! allows.
+//! A revocation at k < m therefore always filters m, also when both lie in one commit. An op
+//! at m < k in an earlier commit was visible when it was committed and may be sent; when k
+//! committed before m left the queue, the committed state already contains k and m is filtered
+//! as well, which never shows a reader more than D126 allows.
 //!
-//! Commits reach the fence from the log section of the process (ARCHITECTURE 5.4, D154): a
-//! transaction calls `append_ops`, commits and pushes the range `next()..=last`, from
+//! # Where commits come from
+//!
+//! A write transaction holds the write lock from before `begin` until it has pushed its commit
+//! here and queued its outcomes (D156). A commit pushes the range `next()..=last`, from
 //! [`BroadcastFence::next`] to the last position `append_ops` returned. A transaction that rolls
 //! back pushes nothing. The positions it allocated are given again to the next transaction
 //! (memory, SQLite) or stay a gap (PostgreSQL); either way the next commit's range starts at
 //! `next()` and covers them as positions without an op. Pushing a rolled back range would be
 //! wrong: a reused position would then be refused as released and its op never sent live.
 //!
-//! The fence sends nothing itself; it returns the messages in the order they must be written to
-//! the sessions. Splitting an `Ops` message into frames (D121) is the job of the encoder, which
-//! keeps the order. Rows that entered a scope (`Snapshot` rows, 5.6) are not handled here.
+//! Under the write lock commits arrive in order, so [`BroadcastFence::held`] stays zero in a
+//! server process. The fence still holds a commit that arrives before an earlier one and
+//! refuses overlapping or released ranges ([`FenceError`]), so a defect in the caller shows as
+//! an error instead of a reader that sees an op its scope no longer admits.
+//!
+//! # What the caller does with the messages
+//!
+//! The fence sends nothing itself; it returns the messages in the order they must be queued to
+//! the sessions. Under D162 the broadcast queue never waits for room in a send queue: the caller
+//! queues every returned message, the `Evict` pages and `Reset` of scope re-evaluation included,
+//! at once. They count to the session's send queue (8 MiB, ARCHITECTURE 5.9); if one would push
+//! it over the limit, that session gets the fatal `Error Overloaded` and is closed, and no other
+//! session waits for it. Splitting an `Ops` message into frames (D121) is the job of the encoder,
+//! which keeps the order.
+//!
+//! # Bound and memory (D162, kira #2376)
+//!
+//! The broadcast queue holds at most 1 024 commits not yet released; a task waits before it
+//! takes the write lock while the queue is full. That bound is counted by the caller, which owns
+//! the queue between the write lock and [`BroadcastFence::push`], not by this type. It bounds
+//! memory only when a queued entry holds the commit's positions and not its op bodies: one
+//! commit can carry a batch of up to 1 MiB or a bulk write of far more. The caller therefore
+//! queues `first..=last` and builds the [`Commit`] when it releases it, reading its ops one page
+//! per read transaction on the read connection.
+//!
+//! Rows that enter a scope are waiting rows and reach the client as `Snapshot` rows through
+//! closures (ARCHITECTURE 5.4); they are not handled here.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -50,7 +74,8 @@ pub struct Commit {
     pub ops: Vec<LoggedOp>,
 }
 
-/// A subscription that lost rows through a commit.
+/// A subscription that lost rows through a commit. Its messages never wait for room in the
+/// session's send queue (D162).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScopeExit<S> {
     /// Rows of `model` that left the reader's scope or were deleted. The fence splits them
@@ -510,6 +535,81 @@ mod tests {
         );
         assert_eq!(seqs_to(&sent, BOB), vec![1]);
         assert_eq!(evicts_to(&sent, BOB).len(), 1);
+    }
+
+    /// Committed state that keeps its history by position, so a reader query sees exactly the
+    /// state up to the `upto` it is asked for, as a read at that position would.
+    struct History {
+        /// Position of the revocation of each removed member.
+        removed_at: BTreeMap<u8, u64>,
+        members: Vec<u8>,
+        held: BTreeMap<u8, Vec<RowId>>,
+    }
+
+    impl CommittedScope for History {
+        type Session = u8;
+
+        fn scope_exits(&mut self, commit: &Commit) -> Vec<ScopeExit<u8>> {
+            let mut exits = Vec::new();
+            for logged in &commit.ops {
+                if let OpBody::SetRemove { elem, .. } = &logged.op.body {
+                    let who = self.members.iter().copied().find(|m| member(*m) == *elem);
+                    if let Some(who) = who {
+                        self.removed_at.insert(who, logged.seq.0);
+                        exits.push(ScopeExit::Evict {
+                            session: who,
+                            sub: 7,
+                            model: MESSAGE,
+                            rows: self.held.remove(&who).unwrap_or_default(),
+                        });
+                    }
+                }
+            }
+            exits
+        }
+
+        fn readers(&self, op: &LoggedOp, upto: ServerSeq) -> Vec<u8> {
+            let author = u8::try_from(op.op.id.replica.0).unwrap();
+            self.members
+                .iter()
+                .copied()
+                .filter(|s| *s != author)
+                .filter(|s| self.removed_at.get(s).is_none_or(|at| *at > upto.0))
+                .collect()
+        }
+    }
+
+    /// One commit holds a message at 1 and the revocation of Bob at 2 (a server fn that posts
+    /// and then removes a member, or a batch). The filter of the message must run against the
+    /// state up to the commit's last position: evaluated at the op's own position, Bob would
+    /// be admitted and get a row after the `Evict` that left him without the room
+    /// (dana #2072 (1)).
+    #[test]
+    fn an_op_is_filtered_at_the_last_position_of_its_commit() {
+        let body = OpBody::SetRemove {
+            field: MEMBERS,
+            elem: member(BOB),
+            tags: vec![],
+        };
+        let commit = Commit {
+            first: ServerSeq(1),
+            last: ServerSeq(2),
+            ops: vec![
+                logged(1, CARA, MESSAGE, row(1), OpBody::Make { fields: vec![] }),
+                logged(2, ALICE, ROOM, row(0), body),
+            ],
+        };
+        let mut scope = History {
+            removed_at: BTreeMap::new(),
+            members: vec![ALICE, BOB, CARA],
+            held: BTreeMap::from([(BOB, vec![row(0)])]),
+        };
+        let mut fence = BroadcastFence::new(ServerSeq(1), 1_000);
+        let sent = fence.push(commit, &mut scope).unwrap();
+        assert_eq!(seqs_to(&sent, BOB), Vec::<u64>::new());
+        assert_eq!(evicts_to(&sent, BOB), vec![0]);
+        assert_eq!(seqs_to(&sent, ALICE), vec![1]);
+        assert_eq!(seqs_to(&sent, CARA), vec![2]);
     }
 
     #[test]

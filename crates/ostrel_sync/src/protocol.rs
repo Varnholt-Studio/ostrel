@@ -409,6 +409,50 @@ pub enum CallError {
 pub struct ProtocolError {
     pub sub: Option<SubId>,
     pub code: ErrorCode,
+    /// Delay before the client subscribes again; set exactly for
+    /// [`ErrorCode::RateLimited`] (D159).
+    pub retry_after_ms: Option<u32>,
+}
+
+impl ProtocolError {
+    /// A fatal error: the server closes the connection after it.
+    pub fn fatal(code: ErrorCode) -> Self {
+        ProtocolError {
+            sub: None,
+            code,
+            retry_after_ms: None,
+        }
+    }
+
+    /// An error that ends only the subscription `sub`.
+    pub fn of_subscription(sub: SubId, code: ErrorCode) -> Self {
+        ProtocolError {
+            sub: Some(sub),
+            code,
+            retry_after_ms: None,
+        }
+    }
+
+    /// The answer to a `Subscribe` over the rate of its principal (ARCHITECTURE 5.9, D159):
+    /// the client subscribes again after `retry_after_ms` with a new subscription id (D155).
+    pub fn rate_limited(sub: SubId, retry_after_ms: u32) -> Self {
+        ProtocolError {
+            sub: Some(sub),
+            code: ErrorCode::RateLimited,
+            retry_after_ms: Some(retry_after_ms),
+        }
+    }
+
+    /// Whether the fields fit the code. [`ErrorCode::RateLimited`] names its subscription and
+    /// carries `retry_after_ms`; no other code carries `retry_after_ms`. The session codes
+    /// ([`ErrorCode::is_session_fatal`]) never name a subscription.
+    pub fn is_well_formed(&self) -> bool {
+        match self.code {
+            ErrorCode::RateLimited => self.sub.is_some() && self.retry_after_ms.is_some(),
+            code if code.is_session_fatal() => self.sub.is_none() && self.retry_after_ms.is_none(),
+            _ => self.retry_after_ms.is_none(),
+        }
+    }
 }
 
 /// Cause of a [`ProtocolError`].
@@ -431,6 +475,46 @@ pub enum ErrorCode {
     FilterTooLarge,
     /// Filter or sort names a field the client may not read (D101).
     FilterNotReadable,
+    /// A newer accepted [`Hello`] named the replica of this session; only one session per
+    /// replica is open (ARCHITECTURE 5.4, 5.9, D156, D158 (2)). Fatal. A refused `Hello`
+    /// never closes another session.
+    Superseded,
+    /// A [`Hello`] over the open sessions per principal, in an app without `auth` per IP
+    /// (ARCHITECTURE 5.9, D156, D159). Fatal. A superseding `Hello` does not count.
+    TooManySessions,
+    /// The live ops, outcomes, `Evict` or `Reset` queued for this session would push its send
+    /// queue over its limit; the frames not yet written are dropped and the session closes.
+    /// The client reconnects and catches up (ARCHITECTURE 5.4, 5.9, D158 (1), D162). Fatal.
+    Overloaded,
+    /// A [`ClientMsg::Subscribe`] over the rate of its principal; it carries the subscription
+    /// id and [`ProtocolError::retry_after_ms`] (ARCHITECTURE 5.9, D159). Only that
+    /// subscription failed.
+    RateLimited,
+}
+
+impl ErrorCode {
+    /// Every code, in declaration order.
+    pub const ALL: [ErrorCode; 11] = [
+        ErrorCode::Protocol,
+        ErrorCode::FrameTooLarge,
+        ErrorCode::Unauthorized,
+        ErrorCode::ReplicaExpired,
+        ErrorCode::TooManySubscriptions,
+        ErrorCode::FilterTooLarge,
+        ErrorCode::FilterNotReadable,
+        ErrorCode::Superseded,
+        ErrorCode::TooManySessions,
+        ErrorCode::Overloaded,
+        ErrorCode::RateLimited,
+    ];
+
+    /// The codes that end a whole session and never name a subscription (D156, D158).
+    pub fn is_session_fatal(self) -> bool {
+        matches!(
+            self,
+            ErrorCode::Superseded | ErrorCode::TooManySessions | ErrorCode::Overloaded
+        )
+    }
 }
 
 impl ClientMsg {
@@ -680,10 +764,7 @@ mod tests {
                 call: 1,
                 result: Err(CallError::NotFound),
             },
-            ServerMsg::Error(ProtocolError {
-                sub: None,
-                code: ErrorCode::Protocol,
-            }),
+            ServerMsg::Error(ProtocolError::fatal(ErrorCode::Protocol)),
         ];
         let mut c: Vec<_> = client.iter().map(ClientMsg::name).collect();
         let mut s: Vec<_> = server.iter().map(ServerMsg::name).collect();
@@ -693,5 +774,63 @@ mod tests {
         s.dedup();
         assert_eq!(c.len(), client.len());
         assert_eq!(s.len(), server.len());
+    }
+    #[test]
+    fn error_codes_of_d156_to_d159_exist_once() {
+        let names: Vec<_> = ErrorCode::ALL.iter().map(|c| format!("{c:?}")).collect();
+        for code in ["Superseded", "TooManySessions", "Overloaded", "RateLimited"] {
+            assert_eq!(names.iter().filter(|n| *n == code).count(), 1, "{code}");
+        }
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ErrorCode::ALL.len());
+    }
+
+    #[test]
+    fn only_rate_limited_carries_a_retry_delay() {
+        assert!(ProtocolError::rate_limited(3, 250).is_well_formed());
+        for code in ErrorCode::ALL {
+            let with_delay = ProtocolError {
+                sub: Some(3),
+                code,
+                retry_after_ms: Some(250),
+            };
+            assert_eq!(
+                with_delay.is_well_formed(),
+                code == ErrorCode::RateLimited,
+                "{code:?}"
+            );
+            if code != ErrorCode::RateLimited {
+                assert!(ProtocolError::fatal(code).is_well_formed(), "{code:?}");
+            }
+        }
+        // RateLimited without its subscription or without its delay is not a valid error.
+        let no_sub = ProtocolError {
+            sub: None,
+            ..ProtocolError::rate_limited(3, 250)
+        };
+        let no_delay = ProtocolError {
+            retry_after_ms: None,
+            ..ProtocolError::rate_limited(3, 250)
+        };
+        assert!(!no_sub.is_well_formed());
+        assert!(!no_delay.is_well_formed());
+    }
+
+    #[test]
+    fn session_codes_never_name_a_subscription() {
+        let fatal = [
+            ErrorCode::Superseded,
+            ErrorCode::TooManySessions,
+            ErrorCode::Overloaded,
+        ];
+        for code in ErrorCode::ALL {
+            assert_eq!(code.is_session_fatal(), fatal.contains(&code), "{code:?}");
+        }
+        for code in fatal {
+            assert!(ProtocolError::fatal(code).is_well_formed());
+            assert!(!ProtocolError::of_subscription(1, code).is_well_formed());
+        }
     }
 }

@@ -1,0 +1,283 @@
+{
+  "ac": "AC-57",
+  "fixture": "notes_open",
+  "cases": [
+    {
+      "name": "ac_57_own_replica_with_secret",
+      "covers": "control",
+      "kind": "session",
+      "verdict": "allow",
+      "as": "s1",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "hello",
+            "token": null,
+            "replica": "$replica:s1",
+            "replica_secret": "$secret:s1",
+            "last_server_seq": null
+          },
+          "expect": [
+            {
+              "welcome": {
+                "replica": "$replica:s1"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged"
+    },
+    {
+      "name": "ac_57_foreign_replica_from_logged_op",
+      "covers": "foreign_replica",
+      "kind": "session",
+      "verdict": "deny",
+      "as": "s2",
+      "source": "SPEC 5.0 AC-57 (b), D111: s2 takes the replica from the logged make of n1, which it received as a subscriber; no Welcome is sent",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "hello",
+            "token": null,
+            "replica": "$loggedreplica:n1",
+            "replica_secret": "$secret:s2",
+            "last_server_seq": null
+          },
+          "expect": [
+            {
+              "error": "Unauthorized",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_57_own_replica_with_secret"
+    },
+    {
+      "name": "ac_57_foreign_replica_without_secret",
+      "covers": "foreign_replica",
+      "kind": "session",
+      "verdict": "deny",
+      "as": "s2",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "hello",
+            "token": null,
+            "replica": "$loggedreplica:n1",
+            "replica_secret": null,
+            "last_server_seq": null
+          },
+          "expect": [
+            {
+              "error": "Unauthorized",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_57_own_replica_with_secret"
+    },
+    {
+      "name": "ac_57_secret_without_replica",
+      "covers": "foreign_replica",
+      "kind": "session",
+      "verdict": "deny",
+      "as": "s1",
+      "source": "D122",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "hello",
+            "token": null,
+            "replica": null,
+            "replica_secret": "$secret:s1",
+            "last_server_seq": null
+          },
+          "expect": [
+            {
+              "error": "Protocol",
+              "fatal": true
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_57_own_replica_with_secret"
+    },
+    {
+      "name": "ac_57_seq_gap_is_forged",
+      "covers": "order",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "s1",
+      "source": "D110",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op+2",
+                "hlc": "$hlc",
+                "model": "Note",
+                "row": "$newrow:x",
+                "body": {
+                  "make": {
+                    "title": "Second",
+                    "body": "",
+                    "pinned": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Forged",
+              "op": "$op+2"
+            }
+          ]
+        },
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Note",
+                "row": "$newrow:y",
+                "body": {
+                  "make": {
+                    "title": "Second",
+                    "body": "",
+                    "pinned": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ],
+          "note": "last_seq did not move, so the next contiguous op is processed"
+        }
+      ],
+      "db": {
+        "expect": "only Note y is new"
+      },
+      "partial": true,
+      "control": "ac_57_replay_gets_original_outcome"
+    },
+    {
+      "name": "ac_57_replay_gets_original_outcome",
+      "covers": "order",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "s1",
+      "source": "D110, D120",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Note",
+                "row": "$newrow:z",
+                "body": {
+                  "make": {
+                    "title": "Second",
+                    "body": "",
+                    "pinned": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        },
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op-1",
+                "hlc": "$hlc",
+                "model": "Note",
+                "row": "$row:z",
+                "body": {
+                  "make": {
+                    "title": "Second",
+                    "body": "",
+                    "pinned": false
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op-1"
+            }
+          ],
+          "note": "The same op again: Ack with its logged ServerSeq and accepted stamp, no second row"
+        }
+      ],
+      "db": {
+        "expect": "exactly one new Note z"
+      }
+    },
+    {
+      "name": "ac_57_offline_300_ops_all_accepted",
+      "covers": "honest_outbox",
+      "kind": "scenario",
+      "verdict": "allow",
+      "as": "s1",
+      "source": "SPEC 5.0 AC-57 (a), D108",
+      "steps": [
+        {
+          "send_generated": {
+            "kind": "offline_outbox",
+            "model": "Note",
+            "ops": 300,
+            "fields": {
+              "title": "Second",
+              "body": "",
+              "pinned": false
+            }
+          },
+          "expect": [
+            {
+              "all_acked": 300,
+              "rejects": 0
+            }
+          ],
+          "note": "An honest client queues 300 makes offline and drains them after reconnect in batches of at most 200; Defer answers are followed by a resend after retry_after_ms"
+        }
+      ],
+      "db": {
+        "expect": "300 new Note rows"
+      }
+    }
+  ]
+}

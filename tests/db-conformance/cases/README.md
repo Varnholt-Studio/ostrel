@@ -7,6 +7,7 @@ expectation fails in the gate before any adapter exists.
 
 | File | AC | Covers |
 |---|---|---|
+| `ac_10_positions.json` | AC-10 | position contract of `append_ops` (D154): positions increase within a call and from one commit to the next, a committed position is never given again, a rolled back transaction leaves no op in the log (its positions may be given again or left out) |
 | `ac_10_replay.json` | AC-10 | final outcomes of ops (D110): replay after a lost ack or a lost reject returns the first outcome, an op id has one outcome only, `last_seq` per replica only grows and rolls back with its transaction, reject reason rules |
 | `ac_31_no_upsert.json` | AC-31 | insert of an existing or deleted id, in the same or another model, fails and changes nothing; update and delete never create or resurrect a row |
 | `ac_37_injection.json` | AC-37 | SQL and query metacharacters, NUL, U+0001, Unicode edge cases and 1 MiB strings round trip through insert and update in every field; Text order is code point order (D50, D55) |
@@ -24,6 +25,8 @@ every other character is written as a JSON escape.
 * A step is either a transaction or a query:
   * `{"tx": [write, ...], "expect": "ok"}`: begin, apply the writes in order, commit. Every call
     must succeed.
+  * `{"tx": [write, ...], "expect": "rollback"}`: begin, apply the writes in order, roll back.
+    Every call must succeed.
   * `{"tx": [write, ...], "expect": {"error": "Conflict"}}`: begin, apply the writes in order; one
     of them must fail with that `DbError` variant (`Conflict`, `VersionMismatch` or `NotFound`);
     then roll back.
@@ -32,6 +35,11 @@ every other character is written as a JSON escape.
   * `{"replay": {"replica", "seq"}, "expect": outcome}`: begin, `Transaction::replay_outcome`,
     roll back. `outcome` is `null` (no final outcome), `{"rejected": "<reason>"}` or
     `{"accepted": {"position": n, "op": op}}` with the log position and the stored op.
+  * `{"ops_since": n, "expect": [op, ...]}`: begin, `Transaction::ops_since` after position `n`
+    (at most 1000 ops), roll back. The result must hold exactly these ops in this order, with
+    positions above `n` that strictly increase. The position values are not compared, because
+    a rolled back position may be given again or be left out (D154); use `0` unless the case
+    fixes the positions by other means.
   * `{"query": {"model", "order", "limit"}, "expect": [row, ...]}`: `Connection::query` on
     committed state. `order` is a list of `[FieldId, "asc" | "desc"]`, `limit` a number or `null`.
     The result must equal the expected rows in order.
@@ -51,7 +59,14 @@ every other character is written as a JSON escape.
   2^53 - 1 in magnitude, ARCHITECTURE 7.4), `{"text": "..."}`, or
   `{"text_repeat": ["<unit>", count]}` for the unit repeated `count` times.
 
+The harness adds the built in case `ac_10_commit_error_is_final` (outcome contract of `commit`,
+D156), see `../harness/README.md`.
+
 ## Not covered yet
+
+PostgreSQL specific parts of the contract are checked by the PostgreSQL adapter's own tests
+when it exists (D156, D159): the op log sequence is declared with `CACHE 1`, and opening the
+database for a server process ends every other backend of the app's `application_name`.
 
 Equality filters on Text (D55) need `Query.filter`, which comes with the query IR; `Float`, time,
 bytes, references, `Set` and `Map` values need the `ostrel_core` value type. Both extend these

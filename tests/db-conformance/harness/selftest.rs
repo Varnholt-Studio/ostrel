@@ -43,6 +43,25 @@ struct Faults {
     forget_last_seq: bool,
     /// `record_reject` of an op that already has an outcome replaces it.
     overwrite_outcome: bool,
+    /// `append_ops` numbers the ops of a call from 1 again, so it gives committed positions
+    /// again.
+    reuse_position: bool,
+    /// A rolled back transaction leaves a gap of ten positions, as a sequence that is not
+    /// rolled back does. The position contract allows it (D154).
+    gap_after_rollback: bool,
+    /// `ops_since` returns the log in reverse position order.
+    reverse_log: bool,
+    /// `append_ops` returns the position of its last op plus 7.
+    append_result_off: bool,
+    /// `append_ops` without ops returns `ServerSeq(0)` instead of the last position.
+    empty_append_zero: bool,
+    /// After a failed call, `commit` gives `Err` and leaves nothing behind. Conforms.
+    refuse_after_error: bool,
+    /// After a failed call, `commit` gives `Err` but stores the transaction.
+    commit_error_applies: bool,
+    /// After a failed call, `commit` gives `Err`, and the ops of the transaction enter the log
+    /// with the next commit on the connection, as a late `COMMIT` of a lost backend would.
+    commit_error_applies_later: bool,
 }
 
 #[derive(Clone)]
@@ -61,6 +80,9 @@ struct Log {
     ops: Vec<StoredOp>,
     rejects: BTreeMap<OpId, String>,
     last: BTreeMap<ReplicaId, u32>,
+    /// Positions handed out so far, committed or not. Only kept apart from `ops` when
+    /// `gap_after_rollback` is set; otherwise a rolled back position is given again.
+    issued: u64,
 }
 
 impl Log {
@@ -88,8 +110,15 @@ impl Log {
                 return Err(DbError::Conflict);
             }
         }
-        for op in ops {
-            let seq = ServerSeq(self.ops.len() as u64 + 1);
+        let base = if faults.reuse_position {
+            0
+        } else if faults.gap_after_rollback {
+            self.issued
+        } else {
+            self.ops.last().map_or(0, |o| o.seq.0)
+        };
+        for (i, op) in ops.iter().enumerate() {
+            let seq = ServerSeq(base + i as u64 + 1);
             self.ops.push(StoredOp {
                 seq,
                 op: op.clone(),
@@ -98,7 +127,18 @@ impl Log {
                 self.raise(op.id);
             }
         }
-        Ok(ServerSeq(self.ops.len() as u64))
+        self.issued = self.issued.max(base + ops.len() as u64);
+        Ok(self.ops.last().map_or(ServerSeq(0), |o| o.seq))
+    }
+
+    fn since(&self, after: ServerSeq, limit: u32, faults: Faults) -> Vec<StoredOp> {
+        let mut out: Vec<StoredOp> = self.ops.iter().filter(|o| o.seq > after).cloned().collect();
+        out.sort_by_key(|o| o.seq);
+        out.truncate(limit as usize);
+        if faults.reverse_log {
+            out.reverse();
+        }
+        out
     }
 
     fn reject(&mut self, op: OpId, reason: &str, faults: Faults) -> Result<(), DbError> {
@@ -125,11 +165,23 @@ struct State {
 struct RefConn {
     faults: Faults,
     state: Rc<RefCell<State>>,
+    /// A transaction whose commit failed, whose ops the next commit stores
+    /// (`commit_error_applies_later`).
+    pending: Option<State>,
 }
 
 struct RefTx<'c> {
     conn: &'c mut RefConn,
     work: State,
+    /// A call of this transaction returned an error.
+    failed: bool,
+}
+
+impl RefTx<'_> {
+    fn note<T>(&mut self, result: Result<T, DbError>) -> Result<T, DbError> {
+        self.failed |= result.is_err();
+        result
+    }
 }
 
 fn fresh_ref(faults: Faults) -> BoxFuture<'static, Result<Box<dyn Connection>, DbError>> {
@@ -137,6 +189,7 @@ fn fresh_ref(faults: Faults) -> BoxFuture<'static, Result<Box<dyn Connection>, D
         Ok(Box::new(RefConn {
             faults,
             state: Rc::default(),
+            pending: None,
         }) as Box<dyn Connection>)
     })
 }
@@ -168,6 +221,7 @@ impl Driver for RefDriver {
             Ok(Box::new(RefConn {
                 faults: Faults::default(),
                 state: Rc::clone(&self.state),
+                pending: None,
             }) as Box<dyn Connection>)
         })
     }
@@ -306,7 +360,11 @@ impl Connection for RefConn {
     fn begin<'c>(&'c mut self) -> BoxFuture<'c, Result<Box<dyn Transaction<'c> + 'c>, DbError>> {
         Box::pin(async move {
             let work = self.state.borrow().clone();
-            Ok(Box::new(RefTx { conn: self, work }) as Box<dyn Transaction<'c> + 'c>)
+            Ok(Box::new(RefTx {
+                conn: self,
+                work,
+                failed: false,
+            }) as Box<dyn Transaction<'c> + 'c>)
         })
     }
 }
@@ -318,13 +376,22 @@ impl<'c> Transaction<'c> for RefTx<'c> {
     fn apply<'a>(&'a mut self, ws: &'a [Write]) -> BoxFuture<'a, Result<(), DbError>> {
         let faults = self.conn.faults;
         Box::pin(async move {
-            ws.iter()
-                .try_for_each(|w| apply_one(&mut self.work.rows, w, faults))
+            let result = ws
+                .iter()
+                .try_for_each(|w| apply_one(&mut self.work.rows, w, faults));
+            self.note(result)
         })
     }
     fn append_ops<'a>(&'a mut self, ops: &'a [NewOp]) -> BoxFuture<'a, Result<ServerSeq, DbError>> {
         let faults = self.conn.faults;
-        Box::pin(async move { self.work.log.append(ops, faults) })
+        Box::pin(async move {
+            let result = self.work.log.append(ops, faults).map(|seq| match ops {
+                [] if faults.empty_append_zero => ServerSeq(0),
+                [_, ..] if faults.append_result_off => ServerSeq(seq.0 + 7),
+                _ => seq,
+            });
+            self.note(result)
+        })
     }
     fn record_reject<'a>(
         &'a mut self,
@@ -332,7 +399,10 @@ impl<'c> Transaction<'c> for RefTx<'c> {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<(), DbError>> {
         let faults = self.conn.faults;
-        Box::pin(async move { self.work.log.reject(op, reason, faults) })
+        Box::pin(async move {
+            let result = self.work.log.reject(op, reason, faults);
+            self.note(result)
+        })
     }
     fn last_seq<'a>(&'a mut self, replica: ReplicaId) -> BoxFuture<'a, Result<u32, DbError>> {
         Box::pin(async move { Ok(self.work.log.last.get(&replica).copied().unwrap_or(0)) })
@@ -345,10 +415,11 @@ impl<'c> Transaction<'c> for RefTx<'c> {
     }
     fn ops_since<'a>(
         &'a mut self,
-        _after: ServerSeq,
-        _limit: u32,
+        after: ServerSeq,
+        limit: u32,
     ) -> BoxFuture<'a, Result<Vec<StoredOp>, DbError>> {
-        Box::pin(async { Err(DbError::Unsupported("op log")) })
+        let faults = self.conn.faults;
+        Box::pin(async move { Ok(self.work.log.since(after, limit, faults)) })
     }
     fn next_in_sequence<'a>(&'a mut self, _key: &'a str) -> BoxFuture<'a, Result<u64, DbError>> {
         Box::pin(async { Err(DbError::Unsupported("sequences")) })
@@ -356,7 +427,28 @@ impl<'c> Transaction<'c> for RefTx<'c> {
     fn commit(self: Box<Self>) -> BoxFuture<'c, Result<(), DbError>> {
         Box::pin(async move {
             let tx = *self;
-            *tx.conn.state.borrow_mut() = tx.work;
+            let faults = tx.conn.faults;
+            if tx.failed && faults.commit_error_applies_later {
+                tx.conn.pending = Some(tx.work);
+                return Err(DbError::Backend("refused".into()));
+            }
+            if tx.failed && (faults.refuse_after_error || faults.commit_error_applies) {
+                if faults.commit_error_applies {
+                    *tx.conn.state.borrow_mut() = tx.work;
+                }
+                return Err(DbError::Backend("refused".into()));
+            }
+            let mut state = tx.conn.state.borrow_mut();
+            *state = tx.work;
+            if let Some(late) = tx.conn.pending.take() {
+                for o in late.log.ops {
+                    if !state.log.in_log(o.op.id) {
+                        let seq = ServerSeq(state.log.ops.last().map_or(0, |s| s.seq.0) + 1);
+                        state.log.raise(o.op.id);
+                        state.log.ops.push(StoredOp { seq, op: o.op });
+                    }
+                }
+            }
             Ok(())
         })
     }
@@ -365,6 +457,10 @@ impl<'c> Transaction<'c> for RefTx<'c> {
             let tx = *self;
             if tx.conn.faults.rollback_commits {
                 *tx.conn.state.borrow_mut() = tx.work;
+            } else if tx.conn.faults.gap_after_rollback {
+                // The positions stay used, as with a sequence outside the transaction.
+                let mut state = tx.conn.state.borrow_mut();
+                state.log.issued = state.log.issued.max(tx.work.log.issued);
             }
             Ok(())
         })
@@ -865,7 +961,8 @@ fn run_dir_reads_every_json_file_in_order() {
     std::fs::write(dir.join("README.md"), "not a case file").unwrap();
     let report = block_on(run_dir(&dir, &|| fresh_ref(Faults::default())));
     assert_eq!(report.files, ["a.json", "b.json"]);
-    assert_eq!(report.cases, 14);
+    // 7 cases per file plus the built in commit case.
+    assert_eq!(report.cases, 15);
     report.assert_passed();
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1057,4 +1154,309 @@ fn new_driver_per_case_passes_the_connect_error_on() {
             .message
             .contains("connect failed with Unsupported")
     );
+}
+
+/// The position faults of the reference driver break exactly the position cases (D154), and a
+/// driver that leaves gaps after a rollback, as a PostgreSQL sequence does, still conforms.
+#[test]
+fn position_faults_fail_their_cases() {
+    let text = std::fs::read_to_string(super::cases_dir().join("ac_10_positions.json")).unwrap();
+    let all: &[&str] = &[
+        "ac_10_append_positions_after_commit",
+        "ac_10_append_positions_after_failed_call",
+        "ac_10_append_positions_after_rollback",
+    ];
+    let table: [(&str, Faults, &[&str]); 4] = [
+        (
+            "reuse_position",
+            Faults {
+                reuse_position: true,
+                ..Faults::default()
+            },
+            all,
+        ),
+        (
+            "reverse_log",
+            Faults {
+                reverse_log: true,
+                ..Faults::default()
+            },
+            all,
+        ),
+        (
+            "rollback_commits",
+            Faults {
+                rollback_commits: true,
+                ..Faults::default()
+            },
+            &[
+                "ac_10_append_positions_after_failed_call",
+                "ac_10_append_positions_after_rollback",
+            ],
+        ),
+        (
+            "gap_after_rollback",
+            Faults {
+                gap_after_rollback: true,
+                ..Faults::default()
+            },
+            &[],
+        ),
+    ];
+    assert!(run_ref(&text, Faults::default()).is_ok());
+    for (label, faults, expected) in table {
+        let report = run_ref(&text, faults);
+        assert_eq!(failed(&report), expected, "fault {label}: {report}");
+    }
+}
+
+/// The gap fault really leaves gaps, so the case above proves that positions are compared by
+/// order only.
+#[test]
+fn gap_after_rollback_leaves_a_gap() {
+    let faults = Faults {
+        gap_after_rollback: true,
+        ..Faults::default()
+    };
+    let mut conn = block_on(fresh_ref(faults)).unwrap();
+    let op = |replica: u64| NewOp {
+        id: OpId {
+            replica: ReplicaId(replica),
+            seq: 1,
+        },
+        hlc: ostrel_db::api::Hlc::new(1, 0, ReplicaId(replica)).unwrap(),
+        model: 0,
+        row: RowId::from_hex(&format!("{:032x}", 1)).unwrap(),
+        body: Vec::new(),
+    };
+    block_on(async {
+        let mut tx = conn.begin().await.unwrap();
+        assert_eq!(tx.append_ops(&[op(1)]).await, Ok(ServerSeq(1)));
+        tx.rollback().await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        assert_eq!(tx.append_ops(&[op(2)]).await, Ok(ServerSeq(2)));
+        tx.commit().await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        let log = tx.ops_since(ServerSeq(0), 10).await.unwrap();
+        assert_eq!(
+            log.iter().map(|o| o.seq).collect::<Vec<_>>(),
+            [ServerSeq(2)]
+        );
+        tx.rollback().await.unwrap();
+    });
+}
+
+#[test]
+fn ops_since_and_rollback_steps_report_deviations() {
+    let op = |seq: u32| {
+        format!(
+            r#"{{"replica": "1", "seq": {seq}, "wall": 0, "model": 0, "row": "1", "body": ""}}"#
+        )
+    };
+    let (a, b) = (op(1), op(2));
+    let text = with_case(&format!(
+        r#"{{"tx": [{{"append_ops": [{a}, {b}]}}], "expect": "ok"}},
+           {{"ops_since": 0, "expect": [{b}, {a}]}},
+           {{"ops_since": 0, "expect": [{a}]}},
+           {{"ops_since": 1, "expect": [{b}]}},
+           {{"tx": [{{"delete": {{"model": 0, "row": "1", "expect_version": 1}}}}], "expect": "rollback"}},
+           {{"replay": {{"replica": "1", "seq": 1}}, "expect": {{"accepted": {{"position": 1, "op": {a}}}}}}}"#
+    ));
+    let report = run_ref(&text, Faults::default());
+    let got: Vec<(usize, &str)> = report
+        .failures
+        .iter()
+        .map(|f| (f.step, f.message.as_str()))
+        .collect();
+    assert_eq!(got.len(), 3, "{report}");
+    assert_eq!(got[0].0, 1);
+    assert!(got[0].1.contains("op 0: expected"), "{report}");
+    assert_eq!(got[1].0, 2);
+    assert!(got[1].1.contains("expected 1 ops, got 2"), "{report}");
+    assert_eq!(got[2].0, 4);
+    assert!(
+        got[2].1.contains("write 0 failed with NotFound"),
+        "{report}"
+    );
+    // A rolled back step changes nothing.
+    let rolled = with_case(&format!(
+        r#"{{"tx": [{{"append_ops": [{a}]}}], "expect": "rollback"}},
+           {{"ops_since": 0, "expect": []}},
+           {{"last_seq": "1", "expect": 0}}"#
+    ));
+    run_ref(&rolled, Faults::default()).assert_passed();
+    let report = run_ref(
+        &rolled,
+        Faults {
+            rollback_commits: true,
+            ..Faults::default()
+        },
+    );
+    assert_eq!(report.failures.len(), 2, "{report}");
+}
+
+#[test]
+fn decode_rejects_invalid_ops_since_steps() {
+    for (step, needle) in [
+        (r#"{"ops_since": -1, "expect": []}"#, "non negative"),
+        (r#"{"ops_since": "0", "expect": []}"#, "expected a number"),
+        (r#"{"ops_since": 0, "expect": {}}"#, "expected an array"),
+        (r#"{"ops_since": 0}"#, "missing key"),
+        (
+            r#"{"ops_since": 0, "expect": [], "limit": 1}"#,
+            "unknown key",
+        ),
+        (
+            r#"{"ops_since": 0, "expect": [{"replica": "1", "seq": 1}]}"#,
+            "missing key",
+        ),
+        (
+            r#"{"tx": [{"append_ops": []}], "expect": "commit"}"#,
+            "\"rollback\"",
+        ),
+    ] {
+        let err = decode_err(&with_case(step));
+        assert!(err.contains(needle), "{step}: {err}");
+    }
+}
+
+/// The harness checks the result of every `append_ops` call against the log the transaction
+/// reads (ines F1 on T199), so a driver that returns a wrong position fails every case that
+/// appends ops, also on drivers whose own tests do not look at the result.
+#[test]
+fn wrong_append_result_fails_every_appending_case() {
+    let positions =
+        std::fs::read_to_string(super::cases_dir().join("ac_10_positions.json")).unwrap();
+    let replay = std::fs::read_to_string(super::cases_dir().join("ac_10_replay.json")).unwrap();
+    let off = Faults {
+        append_result_off: true,
+        ..Faults::default()
+    };
+    // Every case whose append_ops call returns a position. `ac_10_replay_duplicate_in_one_call`
+    // appends only a call that fails, so the fault cannot show there.
+    let table: [(&str, &[&str]); 2] = [
+        (
+            &positions,
+            &[
+                "ac_10_append_positions_after_commit",
+                "ac_10_append_positions_after_failed_call",
+                "ac_10_append_positions_after_rollback",
+            ],
+        ),
+        (
+            &replay,
+            &[
+                "ac_10_replay_after_lost_ack",
+                "ac_10_replay_after_lost_reject",
+                "ac_10_replay_last_seq_per_replica",
+                "ac_10_replay_outcomes_roll_back",
+            ],
+        ),
+    ];
+    for (text, appending) in table {
+        assert!(run_ref(text, Faults::default()).is_ok());
+        let report = run_ref(text, off);
+        assert_eq!(failed(&report), appending, "{report}");
+        // The first failure of each case is the returned position.
+        for name in appending {
+            let first = report.failures.iter().find(|f| f.case == *name).unwrap();
+            assert!(
+                first.message.contains("append_ops returned position"),
+                "{report}"
+            );
+        }
+    }
+    let op = r#"{"replica": "1", "seq": 1, "wall": 0, "model": 0, "row": "1", "body": ""}"#;
+    let empty = with_case(&format!(
+        r#"{{"tx": [{{"append_ops": [{op}]}}], "expect": "ok"}},
+           {{"tx": [{{"append_ops": []}}], "expect": "rollback"}}"#
+    ));
+    run_ref(&empty, Faults::default()).assert_passed();
+    let zero = Faults {
+        empty_append_zero: true,
+        ..Faults::default()
+    };
+    let report = run_ref(&empty, zero);
+    assert_eq!(report.failures.len(), 1, "{report}");
+    assert_eq!(report.failures[0].step, 1);
+    assert!(
+        report.failures[0]
+            .message
+            .contains("returned position 0, but the log ends at 1"),
+        "{report}"
+    );
+}
+
+fn run_builtin_ref(faults: Faults) -> Report {
+    let mut report = Report::default();
+    block_on(super::run_builtin(&|| fresh_ref(faults), &mut report));
+    report
+}
+
+/// The built in commit case passes for a driver that commits after a failed call and for one
+/// that refuses that commit, and fails for one whose refused commit is visible at once or
+/// later.
+#[test]
+fn commit_error_is_final_catches_a_visible_refused_commit() {
+    for faults in [
+        Faults::default(),
+        Faults {
+            refuse_after_error: true,
+            ..Faults::default()
+        },
+    ] {
+        let report = run_builtin_ref(faults);
+        assert_eq!(report.cases, 1);
+        report.assert_passed();
+    }
+    let now = run_builtin_ref(Faults {
+        commit_error_applies: true,
+        ..Faults::default()
+    });
+    let steps: Vec<usize> = now.failures.iter().map(|f| f.step).collect();
+    assert_eq!(steps, [1, 3], "{now}");
+    assert!(now.failures.iter().all(|f| f.case == super::COMMIT_CASE));
+    assert!(
+        now.failures[0].message.contains("commit returned Err"),
+        "{now}"
+    );
+    let later = run_builtin_ref(Faults {
+        commit_error_applies_later: true,
+        ..Faults::default()
+    });
+    let steps: Vec<usize> = later.failures.iter().map(|f| f.step).collect();
+    assert_eq!(steps, [3], "{later}");
+    assert!(
+        later.failures[0].message.contains("but the op is visible"),
+        "{later}"
+    );
+}
+
+/// `run_dir` runs the built in cases after the case files, once per run.
+#[test]
+fn run_dir_runs_the_builtin_cases() {
+    let report = block_on(run_dir(&super::cases_dir(), &|| {
+        fresh_ref(Faults {
+            commit_error_applies: true,
+            ..Faults::default()
+        })
+    }));
+    assert_eq!(failed(&report), [super::COMMIT_CASE], "{report}");
+    assert!(
+        report
+            .failures
+            .iter()
+            .all(|f| f.file == super::BUILTIN_FILE)
+    );
+    let mut twice = Report::default();
+    block_on(super::run_builtin(
+        &|| fresh_ref(Faults::default()),
+        &mut twice,
+    ));
+    block_on(super::run_builtin(
+        &|| fresh_ref(Faults::default()),
+        &mut twice,
+    ));
+    assert_eq!(twice.cases, 1);
+    assert_eq!(twice.failures.len(), 1, "{twice}");
 }

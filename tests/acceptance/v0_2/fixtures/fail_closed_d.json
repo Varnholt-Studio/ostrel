@@ -1,0 +1,18 @@
+{
+  "app": "examples/v0_2/rules_fail_closed/d_call_denied_fallback.ostl",
+  "users": [
+    "alice",
+    "bob"
+  ],
+  "given": [
+    {
+      "as": "alice",
+      "make": "Coupon",
+      "alias": "a10",
+      "fields": {
+        "code": "A10",
+        "percent": 10
+      }
+    }
+  ]
+}

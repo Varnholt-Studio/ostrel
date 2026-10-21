@@ -1,0 +1,7 @@
+{
+  "app": "examples/v0_2/rules_fail_closed/b_rule_runtime_error.ostl",
+  "users": [
+    "alice"
+  ],
+  "given": []
+}

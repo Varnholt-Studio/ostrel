@@ -1,0 +1,7 @@
+style
+  /* x */
+/* y */
+  .c {}
+
+fn main()
+  print("ok")

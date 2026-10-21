@@ -1,0 +1,12 @@
+// SPEC 12.10: two clashing locals the query does not mention: one fault each, both at the
+// type name in the query head.
+app Golden
+
+data Post
+  pos: Int
+  text: Text
+  see if true
+  drop if true
+
+fn f(text: Text, pos: Int)
+  drop Post where made > made

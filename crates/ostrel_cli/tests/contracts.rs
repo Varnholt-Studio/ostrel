@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const USAGE: &str = "usage: ostrel run [--max-steps N] FILE\n       ostrel check FILE\n       ostrel --help | --version\n";
+const USAGE: &str = "usage: ostrel run [--max-steps N] FILE\n       ostrel check [--list-elevated] FILE\n       ostrel --help | --version\n";
 const LEX_CASE: &str = "tests/errors/lex_tab_indent.ostl";
 const LEX_EXPECTED: &str = "tests/errors/lex_tab_indent.expected_err";
 
