@@ -1213,3 +1213,240 @@ fn refused_writes_change_nothing() {
         }],
     );
 }
+
+/// The collections of every live row of model 1, in id order.
+fn collections_of_model_1(conn: &mut Box<dyn Connection>) -> Vec<Vec<(FieldId, CollectionState)>> {
+    block_on(conn.query(&all(1)))
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|r| r.collections)
+        .collect()
+}
+
+/// A change of a collection field to the other kind starts the field over empty and stores it
+/// whole (D148): no tag or entry of the old kind survives, the kind is stored, and a later
+/// change of the same kind reads only the new entries. Other fields and rows keep theirs.
+#[test]
+fn a_kind_change_replaces_the_whole_field_and_nothing_else() {
+    let mut conn = connect();
+    let stamp = |n| Hlc::new(n, 0, ReplicaId(1)).unwrap();
+    let set = |f, adds: Vec<(&str, u64, u32)>| {
+        (
+            f,
+            CollectionChange::Set(
+                adds.into_iter()
+                    .map(|(e, r, q)| SetChange::Add {
+                        elem: text(e),
+                        tag: tag(r, q),
+                    })
+                    .collect(),
+            ),
+        )
+    };
+    let entry = |k: &str, v: Option<i64>, n| MapEntry {
+        key: text(k),
+        value: v.map(int),
+        hlc: stamp(n),
+    };
+    let map = |f, entries| (f, CollectionChange::Map(entries));
+    let tags = |t: Vec<(&str, u64, u32)>| {
+        CollectionState::Set(
+            t.into_iter()
+                .map(|(e, r, q)| SetTag {
+                    elem: text(e),
+                    tag: tag(r, q),
+                })
+                .collect(),
+        )
+    };
+    let edit = |v, collections| Write::Update {
+        model: 1,
+        row: rid(1),
+        expect_version: v,
+        fields: vec![],
+        collections: vec![collections],
+    };
+    let row = |n: u128, collections| Write::Insert {
+        model: 1,
+        row: rid(n),
+        fields: vec![],
+        collections,
+    };
+    commit(
+        &mut conn,
+        &[
+            row(
+                1,
+                vec![
+                    set(1, vec![("a", 1, 1), ("b", 2, 1)]),
+                    set(2, vec![("z", 3, 1)]),
+                ],
+            ),
+            row(2, vec![set(1, vec![("a", 4, 1)])]),
+        ],
+    );
+    let other_row = vec![(1, tags(vec![("a", 4, 1)]))];
+    let field_2 = (2, tags(vec![("z", 3, 1)]));
+
+    // Set to Map: the tags of a and b go, only the new entry is stored.
+    commit(&mut conn, &[edit(1, map(1, vec![entry("a", Some(1), 1)]))]);
+    assert_eq!(
+        collections_of_model_1(&mut conn),
+        vec![
+            vec![
+                (1, CollectionState::Map(vec![entry("a", Some(1), 1)])),
+                field_2.clone()
+            ],
+            other_row.clone(),
+        ]
+    );
+    let in_set = |e: &str| Expr::InSet {
+        elem: konst(text(e)),
+        set: Path {
+            hops: vec![],
+            field: 1,
+        },
+    };
+    let in_map = |k: &str| Expr::InMap {
+        key: konst(text(k)),
+        map: Path {
+            hops: vec![],
+            field: 1,
+        },
+    };
+    let ids_of = |c: &mut Box<dyn Connection>, e| block_on(c.query(&filtered(1, e))).map(ids);
+    assert_eq!(ids_of(&mut conn, in_set("a")), Ok(vec![2]));
+    assert_eq!(ids_of(&mut conn, in_map("a")), Ok(vec![1]));
+
+    // Map to Set and a second change of the new kind in the same transaction: the second
+    // change reads the tags the first one stored and no entry of the map.
+    commit(
+        &mut conn,
+        &[
+            edit(2, set(1, vec![("c", 5, 1)])),
+            edit(3, set(1, vec![("a", 6, 1)])),
+        ],
+    );
+    assert_eq!(
+        collections_of_model_1(&mut conn),
+        vec![
+            vec![(1, tags(vec![("a", 6, 1), ("c", 5, 1)])), field_2.clone()],
+            other_row.clone(),
+        ]
+    );
+    assert_eq!(ids_of(&mut conn, in_set("a")), Ok(vec![1, 2]));
+    assert_eq!(ids_of(&mut conn, in_map("a")), Ok(vec![]));
+
+    // Back to Map: the entry of the first map does not come back, also not under its key.
+    commit(
+        &mut conn,
+        &[edit(
+            4,
+            map(1, vec![entry("c", Some(2), 2), entry("d", None, 2)]),
+        )],
+    );
+    assert_eq!(
+        collections_of_model_1(&mut conn),
+        vec![
+            vec![
+                (
+                    1,
+                    CollectionState::Map(vec![entry("c", Some(2), 2), entry("d", None, 2)])
+                ),
+                field_2.clone()
+            ],
+            other_row.clone(),
+        ]
+    );
+    assert_eq!(ids_of(&mut conn, in_map("a")), Ok(vec![]));
+    assert_eq!(ids_of(&mut conn, in_map("c")), Ok(vec![1]));
+
+    // An empty change of the other kind still changes the kind and leaves the field empty.
+    commit(
+        &mut conn,
+        &[edit(5, set(1, vec![])), edit(6, map(2, vec![]))],
+    );
+    assert_eq!(
+        collections_of_model_1(&mut conn),
+        vec![
+            vec![
+                (1, CollectionState::Set(vec![])),
+                (2, CollectionState::Map(vec![]))
+            ],
+            other_row,
+        ]
+    );
+    assert_eq!(ids_of(&mut conn, in_set("a")), Ok(vec![2]));
+    assert_eq!(ids_of(&mut conn, in_map("a")), Ok(vec![]));
+}
+
+/// Versions are stored as signed 64 bit integers: a row can reach `i64::MAX`, and a write
+/// that would grow it further fails with a backend error and changes nothing. No sequence of
+/// writes reaches that version in a test, so the test sets it in the file directly.
+#[test]
+fn a_write_past_the_largest_row_version_fails_and_changes_nothing() {
+    let path = fresh_file("version_exhausted");
+    let mut conn = open(&path);
+    commit(
+        &mut conn,
+        &[
+            insert(1, 1, vec![(0, int(1))]),
+            insert(1, 2, vec![(0, int(2))]),
+        ],
+    );
+    drop(conn);
+    let max = i64::MAX;
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    for (n, version) in [(1u128, max - 1), (2, max)] {
+        let changed = raw
+            .execute(
+                "UPDATE ostrel_rows SET version = ?2 WHERE id = ?1",
+                rusqlite::params![&rid(n).as_u128().to_be_bytes()[..], version],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    drop(raw);
+
+    let mut conn = open(&path);
+    let top = max as u64;
+    // The last version that still fits is reached.
+    commit(&mut conn, &[update(1, 1, top - 1, vec![(0, int(10))])]);
+    let exhausted = Err(DbError::Backend("row version exhausted".into()));
+    for w in [
+        update(1, 1, top, vec![(0, int(11))]),
+        update(1, 2, top, vec![(0, int(12))]),
+        // A delete stores the next version too.
+        delete(1, 2, top),
+    ] {
+        block_on(async {
+            let mut tx = conn.begin().await.unwrap();
+            // The valid insert before the failing write is not applied either.
+            assert_eq!(
+                tx.apply(&[insert(1, 3, vec![]), w.clone()]).await,
+                exhausted,
+                "{w:?}"
+            );
+            tx.rollback().await.unwrap();
+        });
+    }
+    let rows = block_on(conn.query(&all(1))).unwrap().0;
+    let seen: Vec<_> = rows
+        .into_iter()
+        .map(|r| (r.id.as_u128(), r.version, r.fields))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![(1, top, vec![(0, int(10))]), (2, top, vec![(0, int(2))])]
+    );
+    // A stale version is still a mismatch, not an exhausted version.
+    block_on(async {
+        let mut tx = conn.begin().await.unwrap();
+        assert_eq!(
+            tx.apply(&[update(1, 1, top - 1, vec![])]).await,
+            Err(DbError::VersionMismatch)
+        );
+        tx.rollback().await.unwrap();
+    });
+}
