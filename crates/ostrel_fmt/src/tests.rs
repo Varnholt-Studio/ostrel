@@ -118,7 +118,7 @@ fn continuation_lines_are_one_level_deeper_than_their_bracket() -> Result<(), St
 #[test]
 fn nested_continuation_lines_follow_the_line_that_opened_the_bracket() -> Result<(), String> {
     same(
-        &main_with("  print(f(\n   g(\n         1\n  ),\n 2\n  ))\n"),
+        &main_with("  print(f(\n   g(\n         1\n  ),\n   2\n  ))\n"),
         &main_with("  print(f(\n    g(\n      1\n    ),\n    2\n  ))\n"),
     )
 }

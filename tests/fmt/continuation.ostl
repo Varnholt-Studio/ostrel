@@ -7,7 +7,7 @@ fn main()
    3
       ))
   print(sum(
- sum(1, 2,
+   sum(1, 2,
          3),
     4,
         5
