@@ -10,10 +10,12 @@
 //! unknown names costs no more than one with known names.
 //!
 //! Only declared fields are part of the schema. The implicit fields (`id`, `made`, `changed`,
-//! `author`) are never written by an op (the `make` body names every declared field once,
-//! D116), so a name of an implicit field in an op body is an unknown field. Because rows
-//! carry the implicit fields under the same names, a declared field may not use one of them
-//! ([`SchemaError::ReservedField`]).
+//! and `author` in a program with `auth`) are never written by an op (the `make` body names
+//! every declared field once, D116), so a name of an implicit field in an op body is an
+//! unknown field. Because rows carry the implicit fields under the same names, a declared
+//! field may not use one of them ([`SchemaError::ReservedField`]). A program without `auth`
+//! has no implicit `author`, so there a declared field `author` is an ordinary field
+//! (SPEC 12.6, G8).
 //!
 //! Server functions are not part of the schema yet: they join the trait together with the
 //! `Call` and `Return` messages (D135).
@@ -25,8 +27,27 @@ use std::fmt;
 use ostrel_sync::protocol::{FieldId, ModelId};
 use ostrel_sync::wire::{WireSchema, WireTy};
 
-/// Names of the implicit fields, which rows carry next to the declared fields.
-pub const IMPLICIT_FIELDS: [&str; 4] = ["id", "made", "changed", "author"];
+/// Names of the implicit fields every row carries next to the declared fields.
+pub const IMPLICIT_FIELDS: [&str; 3] = ["id", "made", "changed"];
+
+/// Name of the implicit field that rows carry only in a program with `auth` (G8, D142).
+pub const AUTHOR_FIELD: &str = "author";
+
+/// Whether the program declares `auth`, which decides if `author` is an implicit field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Auth {
+    /// The `app` has no `auth` line: rows have no implicit `author`.
+    Off,
+    /// The `app` has an `auth` line: rows carry the implicit `author`.
+    On,
+}
+
+impl Auth {
+    /// Whether `name` is an implicit field of every row of a program with this setting.
+    pub fn is_implicit(self, name: &str) -> bool {
+        IMPLICIT_FIELDS.contains(&name) || (self == Auth::On && name == AUTHOR_FIELD)
+    }
+}
 
 /// One model as the compiler declares it: its name and its declared fields in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,8 +117,9 @@ struct ModelEntry {
 }
 
 impl ServerSchema {
-    /// Builds the schema from the models in declaration order.
-    pub fn new(models: Vec<ModelDecl>) -> Result<Self, SchemaError> {
+    /// Builds the schema from the models in declaration order. `auth` tells whether the
+    /// program declares `auth`, which makes `author` an implicit field.
+    pub fn new(models: Vec<ModelDecl>, auth: Auth) -> Result<Self, SchemaError> {
         let mut entries = Vec::with_capacity(models.len());
         let mut model_ids = HashMap::with_capacity(models.len());
         for (at, model) in models.into_iter().enumerate() {
@@ -105,7 +127,7 @@ impl ServerSchema {
             if model.name.is_empty() {
                 return Err(SchemaError::EmptyModelName);
             }
-            let entry = ModelEntry::new(model)?;
+            let entry = ModelEntry::new(model, auth)?;
             match model_ids.entry(entry.name.clone()) {
                 Entry::Occupied(_) => return Err(SchemaError::DuplicateModel(entry.name)),
                 Entry::Vacant(slot) => {
@@ -135,14 +157,14 @@ impl ServerSchema {
 }
 
 impl ModelEntry {
-    fn new(model: ModelDecl) -> Result<Self, SchemaError> {
+    fn new(model: ModelDecl, auth: Auth) -> Result<Self, SchemaError> {
         let mut field_ids = HashMap::with_capacity(model.fields.len());
         for (at, field) in model.fields.iter().enumerate() {
             let id = FieldId::try_from(at).map_err(|_| SchemaError::TooMany)?;
             if field.name.is_empty() {
                 return Err(SchemaError::EmptyFieldName { model: model.name });
             }
-            if IMPLICIT_FIELDS.contains(&field.name.as_str()) {
+            if auth.is_implicit(&field.name) {
                 return Err(SchemaError::ReservedField {
                     model: model.name,
                     field: field.name.clone(),
@@ -225,7 +247,7 @@ mod tests {
     }
 
     fn schema() -> Result<ServerSchema, SchemaError> {
-        ServerSchema::new(chat())
+        ServerSchema::new(chat(), Auth::Off)
     }
 
     #[test]
@@ -274,16 +296,75 @@ mod tests {
 
     #[test]
     fn implicit_fields_are_not_declared_fields() -> Result<(), SchemaError> {
-        let s = schema()?;
-        for name in IMPLICIT_FIELDS {
-            assert_eq!(s.field_id(0, name), None, "{name}");
+        for auth in [Auth::Off, Auth::On] {
+            let s = ServerSchema::new(chat(), auth)?;
+            for name in IMPLICIT_FIELDS.into_iter().chain([AUTHOR_FIELD]) {
+                assert_eq!(s.field_id(0, name), None, "{name} {auth:?}");
+            }
         }
         Ok(())
     }
 
+    /// Without `auth` a declared field `author` is an ordinary field (SPEC 12.6, G8): the
+    /// schema loads, the codec maps it by name, and its declared type holds.
+    #[test]
+    fn declared_author_without_auth_is_an_ordinary_field() -> Result<(), String> {
+        let s = ServerSchema::new(
+            vec![model(
+                "Note",
+                vec![field("body", WireTy::Text), field("author", WireTy::Text)],
+            )],
+            Auth::Off,
+        )
+        .map_err(|e| e.to_string())?;
+        assert_eq!(s.field_id(0, "author"), Some(1));
+        assert_eq!(s.field_name(0, 1), Some("author"));
+        assert_eq!(s.field_ty(0, 1), Some(&WireTy::Text));
+        let sent = op(
+            0,
+            OpBody::Set {
+                field: 1,
+                value: Value::Text("Ada".into()),
+            },
+        )?;
+        let text = encode_op(&sent, &s).map_err(|e| format!("{e:?}"))?;
+        assert!(text.contains(r#""field":"author""#), "{text}");
+        let decoded = decode_op(
+            json::parse(text.as_bytes()).map_err(|e| format!("{e:?}"))?,
+            &s,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        assert_eq!(format!("{decoded:?}"), format!("Valid({sent:?})"));
+        Ok(())
+    }
+
+    /// With `auth` the server stamps `author`, so a declaration of it is a compiler defect.
+    #[test]
+    fn declared_author_with_auth_is_reserved() {
+        let reserved = vec![model("Note", vec![field("author", WireTy::Text)])];
+        assert_eq!(
+            ServerSchema::new(reserved, Auth::On).err(),
+            Some(SchemaError::ReservedField {
+                model: "Note".into(),
+                field: "author".into()
+            })
+        );
+    }
+
+    #[test]
+    fn only_author_depends_on_auth() {
+        for name in IMPLICIT_FIELDS {
+            assert!(Auth::Off.is_implicit(name), "{name}");
+            assert!(Auth::On.is_implicit(name), "{name}");
+        }
+        assert!(!Auth::Off.is_implicit(AUTHOR_FIELD));
+        assert!(Auth::On.is_implicit(AUTHOR_FIELD));
+        assert!(!Auth::On.is_implicit("title"));
+    }
+
     #[test]
     fn empty_schema_knows_nothing() -> Result<(), SchemaError> {
-        let s = ServerSchema::new(Vec::new())?;
+        let s = ServerSchema::new(Vec::new(), Auth::Off)?;
         assert_eq!(s.model_count(), 0);
         assert_eq!(s.model_id("Message"), None);
         assert_eq!(s.model_name(0), None);
@@ -295,7 +376,7 @@ mod tests {
         let mut twice = chat();
         twice.push(model("Room", vec![]));
         assert_eq!(
-            ServerSchema::new(twice).err(),
+            ServerSchema::new(twice, Auth::Off).err(),
             Some(SchemaError::DuplicateModel("Room".into()))
         );
 
@@ -304,31 +385,37 @@ mod tests {
             vec![field("title", WireTy::Text), field("title", WireTy::Int)],
         )];
         assert_eq!(
-            ServerSchema::new(field_twice).err(),
+            ServerSchema::new(field_twice, Auth::Off).err(),
             Some(SchemaError::DuplicateField {
                 model: "Room".into(),
                 field: "title".into()
             })
         );
 
-        for name in IMPLICIT_FIELDS {
-            let reserved = vec![model("Room", vec![field(name, WireTy::Text)])];
-            assert_eq!(
-                ServerSchema::new(reserved).err(),
-                Some(SchemaError::ReservedField {
-                    model: "Room".into(),
-                    field: name.into()
-                }),
-                "{name}"
-            );
+        for auth in [Auth::Off, Auth::On] {
+            for name in IMPLICIT_FIELDS {
+                let reserved = vec![model("Room", vec![field(name, WireTy::Text)])];
+                assert_eq!(
+                    ServerSchema::new(reserved, auth).err(),
+                    Some(SchemaError::ReservedField {
+                        model: "Room".into(),
+                        field: name.into()
+                    }),
+                    "{name} {auth:?}"
+                );
+            }
         }
 
         assert_eq!(
-            ServerSchema::new(vec![model("", vec![])]).err(),
+            ServerSchema::new(vec![model("", vec![])], Auth::Off).err(),
             Some(SchemaError::EmptyModelName)
         );
         assert_eq!(
-            ServerSchema::new(vec![model("Room", vec![field("", WireTy::Text)])]).err(),
+            ServerSchema::new(
+                vec![model("Room", vec![field("", WireTy::Text)])],
+                Auth::Off
+            )
+            .err(),
             Some(SchemaError::EmptyFieldName {
                 model: "Room".into()
             })
@@ -337,13 +424,16 @@ mod tests {
 
     #[test]
     fn same_field_name_in_two_models_is_allowed() -> Result<(), SchemaError> {
-        let s = ServerSchema::new(vec![
-            model("A", vec![field("title", WireTy::Text)]),
-            model(
-                "B",
-                vec![field("x", WireTy::Int), field("title", WireTy::Int)],
-            ),
-        ])?;
+        let s = ServerSchema::new(
+            vec![
+                model("A", vec![field("title", WireTy::Text)]),
+                model(
+                    "B",
+                    vec![field("x", WireTy::Int), field("title", WireTy::Int)],
+                ),
+            ],
+            Auth::Off,
+        )?;
         assert_eq!(s.field_id(0, "title"), Some(0));
         assert_eq!(s.field_id(1, "title"), Some(1));
         assert_eq!(s.field_ty(1, 1), Some(&WireTy::Int));
