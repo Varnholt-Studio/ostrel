@@ -203,25 +203,104 @@ fn a_quiet_point_task_queued_during_a_phase_waits_behind_the_writers() {
 }
 
 #[test]
-fn a_phase_grants_nothing_while_a_commit_is_unreleased() {
-    // A quiet point task pushes no commit. If a holder in a phase reported one anyway, the next
-    // task of the phase must still wait for a quiet point.
+fn a_quiet_point_task_cannot_report_a_commit() {
+    // RED kira #2677 (5): a quiet point task pushes no commit. A holder in a phase that reported
+    // one would make the next task of the phase read at a point that is not quiet, so the lock
+    // refuses it, changes nothing and the holder keeps the lock.
     let mut lock = WriteLock::with_bound(8);
     let a = lock.request_quiet("a");
     let w = lock.request("w");
     let b = lock.request_quiet("b");
     assert_eq!(lock.grant(), Some((a, "a")));
-    lock.release(a, Release::Committed).unwrap();
     assert_eq!(
-        lock.grant(),
-        None,
-        "quiet point granted with a commit unreleased"
+        lock.release(a, Release::Committed),
+        Err(LockError::QuietCommit { ticket: a })
     );
+    assert_eq!(lock.holder(), Some(a), "the refused release freed the lock");
+    assert_eq!(lock.unreleased(), 0, "the refused commit was counted");
     assert!(lock.in_quiet_phase());
-    lock.commit_released().unwrap();
+    assert_eq!(lock.grant(), None, "a second holder");
+    lock.release(a, Release::Nothing).unwrap();
     assert_eq!(lock.grant(), Some((b, "b")));
     lock.release(b, Release::Nothing).unwrap();
     assert_eq!(lock.grant(), Some((w, "w")));
+    lock.release(w, Release::Committed).unwrap();
+    assert_eq!(lock.unreleased(), 1, "a writer reports its commit");
+}
+
+#[test]
+fn a_writer_queued_during_a_phase_waits_for_its_rest_and_one_more_phase() {
+    // RED kira #2677 (2): the bound of the documentation. The writer is requested while phase 1
+    // runs; a quiet point task queued before it but after phase 1 began starts phase 2, which
+    // needs one emptying; the writer follows phase 2.
+    let mut lock = WriteLock::with_bound(8);
+    let q1 = lock.request_quiet("q1");
+    let q1b = lock.request_quiet("q1b");
+    assert_eq!(lock.grant(), Some((q1, "q1")));
+    assert!(lock.in_quiet_phase(), "phase 1 runs");
+    let w0 = lock.request("w0");
+    let q2 = lock.request_quiet("q2");
+    let w = lock.request("w");
+    let q3 = lock.request_quiet("q3");
+    lock.release(q1, Release::Nothing).unwrap();
+    assert_eq!(lock.grant(), Some((q1b, "q1b")), "rest of phase 1");
+    lock.release(q1b, Release::Nothing).unwrap();
+    assert!(!lock.in_quiet_phase());
+    assert_eq!(lock.grant(), Some((w0, "w0")));
+    lock.release(w0, Release::Committed).unwrap();
+    assert_eq!(lock.grant(), None, "phase 2 waits for one emptying");
+    lock.commit_released().unwrap();
+    for (t, name) in [(q2, "q2"), (q3, "q3")] {
+        assert_eq!(lock.grant(), Some((t, name)), "phase 2");
+        lock.release(t, Release::Nothing).unwrap();
+    }
+    assert_eq!(
+        lock.grant(),
+        Some((w, "w")),
+        "the writer waited for more than one more phase"
+    );
+}
+
+#[test]
+fn a_subscribe_flood_costs_constant_time_per_grant() {
+    // RED kira #2677 (1): with one scan of the queue per grant, 20 000 writers interleaved with
+    // 20 000 quiet point tasks took 18 s in a debug build for one phase (O(W * Q)). Two queues in
+    // ticket order make every grant O(1). The order is the one of the phase: every quiet point
+    // task first, then the writers in request order.
+    const N: usize = 20_000;
+    let mut lock = WriteLock::with_bound(BROADCAST_COMMITS);
+    let w = lock.request(None);
+    lock.grant().unwrap();
+    lock.release(w, Release::Committed).unwrap();
+    for i in 0..N {
+        lock.request_quiet(Some((true, i)));
+        lock.request(Some((false, i)));
+    }
+    assert_eq!(lock.grant(), None);
+    lock.commit_released().unwrap();
+    let started = std::time::Instant::now();
+    let mut order = Vec::with_capacity(2 * N);
+    while let Some((t, task)) = lock.grant() {
+        let (quiet, i) = task.unwrap();
+        let outcome = if quiet {
+            Release::Nothing
+        } else {
+            Release::Committed
+        };
+        lock.release(t, outcome).unwrap();
+        while lock.unreleased() > 0 {
+            lock.commit_released().unwrap();
+        }
+        order.push((quiet, i));
+    }
+    let elapsed = started.elapsed();
+    let expected: Vec<(bool, usize)> = (0..N)
+        .map(|i| (true, i))
+        .chain((0..N).map(|i| (false, i)))
+        .collect();
+    assert_eq!(order, expected);
+    // A loose bound against the 18 s of the scan; the grants take milliseconds.
+    assert!(elapsed.as_secs() < 3, "{N} + {N} grants took {elapsed:?}");
 }
 
 #[test]
