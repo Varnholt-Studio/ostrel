@@ -1,0 +1,507 @@
+{
+  "ac": "AC-33",
+  "cases": [
+    {
+      "name": "ac_33_a_optional_ordering_is_compile_error",
+      "covers": "a",
+      "kind": "compile",
+      "verdict": "deny",
+      "source": "Golden owned by the v0.2 checker; listed here so the suite names every part of AC-33",
+      "steps": [
+        {
+          "send": {
+            "command": "check",
+            "file": "examples/v0_2/rules_fail_closed/a_optional_ordering.ostl"
+          },
+          "expect": [
+            {
+              "expected_file": "examples/v0_2/rules_fail_closed/a_optional_ordering.expected"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged"
+    },
+    {
+      "name": "ac_33_b_rule_true_allows",
+      "covers": "control",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "alice",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Event",
+                "row": "$newrow:fifty",
+                "body": {
+                  "make": {
+                    "name": "Fifty",
+                    "seats": 50
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "one Event Fifty"
+      },
+      "fixture": "fail_closed_b"
+    },
+    {
+      "name": "ac_33_b_rule_runtime_error_denies",
+      "covers": "b",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "alice",
+      "source": "b_rule_runtime_error.expected step 2",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Event",
+                "row": "$newrow:zero",
+                "body": {
+                  "make": {
+                    "name": "Zero",
+                    "seats": 0
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_33_b_rule_true_allows",
+      "fixture": "fail_closed_b"
+    },
+    {
+      "name": "ac_33_b_rule_false_denies",
+      "covers": "b",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "alice",
+      "source": "b_rule_runtime_error.expected step 3",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Event",
+                "row": "$newrow:huge",
+                "body": {
+                  "make": {
+                    "name": "Huge",
+                    "seats": 200
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_33_b_rule_true_allows",
+      "fixture": "fail_closed_b"
+    },
+    {
+      "name": "ac_33_c_self_add_allows",
+      "covers": "control",
+      "kind": "ops",
+      "verdict": "allow",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Project",
+                "row": "$row:p1",
+                "body": {
+                  "add": {
+                    "field": "watchers",
+                    "elem": "$user:bob"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "ack": "$op"
+            }
+          ]
+        }
+      ],
+      "db": {
+        "expect": "p1.watchers is {alice, bob}"
+      },
+      "fixture": "fail_closed_c"
+    },
+    {
+      "name": "ac_33_c_add_other_denied",
+      "covers": "c",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "carol",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Project",
+                "row": "$row:p1",
+                "body": {
+                  "add": {
+                    "field": "watchers",
+                    "elem": "$user:dave"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_33_c_self_add_allows",
+      "fixture": "fail_closed_c"
+    },
+    {
+      "name": "ac_33_c_author_removal_unmentioned",
+      "covers": "c",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "alice",
+      "source": "c_set_directions.expected step 3b: the rule is true for the author but does not mention removals",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "p1",
+            "field": "watchers",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Project",
+                "row": "$row:p1",
+                "body": {
+                  "remove": {
+                    "field": "watchers",
+                    "elem": "$user:bob",
+                    "tags": [
+                      "$tag:p1.watchers.bob"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_33_c_self_add_allows",
+      "fixture": "fail_closed_c"
+    },
+    {
+      "name": "ac_33_c_self_removal_unmentioned",
+      "covers": "c",
+      "kind": "ops",
+      "verdict": "deny",
+      "as": "bob",
+      "given": [
+        {
+          "as": "bob",
+          "add": {
+            "row": "p1",
+            "field": "watchers",
+            "elem": "$user:bob"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "ops",
+            "ops": [
+              {
+                "id": "$op",
+                "hlc": "$hlc",
+                "model": "Project",
+                "row": "$row:p1",
+                "body": {
+                  "remove": {
+                    "field": "watchers",
+                    "elem": "$user:bob",
+                    "tags": [
+                      "$tag:p1.watchers.bob"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "expect": [
+            {
+              "reject": "Denied",
+              "op": "$op"
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_33_c_self_add_allows",
+      "fixture": "fail_closed_c"
+    },
+    {
+      "name": "ac_33_d_owner_call_allows",
+      "covers": "control",
+      "kind": "call",
+      "verdict": "allow",
+      "as": "alice",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "discount",
+            "args": [
+              "$row:a10"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "ok": 10
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "fixture": "fail_closed_d"
+    },
+    {
+      "name": "ac_33_d_crafted_call_denied",
+      "covers": "d",
+      "kind": "call",
+      "verdict": "deny",
+      "as": "bob",
+      "source": "d_call_denied_fallback.expected probe 6; the client probes 1 to 5 belong to the browser job",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "call",
+            "call": 1,
+            "function": "discount",
+            "args": [
+              "$row:a10"
+            ]
+          },
+          "expect": [
+            {
+              "return": {
+                "error": "Denied"
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_33_d_owner_call_allows",
+      "fixture": "fail_closed_d"
+    },
+    {
+      "name": "ac_33_e_author_reads_first_rows",
+      "covers": "control",
+      "kind": "subscribe",
+      "verdict": "allow",
+      "as": "alice",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "subscribe",
+            "sub": 1,
+            "query": {
+              "model": "Note",
+              "filter": null,
+              "order": [
+                [
+                  "pos",
+                  "asc"
+                ]
+              ],
+              "limit": 3,
+              "after": null
+            }
+          },
+          "expect": [
+            {
+              "snapshot": {
+                "rows": [
+                  "p1",
+                  "p2",
+                  "s3"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "fixture": "fail_closed_e"
+    },
+    {
+      "name": "ac_33_e_limit_counts_readable_rows",
+      "covers": "e",
+      "kind": "subscribe",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "subscribe",
+            "sub": 1,
+            "query": {
+              "model": "Note",
+              "filter": null,
+              "order": [
+                [
+                  "pos",
+                  "asc"
+                ]
+              ],
+              "limit": 3,
+              "after": null
+            }
+          },
+          "expect": [
+            {
+              "snapshot": {
+                "rows": [
+                  "s3",
+                  "s5",
+                  "s6"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_33_e_author_reads_first_rows",
+      "fixture": "fail_closed_e"
+    },
+    {
+      "name": "ac_33_e_last_counts_readable_rows",
+      "covers": "e",
+      "kind": "subscribe",
+      "verdict": "deny",
+      "as": "bob",
+      "steps": [
+        {
+          "send": {
+            "v": 0,
+            "t": "subscribe",
+            "sub": 1,
+            "query": {
+              "model": "Note",
+              "filter": null,
+              "order": [
+                [
+                  "pos",
+                  "desc"
+                ]
+              ],
+              "limit": 3,
+              "after": null
+            }
+          },
+          "expect": [
+            {
+              "snapshot": {
+                "rows": [
+                  "s8",
+                  "s6",
+                  "s5"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "db": "unchanged",
+      "control": "ac_33_e_author_reads_first_rows",
+      "assumption": "The query IR has no last; `last 3` reaches the server as the reversed order with limit 3 and the client restores the order. The rows are the same as e_limit_after_see.expected probe 1.",
+      "fixture": "fail_closed_e"
+    }
+  ]
+}

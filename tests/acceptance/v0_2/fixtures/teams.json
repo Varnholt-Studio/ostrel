@@ -1,0 +1,81 @@
+{
+  "app": "tests/acceptance/v0_2/apps/teams.ostl",
+  "users": [
+    "alice",
+    "bob",
+    "carol",
+    "dave"
+  ],
+  "given": [
+    {
+      "as": "alice",
+      "make": "Team",
+      "alias": "alpha",
+      "fields": {
+        "name": "Alpha",
+        "roles": [
+          [
+            "$user:alice",
+            "admin"
+          ]
+        ]
+      }
+    },
+    {
+      "as": "alice",
+      "put": {
+        "row": "alpha",
+        "field": "roles",
+        "key": "$user:bob",
+        "value": "member"
+      }
+    },
+    {
+      "as": "carol",
+      "make": "Team",
+      "alias": "gamma",
+      "fields": {
+        "name": "Gamma",
+        "roles": [
+          [
+            "$user:carol",
+            "admin"
+          ]
+        ]
+      }
+    },
+    {
+      "as": "alice",
+      "make": "Task",
+      "alias": "t1",
+      "fields": {
+        "team": "$row:alpha",
+        "title": "One",
+        "owner": "$user:alice",
+        "locked": false
+      }
+    },
+    {
+      "as": "bob",
+      "make": "Task",
+      "alias": "t2",
+      "fields": {
+        "team": "$row:alpha",
+        "title": "Two",
+        "owner": "$user:bob",
+        "locked": false
+      }
+    },
+    {
+      "as": "carol",
+      "make": "Task",
+      "alias": "g1",
+      "fields": {
+        "team": "$row:gamma",
+        "title": "Gamma one",
+        "owner": "$user:carol",
+        "locked": false
+      }
+    }
+  ]
+}

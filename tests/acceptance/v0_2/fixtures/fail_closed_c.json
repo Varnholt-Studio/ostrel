@@ -1,0 +1,22 @@
+{
+  "app": "examples/v0_2/rules_fail_closed/c_set_directions.ostl",
+  "users": [
+    "alice",
+    "bob",
+    "carol",
+    "dave"
+  ],
+  "given": [
+    {
+      "as": "alice",
+      "make": "Project",
+      "alias": "p1",
+      "fields": {
+        "name": "Launch",
+        "watchers": [
+          "$user:alice"
+        ]
+      }
+    }
+  ]
+}
