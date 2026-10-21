@@ -712,8 +712,10 @@ impl<'a> Rx<'a> {
                     var.value = value;
                 }
             }
-            ast::Item::Fn(d) => self.fn_body(at.def, None, d.body),
-            ast::Item::PlacedFn(d) => self.fn_body(at.def, d.call_rule.as_ref(), d.body),
+            ast::Item::Fn(d) => self.fn_body(at.def, &d.name, None, d.body),
+            ast::Item::PlacedFn(d) => {
+                self.fn_body(at.def, &d.name, d.call_rule.as_ref(), d.body);
+            }
             ast::Item::View(d) => {
                 self.bind_params(at.def);
                 let nodes = self.nodes(&d.nodes);
@@ -736,7 +738,13 @@ impl<'a> Rx<'a> {
         }
     }
 
-    fn fn_body(&mut self, def: DefId, call: Option<&'a ast::CallRule>, body: ast::BlockId) {
+    fn fn_body(
+        &mut self,
+        def: DefId,
+        name: &ast::Ident,
+        call: Option<&'a ast::CallRule>,
+        body: ast::BlockId,
+    ) {
         self.bind_params(def);
         let call_rule = call.map(|c| {
             let cond = self.expr(c.cond);
@@ -755,6 +763,39 @@ impl<'a> Rx<'a> {
         {
             f.call_rule = call_rule;
             f.body = body;
+        }
+        self.returns(def, name, body);
+    }
+
+    /// E0303 and E0305 for a function with a result type (SPEC 12.6).
+    fn returns(&mut self, def: DefId, name: &ast::Ident, body: BlockId) {
+        let Some(DefKind::Fn(f)) = self.def_kind(def) else {
+            return;
+        };
+        if matches!(f.result, Ty::Unit | Ty::Error) {
+            return;
+        }
+        match flow::missing_return(&self.p, body) {
+            Some(flow::Missing::Implicit(e)) => {
+                let span = self.p.expr(e).map(|x| x.span);
+                if let Some(span) = span {
+                    self.diags.push(Diagnostic::error(
+                        codes::IMPLICIT_RETURN_IN_BRANCH,
+                        span,
+                        "add `return`; a function body with branches returns only through `return`"
+                            .to_string(),
+                    ));
+                }
+            }
+            Some(flow::Missing::Return) => self.error(
+                codes::MISSING_RETURN,
+                name.range,
+                format!(
+                    "`{}` can end without returning a value; add `return`",
+                    name.text
+                ),
+            ),
+            None => {}
         }
     }
 
@@ -1668,5 +1709,6 @@ fn id_of<T>(arena: &[T]) -> u32 {
     id(arena.len())
 }
 
+mod flow;
 #[cfg(test)]
 mod tests;

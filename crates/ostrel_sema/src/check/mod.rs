@@ -6,18 +6,25 @@
 //! arguments (E0302). Codes and message forms are those of the v0.1 checker
 //! in the crate root.
 //!
+//! It also decides the words of D142 by their expected type, reports the
+//! `call` rule of an elevated function that does not bind `me` to row data
+//! (E0306), a constant range whose lower bound is above its upper bound
+//! (E0311, SPEC 12.11) and a constant negative query count (E0312, SPEC
+//! 12.10). A missing `return` (E0303, E0305) is reported by `resolve`, which
+//! knows where the function name stands.
+//!
 //! The checker reports only what it can prove. Where the type of an
 //! expression is not decided yet (properties other than `len` and `trim`,
 //! methods of collections, contextual names, std names other than
-//! `Url.parse`), the expression gets [`Ty::Error`] and nothing is reported,
+//! `Url.parse`, attribute values of std elements other than `img src` and
+//! `link href`), the expression gets [`Ty::Error`] and nothing is reported,
 //! so a valid program never fails here. Not yet covered: `E0300` and the
 //! ordering of optionals (both stand at the operator, which the HIR does not
-//! record), the missing `return` (E0305), placement, the `call` rule of an
-//! elevated function (E0306) and the words of D142.
+//! record) and placement.
 
 use std::collections::HashMap;
 
-use ostrel_core::{Diagnostic, Span};
+use ostrel_core::{Code, Diagnostic, Span};
 use ostrel_syntax::ast::{BinaryOp, UnaryOp};
 
 use crate::codes;
@@ -26,6 +33,15 @@ use crate::hir::{
     ImplicitField, LocalId, Placement, Program, Res, StdName, StmtId, StmtKind, StrPart, Ty,
     ViewNodeId, ViewNodeKind,
 };
+
+/// The `call` rule of an `as system` function binds `me` to nothing (D124,
+/// SPEC 12.6).
+pub(crate) const UNBOUND_ME: Code = Code::new(306);
+/// A range with constant bounds whose lower bound is above its upper bound
+/// (SPEC 12.11).
+pub(crate) const EMPTY_RANGE: Code = Code::new(311);
+/// A constant negative count after `limit` or `last` (SPEC 12.10).
+pub(crate) const NEGATIVE_COUNT: Code = Code::new(312);
 
 /// Checks types and fills [`crate::hir::Expr::ty`], [`crate::hir::Local::ty`]
 /// and [`crate::hir::VarDef::ty`].
@@ -36,9 +52,15 @@ pub(crate) fn check(program: &mut Program) -> Vec<Diagnostic> {
         exprs,
         locals,
         vars,
+        words,
         diags,
         ..
     } = cx;
+    for (e, res) in words {
+        if let Some(expr) = program.exprs.get_mut(e.index()) {
+            expr.kind = ExprKind::Name(res);
+        }
+    }
     for (expr, ty) in program.exprs.iter_mut().zip(exprs) {
         expr.ty = Some(ty.unwrap_or(Ty::Error));
     }
@@ -69,6 +91,8 @@ struct Cx<'p> {
     exprs: Vec<Option<Ty>>,
     locals: Vec<Option<Ty>>,
     vars: HashMap<DefId, Ty>,
+    /// Words of D142 and what they mean; each becomes [`ExprKind::Name`].
+    words: Vec<(ExprId, Res)>,
     diags: Vec<Diagnostic>,
     /// The std `User` in an app with `auth`.
     user: Option<DefId>,
@@ -94,6 +118,7 @@ impl<'p> Cx<'p> {
             exprs: vec![None; p.exprs.len()],
             locals: p.locals.iter().map(|l| l.ty.clone()).collect(),
             vars: HashMap::new(),
+            words: Vec::new(),
             diags: Vec::new(),
             user,
             result: None,
@@ -142,6 +167,16 @@ impl<'p> Cx<'p> {
                     };
                     if let Some(rule) = &f.call_rule {
                         self.condition(rule.cond);
+                        if f.elevated.is_some() && !self.binds_me(rule.cond, &f.params) {
+                            let at = self.span(rule.cond);
+                            self.diags.push(Diagnostic::error(
+                                UNBOUND_ME,
+                                at,
+                                "the call rule of an as system function must compare me with a \
+                                 parameter or with row data"
+                                    .to_string(),
+                            ));
+                        }
                     }
                     self.result = Some(f.result.clone());
                     self.fn_body(f.body, &f.result);
@@ -420,13 +455,16 @@ impl<'p> Cx<'p> {
             ElementName::View(_) => None,
         };
         for (name, value) in e.attrs.iter() {
-            let found = self.expr(*value);
-            // URLs of `img` and `link` (SPEC 12.13).
-            if matches!(
+            // URLs of `img` and `link` (SPEC 12.13); the other attribute
+            // types are not declared yet.
+            let want = matches!(
                 (std, &**name),
                 (Some("img"), "src") | (Some("link"), "href")
-            ) {
-                self.expect(*value, &Ty::Url, &found);
+            )
+            .then_some(Ty::Url);
+            let found = self.word(*value, want.as_ref(), true);
+            if let Some(want) = &want {
+                self.expect(*value, want, &found);
             }
         }
         for (_, cond) in e.styles.iter() {
@@ -472,10 +510,7 @@ impl<'p> Cx<'p> {
                 Ty::Text
             }
             ExprKind::Name(res) => self.name_ty(*res),
-            ExprKind::Word { lexical, .. } => match lexical {
-                Res::Variant(d, _) => Ty::Enum(*d),
-                _ => Ty::Error,
-            },
+            ExprKind::Word { .. } => self.word(e, None, false),
             ExprKind::Unary { op, operand } => {
                 let want = match op {
                     UnaryOp::Neg => Ty::Int,
@@ -522,14 +557,29 @@ impl<'p> Cx<'p> {
                 collection,
                 ..
             } => {
-                // SYNTAX 4.4: a none element is not in the collection.
-                let found = unwrap_optional(self.expr(*element));
-                if let Ty::Set(t) | Ty::List(t) | Ty::Range(t) = self.expr(*collection) {
-                    self.expect(*element, &t, &found);
+                // SYNTAX 4.4: a none element is not in the collection; a map
+                // holds its keys.
+                let item = match self.expr(*collection) {
+                    Ty::Set(t) | Ty::List(t) | Ty::Range(t) | Ty::Map(t, _) => Some(*t),
+                    _ => None,
+                };
+                let found = unwrap_optional(self.word(*element, item.as_ref(), false));
+                if let Some(t) = &item {
+                    self.expect(*element, t, &found);
                 }
                 Ty::Bool
             }
             ExprKind::Range { lo, hi } => {
+                if let (Some(a), Some(b)) = (self.constant(*lo), self.constant(*hi))
+                    && a > b
+                {
+                    let at = self.span(*lo);
+                    let message = format!(
+                        "the range {a}..{b} holds no value: its lower bound is above its upper \
+                         bound"
+                    );
+                    self.diags.push(Diagnostic::error(EMPTY_RANGE, at, message));
+                }
                 let l = self.expr(*lo);
                 let h = self.expr(*hi);
                 if l == Ty::Error {
@@ -545,11 +595,11 @@ impl<'p> Cx<'p> {
                     Ty::Optional(t) | Ty::Remote(t) => *t,
                     other => other,
                 };
-                let found = self.expr(*fallback);
                 if inner == Ty::Error {
-                    found
+                    self.expr(*fallback)
                 } else {
-                    self.expect(*fallback, &inner, &found);
+                    // A literal fallback is checked element by element.
+                    self.value(*fallback, &inner);
                     inner
                 }
             }
@@ -573,9 +623,18 @@ impl<'p> Cx<'p> {
                 if let Some(f) = q.filter {
                     self.condition(f);
                 }
-                if let Some((_, n)) = q.take {
+                if let Some((kind, n)) = q.take {
                     let found = self.expr(n);
                     self.expect(n, &Ty::Int, &found);
+                    if let Some(v) = self.constant(n).filter(|v| *v < 0) {
+                        let at = self.span(n);
+                        let message = format!(
+                            "the count of `{}` is {v}; a query count is 0 or more",
+                            kind.as_str()
+                        );
+                        self.diags
+                            .push(Diagnostic::error(NEGATIVE_COUNT, at, message));
+                    }
                 }
                 Ty::Rows(q.model)
             }
@@ -589,22 +648,51 @@ impl<'p> Cx<'p> {
     /// literal gets [`Ty::Error`].
     fn items(&mut self, items: &[ExprId]) -> Ty {
         let mut common = Ty::Error;
-        let mut items = items.iter();
-        while let Some(&item) = items.next() {
+        let mut rest = items.iter();
+        while let Some(&item) = rest.next() {
             let found = self.expr(item);
             match join(&common, &found) {
                 Some(ty) => common = ty,
                 None => {
                     let at = self.span(item);
                     self.mismatch(at, &common, &found);
-                    for &rest in items {
+                    for &rest in rest {
                         self.expr(rest);
                     }
                     return Ty::Error;
                 }
             }
         }
+        for &item in items {
+            self.retype(item, &common);
+        }
         common
+    }
+
+    /// Gives a literal element (`none` or an inner collection literal) the
+    /// common type of its literal, so each expression holds the type it is
+    /// used with.
+    fn retype(&mut self, e: ExprId, ty: &Ty) {
+        let p = self.p;
+        match (p.expr(e).map(|x| &x.kind), ty) {
+            (Some(ExprKind::NoneValue), Ty::Optional(_)) => {}
+            (Some(ExprKind::Set(items)), Ty::Set(t))
+            | (Some(ExprKind::List(items)), Ty::List(t)) => {
+                for &item in items.iter() {
+                    self.retype(item, t);
+                }
+            }
+            (Some(ExprKind::Map(entries)), Ty::Map(k, v)) => {
+                for &(a, b) in entries.iter() {
+                    self.retype(a, k);
+                    self.retype(b, v);
+                }
+            }
+            _ => return,
+        }
+        if let Some(slot) = self.exprs.get_mut(e.index()) {
+            *slot = Some(ty.clone());
+        }
     }
 
     /// Checks `e` where a value of type `want` is required and gives the type
@@ -637,8 +725,11 @@ impl<'p> Cx<'p> {
                 inner.clone()
             }
             _ => {
-                let found = self.expr(e);
+                let found = self.word(e, Some(want), false);
                 self.expect(e, want, &found);
+                if matches!(kind, Some(ExprKind::NoneValue)) && fits(want, &found) {
+                    self.retype(e, want);
+                }
                 return found;
             }
         };
@@ -685,8 +776,19 @@ impl<'p> Cx<'p> {
     }
 
     fn binary(&mut self, op: BinaryOp, lhs: ExprId, rhs: ExprId) -> Ty {
-        let l = self.expr(lhs);
-        let r = self.expr(rhs);
+        // A word takes its type from the other operand (D142).
+        let (l, r) = match (self.is_word(lhs), self.is_word(rhs)) {
+            (true, false) => {
+                let r = self.expr(rhs);
+                (self.word(lhs, Some(&r), false), r)
+            }
+            (false, true) => {
+                let l = self.expr(lhs);
+                let r = self.word(rhs, Some(&l), false);
+                (l, r)
+            }
+            _ => (self.expr(lhs), self.expr(rhs)),
+        };
         match op {
             BinaryOp::And | BinaryOp::Or => {
                 self.expect(lhs, &Ty::Bool, &l);
@@ -788,6 +890,139 @@ impl<'p> Cx<'p> {
         }
     }
 
+    fn is_word(&self, e: ExprId) -> bool {
+        matches!(self.p.expr(e).map(|x| &x.kind), Some(ExprKind::Word { .. }))
+    }
+
+    /// Decides a word of D142 by the expected type `want`: the enum of
+    /// `want` with a variant of that name wins, else what the name binds
+    /// where it stands, else E0200 at the word naming the expected type or
+    /// the enums that declare the name. Any other expression is inferred.
+    /// An attribute word that binds nothing and has neither an expected type
+    /// nor a candidate enum stays undecided (`attribute`): the attribute
+    /// types of the std elements are not declared yet.
+    fn word(&mut self, e: ExprId, want: Option<&Ty>, attribute: bool) -> Ty {
+        let p = self.p;
+        let Some(ExprKind::Word { name, lexical }) = p.expr(e).map(|x| &x.kind) else {
+            return self.expr(e);
+        };
+        let want = want.map(|w| match w {
+            Ty::Optional(t) => &**t,
+            t => t,
+        });
+        let candidates: Vec<(DefId, u32)> = p
+            .defs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| match &d.kind {
+                DefKind::Enum(vs) => vs
+                    .iter()
+                    .position(|v| v == name)
+                    .map(|v| (DefId(id(i)), id(v))),
+                _ => None,
+            })
+            .collect();
+        let chosen = match want {
+            Some(Ty::Enum(d)) => candidates.iter().find(|(c, _)| c == d).copied(),
+            _ => None,
+        };
+        let res = match chosen {
+            Some((d, v)) => Res::Variant(d, v),
+            None if *lexical != Res::Error => *lexical,
+            None if attribute && want.is_none() && candidates.is_empty() => {
+                if let Some(slot) = self.exprs.get_mut(e.index()) {
+                    *slot = Some(Ty::Error);
+                }
+                return Ty::Error;
+            }
+            None => {
+                let enums: Vec<String> = candidates
+                    .iter()
+                    .map(|(d, _)| format!("`{}`", self.name(&Ty::Enum(*d))))
+                    .collect();
+                let message = match (want.filter(|w| **w != Ty::Error), enums.is_empty()) {
+                    (Some(w), true) => {
+                        format!("unknown name `{name}`; expected {}", self.describe(w))
+                    }
+                    (Some(w), false) => format!(
+                        "`{name}` is no value of {}; it is a variant of {}",
+                        self.describe(w),
+                        enums.join(", ")
+                    ),
+                    (None, true) => format!("unknown name `{name}`"),
+                    (None, false) => format!(
+                        "`{name}` is a variant of {}; the expected type does not say which",
+                        enums.join(" and ")
+                    ),
+                };
+                let at = self.span(e);
+                self.diags
+                    .push(Diagnostic::error(codes::UNKNOWN_NAME, at, message));
+                Res::Error
+            }
+        };
+        self.words.push((e, res));
+        let ty = self.name_ty(res);
+        if let Some(slot) = self.exprs.get_mut(e.index()) {
+            *slot = Some(ty.clone());
+        }
+        ty
+    }
+
+    /// The value of an integer literal, also with unary `-`.
+    fn constant(&self, e: ExprId) -> Option<i64> {
+        match &self.p.expr(e)?.kind {
+            ExprKind::Int(v) => Some(*v),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => match self.p.expr(*operand)?.kind {
+                ExprKind::Int(v) => v.checked_neg(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// True if some atom of the `call` rule `cond` (a comparison or an
+    /// `in`, under `and`, `or` and `not`) names `me` and also a parameter,
+    /// directly or through a hop or an index (D124).
+    fn binds_me(&self, cond: ExprId, params: &[LocalId]) -> bool {
+        let Some(expr) = self.p.expr(cond) else {
+            return false;
+        };
+        match &expr.kind {
+            ExprKind::Binary {
+                op: BinaryOp::And | BinaryOp::Or,
+                lhs,
+                rhs,
+            } => self.binds_me(*lhs, params) || self.binds_me(*rhs, params),
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                operand,
+            } => self.binds_me(*operand, params),
+            ExprKind::Binary { .. } | ExprKind::In { .. } => {
+                self.mentions(cond, &|k| matches!(k, ExprKind::Me))
+                    && self.mentions(
+                        cond,
+                        &|k| matches!(k, ExprKind::Name(Res::Local(l)) if params.contains(l)),
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// True if `e` or an expression inside it satisfies `is`.
+    fn mentions(&self, e: ExprId, is: &dyn Fn(&ExprKind) -> bool) -> bool {
+        let Some(expr) = self.p.expr(e) else {
+            return false;
+        };
+        is(&expr.kind)
+            || children(&expr.kind)
+                .into_iter()
+                .any(|c| self.mentions(c, is))
+    }
+
     fn unknown_call(&mut self, args: &[ExprId]) -> Ty {
         for &a in args {
             self.expr(a);
@@ -844,6 +1079,8 @@ fn join(a: &Ty, b: &Ty) -> Option<Ty> {
         (Ty::Set(x), Ty::Set(y)) => Ty::Set(both(x, y)?),
         (Ty::List(x), Ty::List(y)) => Ty::List(both(x, y)?),
         (Ty::Map(xk, xv), Ty::Map(yk, yv)) => Ty::Map(both(xk, yk)?, both(xv, yv)?),
+        (Ty::Range(x), Ty::Range(y)) => Ty::Range(both(x, y)?),
+        (Ty::Remote(x), Ty::Remote(y)) => Ty::Remote(both(x, y)?),
         _ if a == b => a.clone(),
         _ => return None,
     })
@@ -855,6 +1092,39 @@ fn plain(ty: &Ty) -> bool {
         ty,
         Ty::Optional(_) | Ty::Remote(_) | Ty::Error | Ty::Unit | Ty::Rows(_) | Ty::Range(_)
     )
+}
+
+/// The expressions directly inside an expression of this kind.
+fn children(kind: &ExprKind) -> Vec<ExprId> {
+    match kind {
+        ExprKind::Str(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                StrPart::Interp(x) => Some(*x),
+                StrPart::Text(_) => None,
+            })
+            .collect(),
+        ExprKind::Unary { operand, .. } => vec![*operand],
+        ExprKind::Binary { lhs, rhs, .. } => vec![*lhs, *rhs],
+        ExprKind::Call { callee, args } => std::iter::once(*callee)
+            .chain(args.iter().copied())
+            .collect(),
+        ExprKind::Field { base, .. } | ExprKind::Property { base, .. } => vec![*base],
+        ExprKind::Index { base, index } => vec![*base, *index],
+        ExprKind::In {
+            element,
+            collection,
+            ..
+        } => vec![*element, *collection],
+        ExprKind::Range { lo, hi } => vec![*lo, *hi],
+        ExprKind::Catch { value, .. } => vec![*value],
+        ExprKind::Fallback { value, fallback } => vec![*value, *fallback],
+        ExprKind::Set(items) | ExprKind::List(items) => items.to_vec(),
+        ExprKind::Map(entries) => entries.iter().flat_map(|&(k, v)| [k, v]).collect(),
+        ExprKind::Make { fields, .. } => fields.iter().map(|&(_, v)| v).collect(),
+        ExprKind::Query(q) => q.filter.into_iter().chain(q.take.map(|(_, n)| n)).collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn unwrap_optional(ty: Ty) -> Ty {

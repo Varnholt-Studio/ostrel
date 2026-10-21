@@ -609,3 +609,244 @@ fn mixed_literal_reports_the_element_against_the_expected_type() {
         ["expected `Text`, found `Int`"]
     );
 }
+
+// T204: the rest of the v0.2 type check (SPEC 12.6, 12.10, 12.11, D124, D142).
+
+#[test]
+fn ac_29_missing_return_is_e0305_at_the_name() {
+    let src = with_note("fn sign(n: Int) -> Int\n  if n > 0\n    return 1\n");
+    assert_eq!(resolve_diags(&src), ["E0305 7:4"]);
+    let src = with_note("server fn sign(n: Int) -> Int\n  for x in Note\n    return 1\n");
+    assert_eq!(resolve_diags(&src), ["E0305 7:11"]);
+    let src = with_note("fn sign(n: Int) -> Int\n  let m = n\n");
+    assert_eq!(resolve_diags(&src), ["E0305 7:4"]);
+}
+
+#[test]
+fn ac_29_trailing_value_in_a_body_with_branches_is_e0303() {
+    let src = with_note("fn sign(n: Int) -> Int\n  if n > 0\n    return 1\n  0\n");
+    assert_eq!(resolve_diags(&src), ["E0303 10:3"]);
+    let src = with_note("fn sign(n: Int) -> Int\n  if n > 0\n    1\n  else\n    return 0\n");
+    assert_eq!(resolve_diags(&src), ["E0303 9:5"]);
+}
+
+#[test]
+fn ac_29_bodies_that_always_return_are_clean() {
+    clean(&with_note(
+        "fn sign(n: Int) -> Int\n  if n > 0\n    return 1\n  else\n    return 0\n",
+    ));
+    clean(&with_note("fn one() -> Int\n  1\n"));
+    clean(&with_note(
+        "fn act()\n  if true\n    make Note { title: \"a\" }\n",
+    ));
+    clean(&with_note(
+        "fn f(t: Int?) -> Int\n  if let x = t\n    return x\n  else\n    return 0\n",
+    ));
+}
+
+#[test]
+fn ac_29_constant_empty_range_is_e0311_at_the_lower_bound() {
+    assert_eq!(
+        diags("app A\ndata T\n  n: Int\n  check n in 5..1\n"),
+        ["E0311 4:14"]
+    );
+    assert_eq!(
+        diags("app A\ndata T\n  n: Int\n  check n in -1..-5\n"),
+        ["E0311 4:14"]
+    );
+    let src = with_note("fn f()\n  for n in Note where title.len in 3..2\n    drop n\n");
+    assert_eq!(diags(&src), ["E0311 8:36"]);
+    assert_eq!(
+        messages("app A\ndata T\n  n: Int\n  check n in 5..1\n"),
+        ["the range 5..1 holds no value: its lower bound is above its upper bound"]
+    );
+    // Equal bounds, bounds given at run time.
+    clean("app A\ndata T\n  n: Int\n  check n in 5..5\n  check n in -5..-1\n");
+    clean(&with_note(
+        "fn f(a: Int)\n  for n in Note where title.len in 5..a\n    drop n\n",
+    ));
+}
+
+#[test]
+fn ac_29_constant_negative_count_is_e0312() {
+    let src = with_note("fn f()\n  for n in Note sort title limit -1\n    drop n\n");
+    assert_eq!(diags(&src), ["E0312 8:34"]);
+    let src = with_note("fn f()\n  for n in Note sort title last -3\n    drop n\n");
+    assert_eq!(diags(&src), ["E0312 8:33"]);
+    assert_eq!(
+        messages(&src),
+        ["the count of `last` is -3; a query count is 0 or more"]
+    );
+    clean(&with_note(
+        "fn f(k: Int)\n  for n in Note sort title last 0\n    drop n\n  for n in Note limit k\n    drop n\n",
+    ));
+}
+
+const ELEVATED: &str = "\
+app Teams
+  auth paseto open
+
+data Team
+  name: Text
+  owner: User
+  admins: Set[User]
+  see if true
+";
+
+#[test]
+fn ac_29_call_rule_of_an_elevated_function_must_bind_me() {
+    // D124 goldens ac_54_call_rule_me_eq_me and ac_54_call_rule_me_handle_const.
+    let src =
+        format!("{ELEVATED}server fn wipe(t: Team) as system\n  call if me == me\n  drop t\n");
+    assert_eq!(diags(&src), ["E0306 10:11"]);
+    let src = format!(
+        "{ELEVATED}server fn wipe(t: Team) as system\n  call if signed and me.handle == \"root\"\n  drop t\n"
+    );
+    assert_eq!(diags(&src), ["E0306 10:11"]);
+    assert_eq!(
+        messages(&src),
+        [
+            "the call rule of an as system function must compare me with a parameter or with row data"
+        ]
+    );
+    // An atom with `me` and a parameter, a hop or `in` binds it.
+    for rule in [
+        "me == t.owner",
+        "signed and me in t.admins",
+        "not (t.owner != me) or me.handle == \"x\"",
+    ] {
+        let src =
+            format!("{ELEVATED}server fn wipe(t: Team) as system\n  call if {rule}\n  drop t\n");
+        clean(&src);
+    }
+    // Only elevated functions need it.
+    clean(&format!(
+        "{ELEVATED}server fn look(t: Team) -> Text\n  call if me == me\n  t.name\n"
+    ));
+}
+
+const WORDS: &str = "\
+app Board
+
+enum Phase = open | done
+enum Door = open | shut
+
+data Card
+  phase: Phase
+  door: Door
+  see if phase == open
+";
+
+#[test]
+fn ac_29_words_take_the_expected_type() {
+    let (program, diagnostics) = run(&format!(
+        "{WORDS}fn f(c: Card) -> Door\n  c.phase = open\n  return open\n"
+    ));
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let words: Vec<_> = program
+        .exprs
+        .iter()
+        .filter_map(|e| match e.kind {
+            ExprKind::Name(Res::Variant(d, v)) => {
+                Some((program.def(d).map(|d| &*d.name), v, e.ty.clone()))
+            }
+            ExprKind::Word { .. } => panic!("a word is left after check"),
+            _ => None,
+        })
+        .collect();
+    let phase = program
+        .defs
+        .iter()
+        .position(|d| &*d.name == "Phase")
+        .unwrap();
+    let door = program
+        .defs
+        .iter()
+        .position(|d| &*d.name == "Door")
+        .unwrap();
+    let (phase, door) = (
+        Ty::Enum(crate::hir::DefId(phase as u32)),
+        Ty::Enum(crate::hir::DefId(door as u32)),
+    );
+    assert_eq!(
+        words,
+        [
+            (Some("Phase"), 0, Some(phase.clone())),
+            (Some("Phase"), 0, Some(phase)),
+            (Some("Door"), 0, Some(door)),
+        ]
+    );
+}
+
+#[test]
+fn ac_29_words_without_a_deciding_type_are_e0200() {
+    let src = format!("{WORDS}fn f()\n  let x = open\n");
+    assert_eq!(diags(&src), ["E0200 11:11"]);
+    assert_eq!(
+        messages(&src),
+        ["`open` is a variant of `Phase` and `Door`; the expected type does not say which"]
+    );
+    let src = format!("{WORDS}fn f() -> Int\n  return open\n");
+    assert_eq!(diags(&src), ["E0200 11:10"]);
+    assert_eq!(
+        messages(&src),
+        ["`open` is no value of `Int`; it is a variant of `Phase`, `Door`"]
+    );
+    // `in` takes the element type of the collection.
+    clean(&format!(
+        "{WORDS}fn f(c: Card) -> Bool\n  return open in {{c.door}}\n"
+    ));
+}
+
+#[test]
+fn ac_29_in_a_map_checks_the_key() {
+    let src = with_note("fn f(m: Map[Text, Int]) -> Bool\n  return 1 in m\n");
+    assert_eq!(diags(&src), ["E0304 8:10"]);
+    clean(&with_note(
+        "fn f(m: Map[Text, Int]) -> Bool\n  return \"a\" in m\n",
+    ));
+}
+
+#[test]
+fn ac_29_fallback_literal_is_checked_per_element() {
+    // ivo #2443: the finding stands at the element, not at the literal.
+    let src =
+        with_note("fn f(m: Map[Text, List[Int]]) -> List[Int]\n  return m[\"a\"] ?? [1, \"b\"]\n");
+    assert_eq!(diags(&src), ["E0304 8:24"]);
+}
+
+#[test]
+fn ac_29_each_none_against_a_plain_list_is_a_finding() {
+    // yannick #2439 F1: two faults, two findings.
+    let src = with_note("fn f()\n  let xs: List[Int] = [none, none]\n");
+    let src = src.replace("let xs: List[Int] = [none, none]", "g([none, none])");
+    let src = format!("{src}fn g(xs: List[Int])\n  make Note {{ title: \"a\" }}\n");
+    assert_eq!(diags(&src), ["E0304 8:6", "E0304 8:12"]);
+}
+
+#[test]
+fn ac_29_inner_literals_get_the_joined_type() {
+    // yannick #2439 F4.
+    let (program, d) = run(&with_note("var xs = [[1], [none]]\n"));
+    assert!(d.is_empty(), "{d:?}");
+    let want = Ty::List(Box::new(Ty::Optional(Box::new(Ty::Int))));
+    let inner: Vec<_> = program
+        .exprs
+        .iter()
+        .filter(|e| matches!(e.kind, ExprKind::List(ref items) if items.len() == 1))
+        .map(|e| e.ty.clone())
+        .collect();
+    assert_eq!(inner, [Some(want.clone()), Some(want)]);
+}
+
+#[test]
+fn ac_29_ranges_and_remote_values_join() {
+    // ivo #2443: `join` of ranges.
+    let (program, d) = run(&with_note("var rs = [1..2, 3..4]\n"));
+    assert!(d.is_empty(), "{d:?}");
+    let var = program.defs.iter().find_map(|d| match &d.kind {
+        DefKind::Var(v) => v.ty.clone(),
+        _ => None,
+    });
+    assert_eq!(var, Some(Ty::List(Box::new(Ty::Range(Box::new(Ty::Int))))));
+}
