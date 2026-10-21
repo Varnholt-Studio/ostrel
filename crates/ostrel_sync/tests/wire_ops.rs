@@ -4,10 +4,12 @@
 
 use ostrel_core::ids::{Hlc, OpId, ReplicaId, RowId};
 use ostrel_core::value::Value;
-use ostrel_sync::protocol::{FieldId, LIMITS, ModelId, Op, OpBody};
+use ostrel_sync::protocol::{
+    ClientMsg, DecodedOp, FieldId, LIMITS, ModelId, Op, OpBody, OpFault, ValueFault,
+};
 use ostrel_sync::wire::json::{self, Json};
 use ostrel_sync::wire::{
-    DecodedOp, OpFault, ValueFault, WireError, WireSchema, WireTy, decode_op, encode_op, op_bytes,
+    WireError, WireSchema, WireTy, decode_client, decode_op, encode_client, encode_op, op_bytes,
     read_value,
 };
 
@@ -534,5 +536,119 @@ fn ids_unknown_to_the_schema_are_not_written() {
     assert_eq!(
         encode_op(&unknown_field, &schema()),
         Err(WireError::NotInSchema("field"))
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// The client `ops` message (D135)
+
+fn ops_frame(ops: &[String]) -> String {
+    format!(r#"{{"ops":[{}],"t":"ops","v":0}}"#, ops.join(","))
+}
+
+fn decode_ops_frame(frame: &str) -> Result<ClientMsg, WireError> {
+    decode_client(frame.as_bytes(), &schema())
+}
+
+fn op_with(seq: u32, body: OpBody) -> Op {
+    Op {
+        id: op_id(seq),
+        ..op(body)
+    }
+}
+
+#[test]
+fn a_client_ops_batch_round_trips() {
+    let batch = ClientMsg::Ops(vec![
+        DecodedOp::Valid(op_with(1, OpBody::Drop)),
+        DecodedOp::Valid(op_with(
+            2,
+            OpBody::Set {
+                field: field("title"),
+                value: text("x"),
+            },
+        )),
+    ]);
+    let frame = encode_client(&batch, &schema()).unwrap();
+    assert_eq!(decode_ops_frame(&frame), Ok(batch), "{frame}");
+    let empty = ClientMsg::Ops(Vec::new());
+    let frame = encode_client(&empty, &schema()).unwrap();
+    assert_eq!(frame, r#"{"ops":[],"t":"ops","v":0}"#);
+    assert_eq!(decode_ops_frame(&frame), Ok(empty));
+}
+
+#[test]
+fn an_op_that_does_not_fit_the_schema_leaves_the_rest_of_the_batch_valid() {
+    let good = encode_op(&op_with(1, OpBody::Drop), &schema()).unwrap();
+    let bad = encode_op(
+        &op_with(
+            2,
+            OpBody::Set {
+                field: field("count"),
+                value: int(1),
+            },
+        ),
+        &schema(),
+    )
+    .unwrap()
+    .replace(r#""value":1"#, r#""value":"1""#);
+    let later = encode_op(&op_with(3, OpBody::Drop), &schema()).unwrap();
+    let Ok(ClientMsg::Ops(ops)) = decode_ops_frame(&ops_frame(&[good, bad, later])) else {
+        panic!("expected an ops batch");
+    };
+    assert_eq!(
+        ops,
+        [
+            DecodedOp::Valid(op_with(1, OpBody::Drop)),
+            DecodedOp::Invalid {
+                id: op_id(2),
+                hlc: stamp(),
+                row: row(),
+                fault: OpFault::Value {
+                    field: field("count"),
+                    fault: ValueFault::WrongType,
+                },
+            },
+            DecodedOp::Valid(op_with(3, OpBody::Drop)),
+        ]
+    );
+}
+
+#[test]
+fn a_malformed_op_head_fails_the_whole_frame() {
+    let good = encode_op(&op_with(1, OpBody::Drop), &schema()).unwrap();
+    let bad_head = good.replace(r#""row":""#, r#""row":"x"#);
+    assert!(matches!(
+        decode_ops_frame(&ops_frame(&[good.clone(), bad_head])),
+        Err(WireError::InvalidId("row", _))
+    ));
+    assert_eq!(
+        decode_ops_frame(r#"{"ops":{},"t":"ops","v":0}"#),
+        Err(WireError::WrongType("ops"))
+    );
+    assert_eq!(
+        decode_ops_frame(r#"{"ops":[1],"t":"ops","v":0}"#),
+        Err(WireError::WrongType("ops"))
+    );
+    assert_eq!(
+        decode_ops_frame(r#"{"t":"ops","v":0}"#),
+        Err(WireError::MissingKey("ops"))
+    );
+}
+
+#[test]
+fn encoding_an_invalid_op_is_a_typed_error() {
+    let batch = ClientMsg::Ops(vec![
+        DecodedOp::Valid(op_with(1, OpBody::Drop)),
+        DecodedOp::Invalid {
+            id: op_id(2),
+            hlc: stamp(),
+            row: row(),
+            fault: OpFault::UnknownModel("Gone".into()),
+        },
+    ]);
+    assert_eq!(
+        encode_client(&batch, &schema()),
+        Err(WireError::InvalidOp(op_id(2)))
     );
 }

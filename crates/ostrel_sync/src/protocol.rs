@@ -69,8 +69,10 @@ pub enum ClientMsg {
     },
     /// A batch of local ops in `seq` order of the replica. A batch over [`Limits::ops_per_batch`]
     /// gets one `Reject Limit` per op, in batch order (D106). The client packs batches so that
-    /// the frame stays within [`Limits::frame_bytes`] (D109).
-    Ops(Vec<Op>),
+    /// the frame stays within [`Limits::frame_bytes`] (D109). An op that was well formed but
+    /// did not fit the schema arrives as [`DecodedOp::Invalid`], so step 6 of ARCHITECTURE 5.5
+    /// still knows its head (D135). A client only ever sends [`DecodedOp::Valid`] ops.
+    Ops(Vec<DecodedOp>),
     Call {
         call: CallId,
         function: FnId,
@@ -82,8 +84,9 @@ pub enum ClientMsg {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServerMsg {
     Welcome(Welcome),
-    /// One page of rows of a subscription, at most [`Limits::rows_per_snapshot`], at log
-    /// position `seq`. `last` marks the final page. A snapshot page sets the client's
+    /// One page of rows of a subscription, at log position `seq`. A page closes at
+    /// [`Limits::rows_per_snapshot`] rows or before the row that would push the frame over
+    /// [`Limits::frame_bytes`] (D121). `last` marks the final page. A snapshot page sets the client's
     /// `applied_server_seq` to `seq` (D62). A [`Row`] of the DB interface carries its version
     /// and every field; the server sends only the fields the client may read (D101).
     Snapshot {
@@ -92,7 +95,9 @@ pub enum ServerMsg {
         seq: ServerSeq,
         last: bool,
     },
-    /// Ops of other replicas, in non decreasing [`ServerSeq`] within one session (D62).
+    /// Ops of other replicas, in non decreasing [`ServerSeq`] within one session (D62). The
+    /// server splits its ops over several messages so that each frame fits
+    /// [`Limits::frame_bytes`], keeping their order (D121).
     Ops(Vec<LoggedOp>),
     Ack(Ack),
     Reject {
@@ -124,8 +129,10 @@ pub enum ServerMsg {
     Error(ProtocolError),
 }
 
-/// First message of every connection.
-#[derive(Clone, Debug, PartialEq)]
+/// First message of every connection. A `replica_secret` in an app with `auth`, or one without
+/// a `replica`, is a fatal [`ErrorCode::Protocol`] (D122). `Debug` shows `token` and
+/// `replica_secret` only as `<redacted>` (D122).
+#[derive(Clone, PartialEq)]
 pub struct Hello {
     /// PASETO v4.public token; `None` only in apps without `auth`.
     pub token: Option<String>,
@@ -138,8 +145,8 @@ pub struct Hello {
     pub last_server_seq: Option<ServerSeq>,
 }
 
-/// Answer to [`Hello`].
-#[derive(Clone, Debug, PartialEq)]
+/// Answer to [`Hello`]. `Debug` shows `replica_secret` only as `<redacted>` (D122).
+#[derive(Clone, PartialEq)]
 pub struct Welcome {
     /// The confirmed or newly issued replica.
     pub replica: ReplicaId,
@@ -151,6 +158,41 @@ pub struct Welcome {
     pub limits: Limits,
 }
 
+/// Stands in for a secret in `Debug` output, so no log carries it (D122).
+struct Redacted;
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+fn redact(secret: &Option<String>) -> Option<Redacted> {
+    secret.as_ref().map(|_| Redacted)
+}
+
+impl std::fmt::Debug for Hello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hello")
+            .field("token", &redact(&self.token))
+            .field("replica", &self.replica)
+            .field("replica_secret", &redact(&self.replica_secret))
+            .field("last_server_seq", &self.last_server_seq)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Welcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Welcome")
+            .field("replica", &self.replica)
+            .field("replica_secret", &redact(&self.replica_secret))
+            .field("server_ms", &self.server_ms)
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
 /// One op: a change of exactly one row, field, element or key (G12).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Op {
@@ -160,6 +202,85 @@ pub struct Op {
     pub model: ModelId,
     pub row: RowId,
     pub body: OpBody,
+}
+
+/// An op of a received [`ClientMsg::Ops`] batch (D132, D135).
+///
+/// The codec reads the head of every op (`id`, `hlc`, `row`) strictly; a malformed head is a
+/// fatal protocol error. The rest is read against the schema, and an op whose rest does not fit
+/// is kept as `Invalid` with its head: the server rejects it in step 6 of ARCHITECTURE 5.5,
+/// after the order check, so a replay still gets its original outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecodedOp {
+    Valid(Op),
+    /// Well formed but not valid for the schema; the server answers `Reject Invalid`. It
+    /// exists only on the receiving side: encoding it is an error, never a frame.
+    Invalid {
+        id: OpId,
+        hlc: Hlc,
+        row: RowId,
+        fault: OpFault,
+    },
+}
+
+/// Why a well formed op is [`DecodedOp::Invalid`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpFault {
+    /// The schema has no model of this name (cut to the codec's echo limit).
+    UnknownModel(String),
+    /// The model has no field of this name (cut to the codec's echo limit).
+    UnknownField(String),
+    /// A value of this field does not fit its type.
+    Value { field: FieldId, fault: ValueFault },
+    /// The body does not suit the type of the field, for example `add` on a `Text` field or
+    /// `set` on a `Set` field.
+    WrongBody { field: FieldId },
+    /// A `remove` names no tag, more than [`Limits::tags_per_remove`] tags, or a tag that is
+    /// not an op id.
+    Tags { field: FieldId },
+    /// The canonical encoding of the op is over [`Limits::op_bytes`] (D109).
+    TooLarge { bytes: usize },
+}
+
+/// Why a received value does not fit the type of its place (D132).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueFault {
+    /// The JSON kind does not match the type, for example a string for an `Int`.
+    WrongType,
+    /// An `Int`, `Serial` or `Time` outside the safe range (D24).
+    IntRange,
+    /// Collections nested deeper than [`Limits::nesting_depth`].
+    TooDeep,
+    /// A `Text` of more than [`Limits::text_bytes`] UTF-8 bytes (D109).
+    TextTooLong,
+    /// A name that is not a variant of the enum.
+    UnknownVariant,
+    /// A reference that is not a 32 digit lowercase row id.
+    InvalidRef,
+    /// `Bytes` that are not unpadded base64url.
+    InvalidBytes,
+    /// A `Rank` key that is not 1 to [`Limits::rank_digits`] base 62 digits without a
+    /// trailing `0` (D88).
+    InvalidRank,
+    /// A `Set` that holds an element twice, or a `Map` that holds a key twice.
+    Repeated,
+}
+
+impl std::fmt::Display for ValueFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let why = match self {
+            ValueFault::WrongType => "value has the wrong JSON form for its type",
+            ValueFault::IntRange => "integer outside the safe range",
+            ValueFault::TooDeep => "value nested too deeply",
+            ValueFault::TextTooLong => "text over the text limit",
+            ValueFault::UnknownVariant => "unknown enum variant",
+            ValueFault::InvalidRef => "reference is not a row id",
+            ValueFault::InvalidBytes => "bytes are not unpadded base64url",
+            ValueFault::InvalidRank => "invalid rank key",
+            ValueFault::Repeated => "set element or map key repeated",
+        };
+        f.write_str(why)
+    }
 }
 
 /// An op as the server log holds and broadcasts it, with its accepted stamp.
@@ -206,7 +327,9 @@ pub enum OpBody {
 }
 
 /// Acknowledgement of one client [`ClientMsg::Ops`] batch. A batch in which no op was accepted
-/// gets no `Ack`. A replayed op (`seq <= last_seq`, D110) that was accepted gets its `Ack`
+/// gets no `Ack`. It is cumulative: it confirms every op of the replica up to `op` that got no
+/// [`ServerMsg::Reject`] of its own; a batch of replays names only its highest replay and that
+/// op's logged [`ServerSeq`] (D122). A replayed op (`seq <= last_seq`, D110) that was accepted gets its `Ack`
 /// again with the logged [`ServerSeq`] and its accepted stamp in `restamped`, always.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ack {
@@ -259,12 +382,16 @@ pub enum CallError {
     /// The function is unknown, or a model argument is missing or unreadable (same kind and
     /// text for both, D99).
     NotFound,
+    /// A rate limit was reached, or the `Return` would exceed [`Limits::frame_bytes`] (D121).
     Limit,
     Invalid,
     /// A runtime error of the server VM, by its kind name (ARCHITECTURE 3.4).
     Runtime {
         kind: String,
     },
+    /// The server could not start the body (the audit entry was not written); nothing of the
+    /// body happened, so a retry is safe (D134).
+    Unavailable,
 }
 
 /// A protocol error. Without `sub` it is fatal and the server closes the connection; with
@@ -333,7 +460,9 @@ impl ServerMsg {
 /// Values change only by decision. Sign in, sidecar and VM limits live with their owners.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// WebSocket frame; beyond it fatal [`ErrorCode::FrameTooLarge`].
+    /// WebSocket frame, in both directions (D121). A larger client frame is a fatal
+    /// [`ErrorCode::FrameTooLarge`]; the server never sends one, and a client that receives one
+    /// treats it as a server defect and closes the connection.
     pub frame_bytes: u32,
     /// HTTP request body; beyond it 413.
     pub http_body_bytes: u32,
@@ -347,6 +476,10 @@ pub struct Limits {
     /// Canonical encoding of one op, envelope included (D109). The client does not apply a
     /// larger write and sends no op; the server answers `Reject Invalid`.
     pub op_bytes: u32,
+    /// Canonical encoding of one row as a [`ServerMsg::Snapshot`] carries it: all fields, `Set`
+    /// and `Map` contents, CRDT state (D121). The client does not apply a larger write and
+    /// sends no op; the server answers `Reject Limit` for the op whose merge would exceed it.
+    pub row_bytes: u32,
     /// Value nesting depth; beyond it `Invalid`.
     pub nesting_depth: u32,
     /// Size of one `Text` field in UTF-8 bytes of the value (D109); beyond it `Invalid`.
@@ -386,6 +519,7 @@ pub const LIMITS: Limits = Limits {
     ops_burst: 200,
     rows_per_hour: 1_000,
     op_bytes: 512 << 10,
+    row_bytes: 768 << 10,
     nesting_depth: 32,
     text_bytes: 256 << 10,
     subscriptions_per_session: 64,
@@ -414,6 +548,7 @@ mod tests {
         assert_eq!(LIMITS.http_body_bytes, 1_048_576);
         assert_eq!(LIMITS.text_bytes, 262_144);
         assert_eq!(LIMITS.op_bytes, 524_288);
+        assert_eq!(LIMITS.row_bytes, 786_432);
         assert_eq!(LIMITS.ops_per_batch, 200);
         assert_eq!(
             LIMITS.filter_nodes as usize,
@@ -422,9 +557,43 @@ mod tests {
         const {
             assert!(LIMITS.ops_burst >= LIMITS.ops_per_second);
             assert!(LIMITS.ops_per_batch <= LIMITS.ops_burst);
-            assert!(LIMITS.op_bytes <= LIMITS.frame_bytes);
+            assert!(LIMITS.op_bytes <= LIMITS.row_bytes);
+            assert!(
+                LIMITS.row_bytes as usize + SNAPSHOT_ENVELOPE.len() <= LIMITS.frame_bytes as usize
+            );
             assert!(LIMITS.calls_burst >= LIMITS.calls_per_second);
             assert!(LIMITS.held_per_subscription >= LIMITS.ids_per_page);
+        }
+    }
+
+    /// The largest `Snapshot` frame around one row: maximal `sub` and `seq`, one row slot.
+    const SNAPSHOT_ENVELOPE: &str = r#"{"v":0,"t":"snapshot","sub":4294967295,"rows":[],"seq":"ffffffffffffffff","last":false}"#;
+
+    #[test]
+    fn debug_of_hello_and_welcome_hides_secrets() {
+        let token = "v4.public.secret-token-body";
+        let secret = "0123456789abcdef0123456789abcdef";
+        let hello = format!(
+            "{:?}",
+            Hello {
+                token: Some(token.into()),
+                replica: Some(ReplicaId(7)),
+                replica_secret: Some(secret.into()),
+                last_server_seq: None,
+            }
+        );
+        let welcome = format!(
+            "{:?}",
+            Welcome {
+                replica: ReplicaId(7),
+                replica_secret: Some(secret.into()),
+                server_ms: 0,
+                limits: LIMITS,
+            }
+        );
+        for out in [&hello, &welcome] {
+            assert!(!out.contains(token) && !out.contains(secret), "{out}");
+            assert!(out.contains("<redacted>"), "{out}");
         }
     }
 
