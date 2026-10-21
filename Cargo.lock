@@ -349,6 +349,7 @@ dependencies = [
  "ostrel_db_sqlite",
  "ostrel_ir",
  "ostrel_sema",
+ "ostrel_sync",
  "ostrel_syntax",
  "ostrel_vm",
  "sha2",
