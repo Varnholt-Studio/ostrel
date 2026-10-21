@@ -1103,6 +1103,7 @@ fn diagnostic_codes_match_the_catalog() {
         (codes::LONE_CLOSE_BRACE, 12),
         (codes::DEEP_INDENT, 13),
         (codes::INVALID_UTF8, 14),
+        (codes::UNTERMINATED_CSS_COMMENT, 15),
     ];
     for (code, number) in expected {
         assert_eq!(code.number(), *number);
