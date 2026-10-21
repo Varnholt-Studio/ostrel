@@ -22,7 +22,8 @@
 //!   [`WireError`], fatal for the connection;
 //! * the form is right but the op does not fit the schema (unknown model or field, a value of
 //!   the wrong type, a body that does not suit the field), names two or more of the seven
-//!   kinds (D147), or is over the op size limit: [`DecodedOp::Invalid`]. The server rejects
+//!   kinds (D147), has a `remove` whose tags are absent, `null`, empty, over the limit or not
+//!   op ids (D135), or is over the op size limit: [`DecodedOp::Invalid`]. The server rejects
 //!   it in step 6 of ARCHITECTURE 5.5, after the order check, so a replay still gets its
 //!   original outcome.
 //!
@@ -181,7 +182,9 @@ enum RawBody {
     Remove {
         field: String,
         elem: Json,
-        tags: Json,
+        /// `None` when the key `tags` is absent. That makes only this op invalid, not the
+        /// frame: the tags are content to check against the limit, like a value (D135).
+        tags: Option<Json>,
     },
     Put {
         field: String,
@@ -241,7 +244,11 @@ fn raw_kind(key: &'static str, kind: &str, inner: Json) -> Result<RawBody, WireE
         "remove" => RawBody::Remove {
             field: f.req("field", string)?,
             elem: f.req("elem", any)?,
-            tags: f.req("tags", any)?,
+            tags: if f.has("tags") {
+                Some(f.req("tags", any)?)
+            } else {
+                None
+            },
         },
         "put" => RawBody::Put {
             field: f.req("field", string)?,
@@ -353,9 +360,10 @@ impl RawBody {
     }
 }
 
-/// The tags of a `remove`: 1 to `tags_per_remove` op ids (ARCHITECTURE 5.9, 6.2).
-fn remove_tags(json: Json) -> Option<Vec<OpId>> {
-    let Json::Arr(items) = json else {
+/// The tags of a `remove`: 1 to `tags_per_remove` op ids (ARCHITECTURE 5.9, 6.2). `None`
+/// for anything else, an absent key included.
+fn remove_tags(json: Option<Json>) -> Option<Vec<OpId>> {
+    let Some(Json::Arr(items)) = json else {
         return None;
     };
     if items.is_empty() || items.len() > LIMITS.tags_per_remove as usize {

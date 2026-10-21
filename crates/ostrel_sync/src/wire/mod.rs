@@ -124,7 +124,7 @@ pub trait WireSchema {
     /// The name of a server function, for writing.
     fn function_name(&self, function: FnId) -> Option<&str>;
     /// The wire types of the parameters of a server function, in declaration order. A model
-    /// parameter is a [`WireTy::Ref`].
+    /// parameter is a [`WireTy::Ref`] to that model.
     fn function_params(&self, function: FnId) -> Option<&[WireTy]>;
     /// The wire type of the result of a server function.
     fn function_result(&self, function: FnId) -> Option<&WireTy>;
