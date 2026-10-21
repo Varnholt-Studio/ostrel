@@ -1,0 +1,1 @@
+tests/errors/v0_2/model_make_enum.ostl:6:8: error[E0205]: `make` needs a data type; `Color` is not one

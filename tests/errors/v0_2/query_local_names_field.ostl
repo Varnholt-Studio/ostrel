@@ -1,0 +1,8 @@
+app Golden
+
+data Post
+  pos: Int
+  see if true
+
+fn f(pos: Int)
+  drop Post where pos == 1

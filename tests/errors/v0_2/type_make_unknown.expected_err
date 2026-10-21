@@ -1,0 +1,1 @@
+tests/errors/v0_2/type_make_unknown.ostl:4:8: error[E0203]: unknown data type `Nope`

@@ -7,6 +7,16 @@
 //! no error (SPEC 12.1: the checker does not run on a file with lexer or parser
 //! diagnostics).
 //!
+//! Two front ends follow the parser (SPEC 2: a script program has no `app`
+//! declaration, an app has one):
+//! * A script program goes through the v0.1 checker in the crate root of
+//!   `ostrel_sema`, for `check` and `run` alike. Declarations outside the v0.1
+//!   slice stay E0100 there.
+//! * An app under `check` goes through the HIR: name resolution
+//!   (`ostrel_sema::hir::resolve`) and, when that reported no error, the HIR
+//!   checker (`ostrel_sema::hir::check`). An app under `run` takes the script
+//!   path, because `run` only runs script programs.
+//!
 //! Output contract:
 //! * Program output goes through the [`Host`] given by the caller.
 //! * Diagnostics, runtime errors and internal errors are appended to an error
@@ -17,7 +27,8 @@
 use std::fmt::Write as _;
 
 use ostrel_core::{Diagnostic, FileId, SourceMap, Span};
-use ostrel_syntax::ast::Module;
+use ostrel_sema::hir;
+use ostrel_syntax::ast::{Item, Module};
 use ostrel_syntax::lex::codes::{INVALID_UTF8, msg_invalid_utf8};
 use ostrel_vm::{Host, Limits, RuntimeError};
 
@@ -122,6 +133,9 @@ pub fn execute_module(
     err: &mut String,
 ) -> Exit {
     let src = map.text(file).unwrap_or_default();
+    if mode == Mode::Check && is_app(module) {
+        return check_app(map, file, src, module, err);
+    }
     let (checked, diags) = ostrel_sema::check(module, file, src);
     report(map, &diags, err);
     if has_error(&diags) {
@@ -151,6 +165,37 @@ pub fn execute_module(
             Exit::Failure
         }
     }
+}
+
+/// Whether `module` declares an `app` (SPEC 2), which makes it an app rather
+/// than a script program.
+fn is_app(module: &Module) -> bool {
+    module
+        .items()
+        .iter()
+        .any(|item| matches!(item, Item::App(_)))
+}
+
+/// `ostrel check` of an app: name resolution into the HIR, then the HIR
+/// checker. The checker runs only on a program that resolved without error,
+/// so one fault never gives a second diagnostic (SPEC 12.1).
+fn check_app(map: &SourceMap, file: FileId, src: &str, module: &Module, err: &mut String) -> Exit {
+    let sources = [hir::Source {
+        file,
+        text: src,
+        module,
+    }];
+    let (mut program, diags) = hir::resolve(&sources);
+    report(map, &diags, err);
+    if has_error(&diags) {
+        return Exit::Failure;
+    }
+    let diags = hir::check(&mut program);
+    report(map, &diags, err);
+    if has_error(&diags) {
+        return Exit::Failure;
+    }
+    Exit::Success
 }
 
 fn has_error(diags: &[Diagnostic]) -> bool {
@@ -201,4 +246,120 @@ pub fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! Routing between the two front ends. The diagnostics of the HIR front
+    //! end are pinned by the goldens under `tests/errors/v0_2/`.
+
+    use ostrel_vm::{Host, Limits};
+
+    use super::{Exit, Mode, execute};
+
+    #[derive(Default)]
+    struct Capture(String);
+
+    impl Host for Capture {
+        fn print(&mut self, text: &str) {
+            self.0.push_str(text);
+            self.0.push('\n');
+        }
+    }
+
+    fn outcome(mode: Mode, src: &str) -> (Exit, String) {
+        let mut out = Capture::default();
+        let mut err = String::new();
+        let exit = execute(mode, "t.ostl", src.as_bytes().to_vec(), &mut out, &mut err);
+        assert!(out.0.is_empty(), "{:?}", out.0);
+        (exit, err)
+    }
+
+    fn check(src: &str) -> (Exit, String) {
+        outcome(Mode::Check, src)
+    }
+
+    const NOTES: &str = "\
+app Notes
+
+data Note
+  title: Text
+  see if true
+  make if true
+
+view Main
+  col
+    for n in Note sort title
+      text n.title
+";
+
+    #[test]
+    fn an_app_is_checked_through_the_hir() {
+        // The v0.1 checker would report E0100 at `app` and E0400.
+        assert_eq!(check(NOTES), (Exit::Success, String::new()));
+        let src = NOTES.replace("sort title", "sort titel");
+        assert_eq!(
+            check(&src),
+            (
+                Exit::Failure,
+                "t.ostl:10:24: error[E0204]: data type `Note` has no field `titel`\n".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn author_is_a_field_only_with_auth() {
+        let read =
+            "data Post\n  pos: Int\n  see if true\n\nfn f(p: Post) -> Text\n  p.author.handle\n";
+        let with_auth = format!("app A\n  auth paseto open\n\n{read}");
+        assert_eq!(check(&with_auth), (Exit::Success, String::new()));
+        let (exit, err) = check(&format!("app A\n\n{read}"));
+        assert_eq!(exit, Exit::Failure);
+        assert!(err.starts_with("t.ostl:8:5: error[E0204]: "), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        // A declared field `author` without `auth` is an ordinary field.
+        let own = "app A\n\ndata Post\n  author: Text\n\nfn f(p: Post) -> Text\n  p.author\n";
+        assert_eq!(check(own), (Exit::Success, String::new()));
+    }
+
+    #[test]
+    fn a_script_program_keeps_the_v0_1_checker() {
+        let src = "fn main()\n  print(\"ok\")\n\nenum Color = red | green\n";
+        assert_eq!(
+            check(src),
+            (
+                Exit::Failure,
+                "t.ostl:4:1: error[E0100]: `enum` declaration is not available in v0.1\n"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn run_takes_the_script_path_for_an_app() {
+        let (exit, err) = outcome(Mode::Run(Limits::default()), NOTES);
+        assert_eq!(exit, Exit::Failure);
+        assert!(
+            err.starts_with(
+                "t.ostl:1:1: error[E0100]: `app` declaration is not available in v0.1\n"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_hir_checker_does_not_run_after_a_resolve_error() {
+        // Two independent faults, both from name resolution, each reported
+        // once and in source order; nothing follows from the HIR checker.
+        let src = "app A\n\ndata Post\n  pos: Int\n  pos: Text\n  see if nope\n";
+        let (exit, err) = check(src);
+        assert_eq!(exit, Exit::Failure);
+        assert_eq!(
+            err.lines()
+                .map(|l| l.split(": ").next().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["t.ostl:5:3", "t.ostl:6:10"],
+            "{err}"
+        );
+    }
 }

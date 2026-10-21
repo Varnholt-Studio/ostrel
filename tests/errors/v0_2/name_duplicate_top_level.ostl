@@ -1,0 +1,7 @@
+app Golden
+
+data f
+  a: Int
+
+fn f()
+  print(1)
