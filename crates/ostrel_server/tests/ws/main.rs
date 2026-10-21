@@ -26,6 +26,8 @@ use ostrel_sync::wire::{WireSchema, WireTy};
 use ostrel_vm::host::{AuditEntry, AuditError, BoxFuture, ExternErrorKind, ServerHost};
 use ostrel_vm::{Limits, RuntimeError, RuntimeErrorKind, Span};
 
+mod hello;
+
 // ---------------------------------------------------------------------------------------------
 // Driving futures
 // ---------------------------------------------------------------------------------------------
@@ -425,7 +427,8 @@ fn a_refused_call_frame_gets_a_return_and_the_connection_stays() {
 
 #[test]
 fn a_malformed_frame_and_a_second_hello_are_fatal() {
-    let fatal = r#"{"code":"Protocol","sub":null,"t":"error","v":0}"#.to_owned();
+    let fatal =
+        r#"{"code":"Protocol","retry_after_ms":null,"sub":null,"t":"error","v":0}"#.to_owned();
     let mut session = Session::new(None);
     assert_eq!(
         session.receive(b"{\"v\":0,\"t\":\"call\"}", &Schema),
@@ -444,7 +447,9 @@ fn an_open_call_id_used_again_is_fatal() {
     ));
     assert_eq!(
         session.receive(&call_frame(5, "count", "[]"), &Schema),
-        Incoming::Close(r#"{"code":"Protocol","sub":null,"t":"error","v":0}"#.to_owned())
+        Incoming::Close(
+            r#"{"code":"Protocol","retry_after_ms":null,"sub":null,"t":"error","v":0}"#.to_owned()
+        )
     );
 }
 
@@ -459,7 +464,9 @@ fn an_open_call_id_with_an_unknown_function_is_fatal() {
     // that is still running.
     assert_eq!(
         session.receive(&call_frame(5, "nope", "[]"), &Schema),
-        Incoming::Close(r#"{"code":"Protocol","sub":null,"t":"error","v":0}"#.to_owned())
+        Incoming::Close(
+            r#"{"code":"Protocol","retry_after_ms":null,"sub":null,"t":"error","v":0}"#.to_owned()
+        )
     );
 }
 
@@ -473,7 +480,9 @@ fn an_open_call_id_with_arguments_that_do_not_fit_is_fatal() {
     // Not `return` `Invalid` for call 6, which is still running.
     assert_eq!(
         session.receive(&call_frame(6, "bump", "[1]"), &Schema),
-        Incoming::Close(r#"{"code":"Protocol","sub":null,"t":"error","v":0}"#.to_owned())
+        Incoming::Close(
+            r#"{"code":"Protocol","retry_after_ms":null,"sub":null,"t":"error","v":0}"#.to_owned()
+        )
     );
 }
 

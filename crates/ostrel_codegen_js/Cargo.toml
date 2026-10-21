@@ -1,0 +1,15 @@
+[package]
+name = "ostrel_codegen_js"
+description = "Browser backend of the Ostrel programming language: ES modules from the IR."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ostrel_core.workspace = true
+ostrel_ir.workspace = true
+
+[lints]
+workspace = true

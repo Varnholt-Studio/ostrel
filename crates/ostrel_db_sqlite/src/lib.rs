@@ -12,8 +12,9 @@
 //!   statement. A second connection that wants to write waits up to the busy timeout and then
 //!   fails with [`DbError::Backend`]; nothing is half applied. `query` outside a transaction
 //!   reads one consistent snapshot of committed state.
-//! * Each `apply`, `append_ops` and `record_reject` call runs in a savepoint: a refused call changes nothing.
-//!   After a call inside a transaction failed, every further call except rollback fails too.
+//! * Each `apply`, `append_ops` and `record_reject` call runs in a savepoint: a refused call
+//!   changes nothing. After a call inside a transaction failed, every further call except
+//!   rollback fails too.
 //! * Dropping a transaction without commit rolls it back.
 //!
 //! Storage layout (docs/db-mapping.md describes the target layout): no migration step exists
@@ -21,15 +22,16 @@
 //! are stored schema free in adapter tables (`store` module), every value in an exact stored
 //! form and every `Set` element and `Map` key also as an order key whose byte order is
 //! [`ostrel_db::api::compare_key`] (D61). Filters, sort and cursor are evaluated by the driver in
-//! Rust over the live rows of the queried model (`eval` module), with the same rules as the in
-//! memory driver; the translation to SQL comes with the per model tables. Ids, stamps and the op
-//! log follow docs/db-mapping.md 2.3 and 4.
+//! Rust over the live rows of the queried model by [`ostrel_db::eval`], shared with the in
+//! memory driver (D129); the translation to SQL comes with the per model tables. A write loads
+//! its one row and applies the row transitions of [`ostrel_db::eval::LiveRow`] (D143), so the
+//! rules of `Set` and `Map` changes are not written twice; a changed collection field is stored
+//! again as a whole. Ids, stamps and the op log follow docs/db-mapping.md 2.3 and 4.
 //!
 //! The driver is blocking: every future is ready when first polled. ARCHITECTURE 4.1 runs
 //! blocking drivers on the blocking pool of the server.
 
 mod codec;
-mod eval;
 mod store;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -324,7 +326,7 @@ impl<'c> Transaction<'c> for SqliteTransaction<'c> {
             self.atomic(|conn, enums| {
                 // All checks run before the first write.
                 check_writes(w)?;
-                store::check_enums(enums, w)?;
+                ostrel_db::eval::check_enums(enums, w)?;
                 store::check_storable(w)?;
                 w.iter().try_for_each(|w| store::apply_write(conn, w))
             })

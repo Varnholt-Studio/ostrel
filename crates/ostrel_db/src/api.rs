@@ -321,7 +321,13 @@ pub trait Transaction<'c> {
     ///
     /// Two transactions that are open at the same time may get the same position; then at
     /// most one of them commits. The case file `ac_10_positions.json` of the conformance suite
-    /// checks the contract.
+    /// checks the contract, and the harness checks every returned position against the log the
+    /// transaction reads.
+    ///
+    /// A driver that takes positions from a database sequence must not let a backend cache
+    /// sequence values: a cached block lets B commit after A with a lower position. PostgreSQL
+    /// therefore declares the log sequence with `CACHE 1`, and its adapter checks that
+    /// definition (D156).
     fn append_ops<'a>(&'a mut self, ops: &'a [NewOp]) -> BoxFuture<'a, Result<ServerSeq, DbError>>;
     /// Returns at most `limit` ops with a position greater than `after`, in position order.
     fn ops_since<'a>(
@@ -353,6 +359,25 @@ pub trait Transaction<'c> {
     /// Next number of the sequence `key`, starting at 1. A number handed out by a transaction
     /// that is rolled back may be handed out again.
     fn next_in_sequence<'a>(&'a mut self, key: &'a str) -> BoxFuture<'a, Result<u64, DbError>>;
+    /// Commits the transaction. Outcome contract (D156, D159):
+    /// * `Ok` means committed: every write, op and reject of the transaction is visible to
+    ///   every transaction that begins afterwards.
+    /// * `Err` means not committed, or the outcome is unknown (for example the connection was
+    ///   lost during `COMMIT`). The caller never retries the commit and never reports the
+    ///   transaction as done; the sync layer ends the server process (ARCHITECTURE 5.4).
+    /// * A transaction whose commit returned `Err` never becomes visible later. A driver whose
+    ///   commit completes inside the call (memory, SQLite) guarantees this once `commit` has
+    ///   returned. A driver with a database server guarantees it at the latest when the
+    ///   database is opened again for a server process: the PostgreSQL adapter sets
+    ///   `application_name` to `ostrel:` plus the database name, ends every other backend
+    ///   with that name with `pg_terminate_backend` on a connection of its own and returns
+    ///   only after they are gone (at most 30 s, otherwise the open fails). So a transaction
+    ///   of an earlier process either became visible before the open returned or never
+    ///   becomes visible.
+    ///
+    /// A driver that refuses calls after an error (see the module rules) refuses `commit`
+    /// with `Err` as well. The built in case `ac_10_commit_error_is_final` of the conformance
+    /// harness checks the contract with that fault.
     fn commit(self: Box<Self>) -> BoxFuture<'c, Result<(), DbError>>;
     fn rollback(self: Box<Self>) -> BoxFuture<'c, Result<(), DbError>>;
 }

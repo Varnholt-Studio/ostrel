@@ -474,10 +474,7 @@ fn a_query_that_does_not_fit_answers_only_its_subscription() {
         assert!(!error.closes_connection());
         assert_eq!(
             error.reply(),
-            ServerMsg::Error(ProtocolError {
-                sub: Some(4),
-                code: ErrorCode::Protocol
-            })
+            ServerMsg::Error(ProtocolError::of_subscription(4, ErrorCode::Protocol))
         );
     }
 }
@@ -506,10 +503,7 @@ fn a_filter_over_the_node_limit_is_filter_too_large() {
     assert_eq!(error.code(), ErrorCode::FilterTooLarge);
     assert_eq!(
         error.reply(),
-        ServerMsg::Error(ProtocolError {
-            sub: Some(4),
-            code: ErrorCode::FilterTooLarge
-        })
+        ServerMsg::Error(ProtocolError::of_subscription(4, ErrorCode::FilterTooLarge))
     );
 }
 
