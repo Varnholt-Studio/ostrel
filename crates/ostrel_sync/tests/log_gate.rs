@@ -139,6 +139,214 @@ fn the_default_bound_is_1024_commits() {
     assert!(lock.grant().is_some());
 }
 
+#[test]
+fn quiet_point_tasks_queued_between_writers_share_one_emptying() {
+    // RED kira #2498: each quiet point task at the head used to make every writer behind it wait
+    // until the broadcast queue was empty, once per task.
+    let mut lock = WriteLock::with_bound(8);
+    let w = lock.request("w0");
+    lock.grant().unwrap();
+    lock.release(w, Release::Committed).unwrap();
+    let q1 = lock.request_quiet("q1");
+    let w1 = lock.request("w1");
+    let q2 = lock.request_quiet("q2");
+    let w2 = lock.request("w2");
+    let q3 = lock.request_quiet("q3");
+    assert_eq!(
+        lock.grant(),
+        None,
+        "quiet point granted with a commit unreleased"
+    );
+    assert!(!lock.in_quiet_phase());
+    lock.commit_released().unwrap();
+    for (t, name) in [(q1, "q1"), (q2, "q2"), (q3, "q3")] {
+        assert_eq!(
+            lock.grant(),
+            Some((t, name)),
+            "quiet point tasks of one phase"
+        );
+        lock.release(t, Release::Nothing).unwrap();
+    }
+    assert!(!lock.in_quiet_phase(), "the phase ends with its last task");
+    assert_eq!(lock.grant(), Some((w1, "w1")));
+    lock.release(w1, Release::Committed).unwrap();
+    assert_eq!(
+        lock.grant(),
+        Some((w2, "w2")),
+        "a writer waited for a second emptying"
+    );
+}
+
+#[test]
+fn a_quiet_point_task_queued_during_a_phase_waits_behind_the_writers() {
+    // 5.4: rows left by a closure wait for the next closure behind the writers already queued.
+    let mut lock = WriteLock::with_bound(8);
+    let closure = lock.request_quiet("closure");
+    let w = lock.request("writer");
+    assert_eq!(lock.grant(), Some((closure, "closure")));
+    let again = lock.request_quiet("next closure");
+    lock.release(closure, Release::Nothing).unwrap();
+    assert!(!lock.in_quiet_phase());
+    assert_eq!(
+        lock.grant(),
+        Some((w, "writer")),
+        "the next closure overtook the writer"
+    );
+    lock.release(w, Release::Committed).unwrap();
+    assert_eq!(
+        lock.grant(),
+        None,
+        "quiet point granted with a commit unreleased"
+    );
+    lock.commit_released().unwrap();
+    assert_eq!(lock.grant(), Some((again, "next closure")));
+}
+
+#[test]
+fn a_phase_grants_nothing_while_a_commit_is_unreleased() {
+    // A quiet point task pushes no commit. If a holder in a phase reported one anyway, the next
+    // task of the phase must still wait for a quiet point.
+    let mut lock = WriteLock::with_bound(8);
+    let a = lock.request_quiet("a");
+    let w = lock.request("w");
+    let b = lock.request_quiet("b");
+    assert_eq!(lock.grant(), Some((a, "a")));
+    lock.release(a, Release::Committed).unwrap();
+    assert_eq!(
+        lock.grant(),
+        None,
+        "quiet point granted with a commit unreleased"
+    );
+    assert!(lock.in_quiet_phase());
+    lock.commit_released().unwrap();
+    assert_eq!(lock.grant(), Some((b, "b")));
+    lock.release(b, Release::Nothing).unwrap();
+    assert_eq!(lock.grant(), Some((w, "w")));
+}
+
+#[test]
+fn interleaved_quiet_point_tasks_cost_writers_one_emptying_not_one_each() {
+    // Measurement in the model: how often must the broadcast queue run empty before 100 writers
+    // interleaved with 100 quiet point tasks are through? Strict FIFO needs 100 (writer
+    // throughput = 1 / broadcast latency, kira #2498); a quiet phase needs 1.
+    let mut lock = WriteLock::with_bound(BROADCAST_COMMITS);
+    let w = lock.request(false);
+    lock.grant().unwrap();
+    lock.release(w, Release::Committed).unwrap();
+    for _ in 0..100 {
+        lock.request_quiet(true);
+        lock.request(false);
+    }
+    let mut emptyings = 0;
+    let mut writers = 0;
+    while lock.queued() > 0 {
+        match lock.grant() {
+            Some((t, quiet)) => {
+                let outcome = if quiet {
+                    Release::Nothing
+                } else {
+                    writers += 1;
+                    Release::Committed
+                };
+                lock.release(t, outcome).unwrap();
+            }
+            None => {
+                while lock.unreleased() > 0 {
+                    lock.commit_released().unwrap();
+                }
+                emptyings += 1;
+            }
+        }
+    }
+    assert_eq!(writers, 100);
+    assert_eq!(emptyings, 1);
+}
+
+/// Small deterministic generator for the property test.
+struct Lcg(u64);
+
+impl Lcg {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) % n
+    }
+}
+
+#[test]
+fn random_schedules_keep_quiet_points_and_bound_every_wait_by_one_phase() {
+    // A phase begins with a quiet point grant made outside a phase. A writer waits for at most
+    // one phase begun after its request; a quiet point task is granted in exactly the first one.
+    for seed in 0..500u64 {
+        let mut rng = Lcg(seed);
+        let bound = 1 + rng.below(4) as usize;
+        let mut lock = WriteLock::with_bound(bound);
+        // Per task: whether it needs a quiet point, and the phases begun at its request.
+        let mut tasks: Vec<(bool, u64)> = Vec::new();
+        let mut phases = 0u64;
+        let mut holder = None;
+        let mut step = 0;
+        while step < 400 || lock.queued() > 0 || holder.is_some() {
+            step += 1;
+            assert!(step < 100_000, "seed {seed}: no progress");
+            let pick = if step < 400 {
+                rng.below(6)
+            } else {
+                2 + rng.below(4)
+            };
+            match pick {
+                0 => {
+                    tasks.push((false, phases));
+                    lock.request(tasks.len() - 1);
+                }
+                1 => {
+                    tasks.push((true, phases));
+                    lock.request_quiet(tasks.len() - 1);
+                }
+                2 | 3 => {
+                    let unreleased = lock.unreleased();
+                    let in_phase = lock.in_quiet_phase();
+                    let Some((t, i)) = lock.grant() else { continue };
+                    let (quiet, at_request) = tasks[i];
+                    if quiet {
+                        assert_eq!(unreleased, 0, "seed {seed}: quiet point not quiet");
+                        if !in_phase {
+                            phases += 1;
+                        }
+                        assert_eq!(phases - at_request, 1, "seed {seed}: quiet task phase");
+                    } else {
+                        assert!(unreleased < bound, "seed {seed}: writer at the bound");
+                        assert!(!in_phase, "seed {seed}: writer granted inside a phase");
+                        assert!(
+                            phases - at_request <= 1,
+                            "seed {seed}: writer waited two phases"
+                        );
+                    }
+                    holder = Some((t, quiet));
+                }
+                4 => {
+                    if let Some((t, quiet)) = holder.take() {
+                        let outcome = if !quiet && rng.below(4) > 0 {
+                            Release::Committed
+                        } else {
+                            Release::Nothing
+                        };
+                        lock.release(t, outcome).unwrap();
+                    }
+                }
+                _ => {
+                    if lock.unreleased() > 0 {
+                        lock.commit_released().unwrap();
+                    }
+                }
+            }
+        }
+        assert_eq!(lock.holder(), None, "seed {seed}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Send queue
 // ---------------------------------------------------------------------------------------------
