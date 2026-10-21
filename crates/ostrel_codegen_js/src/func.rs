@@ -28,6 +28,12 @@ pub(crate) fn emit(
     if params > function.locals.len() || function.blocks.is_empty() {
         return Err(invalid);
     }
+    if function.prologue.is_some() {
+        return Err(EmitError::Unsupported {
+            span: function.span,
+            what: "function prologue",
+        });
+    }
     let cx = Cx { program, function };
     let _ = write!(out, "export function f{}(", id.0);
     for i in 0..params {
@@ -208,14 +214,17 @@ impl Cx<'_> {
             }
             InstKind::Concat { dst, parts } => {
                 let dst = self.local(*dst, span)?;
-                let _ = write!(out, "{dst} = text(''");
-                for part in parts {
+                let _ = write!(out, "{dst} = concat([");
+                for (i, part) in parts.iter().enumerate() {
                     if *self.ty(*part, span)? != Ty::Text {
                         return Err(invalid);
                     }
-                    let _ = write!(out, " + l{}", part.0);
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "l{}", part.0);
                 }
-                out.push_str(");\n");
+                out.push_str("]);\n");
             }
             InstKind::Now { dst } => {
                 let dst = self.local(*dst, span)?;

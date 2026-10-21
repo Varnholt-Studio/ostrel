@@ -27,9 +27,12 @@
 //! Status: first part of T121. Covered are the schema and the value and
 //! control flow instructions; every other instruction kind is
 //! [`EmitError::Unsupported`], never a silent gap in the output. Not covered
-//! yet: views and the safe sinks, handlers, `var`s, rows and queries, remote
-//! calls, `for` loops, collections, `Float` arithmetic, std functions, source
-//! maps, `.d.ts`, and the service worker (T81, v0.3).
+//! yet: views and the safe sinks, handlers, `var`s, `style` blocks, field
+//! defaults, rows and queries, remote calls, `for` loops, collections, `Float`
+//! arithmetic, std functions, source maps, `.d.ts`, and the service worker
+//! (T81, v0.3). A program with any of them is [`EmitError::Unsupported`] at
+//! its first occurrence, so a program with UI never gives a bundle without
+//! it.
 
 // This crate processes data derived from untrusted input: no unwrap, expect,
 // panic or unchecked indexing.
@@ -44,7 +47,7 @@ mod func;
 mod lit;
 mod schema;
 
-use ostrel_core::Span;
+use ostrel_core::{FileId, Span};
 use ostrel_ir::full::{Program, Target};
 
 /// Path of the application module inside the bundle.
@@ -96,6 +99,7 @@ pub enum EmitError {
 
 /// Emits the client target of `program`.
 pub fn emit(program: &Program) -> Result<JsBundle, EmitError> {
+    ui(program)?;
     let mut out = String::from(PRELUDE);
     out.push('\n');
     schema::emit(program, &mut out)?;
@@ -109,4 +113,41 @@ pub fn emit(program: &Program) -> Result<JsBundle, EmitError> {
             text: out,
         }],
     })
+}
+
+/// Refuses every part of the user interface: a program with UI must never
+/// give a bundle without it. The home view is checked first, so a `home`
+/// outside `views` is [`EmitError::Invalid`] whatever else the program has.
+fn ui(program: &Program) -> Result<(), EmitError> {
+    if let Some(home) = program.app.as_ref().and_then(|app| app.home) {
+        // `App` carries no span in the IR; the error points at the start of
+        // the first source file.
+        let view = program
+            .views
+            .get(home.index())
+            .ok_or(EmitError::Invalid(Span::point(FileId::from_raw(0), 0)))?;
+        return Err(EmitError::Unsupported {
+            span: view.span,
+            what: "home view",
+        });
+    }
+    if let Some(view) = program.views.first() {
+        return Err(EmitError::Unsupported {
+            span: view.span,
+            what: "view",
+        });
+    }
+    if let Some(var) = program.vars.first() {
+        return Err(EmitError::Unsupported {
+            span: var.span,
+            what: "var",
+        });
+    }
+    if let Some(style) = program.styles.first() {
+        return Err(EmitError::Unsupported {
+            span: *style,
+            what: "style",
+        });
+    }
+    Ok(())
 }

@@ -61,6 +61,14 @@ pub(crate) fn emit(program: &Program, out: &mut String) -> Result<(), EmitError>
         lit::string(&model.name, out);
         out.push_str(", fields: [");
         for field in &model.fields {
+            // The generated client calls the default for a `make` without
+            // the field (D116); `make` is not emitted yet.
+            if field.default.is_some() {
+                return Err(EmitError::Unsupported {
+                    span: field.span,
+                    what: "field default",
+                });
+            }
             out.push_str("\n      { name: ");
             lit::string(&field.name, out);
             out.push_str(", type: ");

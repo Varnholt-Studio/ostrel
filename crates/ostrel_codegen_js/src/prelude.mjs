@@ -43,10 +43,20 @@ function irem(a, b) {
   return (a % b) + 0;
 }
 
-// TextLimit counts UTF-8 bytes; a string of n UTF-16 units has at most 3n of them.
-function text(s) {
-  if (s.length > TEXT_LIMIT / 3 && utf8Length(s) > TEXT_LIMIT) fail('TextLimit');
-  return s;
+// TextLimit counts UTF-8 bytes; a string of n UTF-16 units has at most 3n of them. The parts are
+// measured before they are joined: a join above the limit can exceed the longest string the
+// engine builds and throw a `RangeError` instead of `TextLimit`.
+function concat(parts) {
+  let units = 0;
+  for (const s of parts) units += s.length;
+  if (units > TEXT_LIMIT / 3) {
+    let bytes = 0;
+    for (const s of parts) {
+      bytes += utf8Length(s);
+      if (bytes > TEXT_LIMIT) fail('TextLimit');
+    }
+  }
+  return parts.join('');
 }
 
 function utf8Length(s) {

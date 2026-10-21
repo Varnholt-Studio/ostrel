@@ -13,8 +13,9 @@ use ostrel_core::{FileId, Span};
 use ostrel_ir::full::{
     App, BinOp, Block, Const, Enum, EnumId, Field, FieldId, FieldMode, FieldRef, FnKind, FuncId,
     Function, ImplicitField, Inst, InstKind, Local, Merge, Model, ModelId, Placement, Program,
-    Registration, Terminator, Ty, UnOp,
+    Prologue, Registration, Terminator, Ty, UnOp, Var, ViewId,
 };
+use ostrel_ir::full::view::View;
 
 fn span(at: u32) -> Span {
     Span::new(FileId::from_raw(0), at, at + 1)
@@ -610,6 +611,37 @@ fn text_limit_is_checked_on_concatenation() {
 }
 
 #[test]
+fn text_limit_is_checked_before_the_parts_are_joined() {
+    // fn(t: Text) -> Text { "{t}{t}...{t}" } with 33 parts: 33 times 16 MiB is
+    // above the longest string Node can build, so the check must come first
+    // (ada, review of T121).
+    let f = function(
+        Placement::Shared,
+        1,
+        vec![Ty::Text, Ty::Text],
+        Ty::Text,
+        vec![block(
+            vec![inst(
+                1,
+                InstKind::Concat {
+                    dst: Local(1),
+                    parts: vec![Local(0); 33],
+                },
+            )],
+            Terminator::Return(Some(Local(1))),
+        )],
+    );
+    let out = run_node(
+        &emitted(&program(vec![f])),
+        "attempt(() => app.f0('a'.repeat(16777216)).length);\n\
+         attempt(() => app.f0('a'.repeat(508400)).length);\n\
+         attempt(() => app.f0('a'.repeat(508401)).length);",
+    );
+    // 33 * 508 400 = 16 777 200 bytes fit; 33 * 508 401 = 16 777 233 do not.
+    assert_eq!(out, "error TextLimit\n16777200\nerror TextLimit\n");
+}
+
+#[test]
 fn calls_reach_shared_functions_and_server_code_is_not_emitted() {
     let server = function(
         Placement::Server,
@@ -804,6 +836,155 @@ fn not_yet_supported_instructions_fail_the_emit() {
         Err(EmitError::Unsupported {
             span: span(1),
             what: "equality of this type",
+        })
+    );
+}
+
+fn app(home: Option<ViewId>) -> App {
+    App {
+        name: "Notes".to_string(),
+        auth: None,
+        home,
+    }
+}
+
+fn view(at: u32) -> View {
+    View {
+        name: "Home".to_string(),
+        params: 0,
+        slots: Vec::new(),
+        nodes: Vec::new(),
+        span: span(at),
+    }
+}
+
+#[test]
+fn views_vars_styles_and_home_are_never_dropped_silently() {
+    // A program with UI must not give an `Ok` bundle without UI (ada, review
+    // of T121): every part this backend does not emit yet is `Unsupported`.
+    let mut p = program(Vec::new());
+    p.views.push(view(4));
+    assert_eq!(
+        emit(&p),
+        Err(EmitError::Unsupported {
+            span: span(4),
+            what: "view",
+        })
+    );
+
+    let mut p = program(Vec::new());
+    p.vars.push(Var {
+        name: "draft".to_string(),
+        ty: Ty::Text,
+        init: None,
+        span: span(5),
+    });
+    assert_eq!(
+        emit(&p),
+        Err(EmitError::Unsupported {
+            span: span(5),
+            what: "var",
+        })
+    );
+
+    let mut p = program(Vec::new());
+    p.styles.push(span(6));
+    assert_eq!(
+        emit(&p),
+        Err(EmitError::Unsupported {
+            span: span(6),
+            what: "style",
+        })
+    );
+
+    // A home view inside `views` is not emitted yet; the error names it.
+    let mut p = program(Vec::new());
+    p.app = Some(app(Some(ViewId(1))));
+    p.views.push(view(7));
+    p.views.push(view(8));
+    assert_eq!(
+        emit(&p),
+        Err(EmitError::Unsupported {
+            span: span(8),
+            what: "home view",
+        })
+    );
+
+    // A home view outside `views` is inconsistent IR.
+    let mut p = program(Vec::new());
+    p.app = Some(app(Some(ViewId(0))));
+    assert!(matches!(emit(&p), Err(EmitError::Invalid(_))));
+    let mut p = program(Vec::new());
+    p.app = Some(app(Some(ViewId(1))));
+    p.views.push(view(7));
+    assert!(matches!(emit(&p), Err(EmitError::Invalid(_))));
+
+    // An app without home and without UI still emits.
+    let mut p = program(Vec::new());
+    p.app = Some(app(None));
+    assert!(emit(&p).is_ok());
+}
+
+#[test]
+fn field_defaults_and_prologues_are_never_dropped_silently() {
+    let mut p = program(vec![function(
+        Placement::Client,
+        0,
+        vec![Ty::Text],
+        Ty::Text,
+        vec![block(
+            vec![inst(
+                1,
+                InstKind::Const {
+                    dst: Local(0),
+                    value: Const::Text("x".to_string()),
+                },
+            )],
+            Terminator::Return(Some(Local(0))),
+        )],
+    )]);
+    p.models.push(Model {
+        name: "Note".to_string(),
+        fields: vec![Field {
+            name: "title".to_string(),
+            ty: Ty::Text,
+            mode: FieldMode::Plain,
+            merge: Merge::Default,
+            default: Some(FuncId(0)),
+            span: span(9),
+        }],
+        see: None,
+        rules: Vec::new(),
+        checks: Vec::new(),
+        span: span(8),
+    });
+    assert_eq!(
+        emit(&p),
+        Err(EmitError::Unsupported {
+            span: span(9),
+            what: "field default",
+        })
+    );
+
+    // A prologue belongs to server functions, which are never emitted; on a
+    // function the client runs, it is not dropped either.
+    let mut with_prologue = function(
+        Placement::Shared,
+        0,
+        Vec::new(),
+        Ty::Unit,
+        vec![block(Vec::new(), Terminator::Return(None))],
+    );
+    with_prologue.span = span(3);
+    with_prologue.prologue = Some(Prologue {
+        resolve: Vec::new(),
+        call_rule: None,
+    });
+    assert_eq!(
+        emit(&program(vec![with_prologue])),
+        Err(EmitError::Unsupported {
+            span: span(3),
+            what: "function prologue",
         })
     );
 }
