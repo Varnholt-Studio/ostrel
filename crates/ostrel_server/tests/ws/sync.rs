@@ -14,9 +14,11 @@ use ostrel_db::api::{
     Write,
 };
 use ostrel_db_memory::MemoryDriver;
+use ostrel_server::ws::FifoLock;
 use ostrel_server::ws::hello::PrincipalKey;
-use ostrel_server::ws::ops::{FIELD_AUTHOR, FIELD_CHANGED, FIELD_MADE};
-use ostrel_server::ws::{BatchFault, BatchSink, FifoLock, OpRules, OpServer, OpSession};
+use ostrel_server::ws::ops::{
+    BatchFault, BatchSink, FIELD_AUTHOR, FIELD_CHANGED, FIELD_MADE, OpRules, OpServer, OpSession,
+};
 use ostrel_sync::protocol::{
     Ack, ClientMsg, DecodedOp, FieldId, FnId, LIMITS, ModelId, Op, OpBody, OpFault, RejectReason,
     ServerMsg,

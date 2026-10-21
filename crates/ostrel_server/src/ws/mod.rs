@@ -22,6 +22,7 @@
 pub mod call;
 pub mod fifo;
 pub mod hello;
+pub mod ops;
 pub mod session;
 
 pub use call::{CallDb, CallServer, CommitFailed, FnFault, LOCKED_CALL_STEPS, ReadDb, ServerFns};

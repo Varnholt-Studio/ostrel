@@ -27,6 +27,7 @@ use ostrel_vm::host::{AuditEntry, AuditError, BoxFuture, ExternErrorKind, Server
 use ostrel_vm::{Limits, RuntimeError, RuntimeErrorKind, Span};
 
 mod hello;
+mod sync;
 
 // ---------------------------------------------------------------------------------------------
 // Driving futures
