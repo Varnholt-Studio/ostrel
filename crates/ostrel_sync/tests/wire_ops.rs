@@ -29,10 +29,10 @@ fn schema() -> Schema {
             ("due", Time),
             ("blob", Bytes),
             ("state", Enum(vec!["open".into(), "closed".into()])),
-            ("owner", Ref),
+            ("owner", Ref(ITEM)),
             ("note", Optional(Box::new(Text))),
             ("tags", Set(Box::new(Text))),
-            ("roles", Map(Box::new(Ref), Box::new(Int))),
+            ("roles", Map(Box::new(Ref(ITEM)), Box::new(Int))),
             ("steps", List(Box::new(Int))),
             ("pos", Rank),
             ("number", Serial),
@@ -285,6 +285,15 @@ fn a_malformed_op_is_a_protocol_error() {
             with_body(r#"{"set":{"field":3,"value":1}}"#),
             WireError::WrongType("field"),
         ),
+        // Only the tags of a `remove` may be absent (D135); its structure keys may not.
+        (
+            with_body(r#"{"remove":{"elem":"x","tags":[]}}"#),
+            WireError::MissingKey("field"),
+        ),
+        (
+            with_body(r#"{"remove":{"field":"tags"}}"#),
+            WireError::MissingKey("elem"),
+        ),
         (
             with_body(r#"{"make":{"title":"a","title":"b"}}"#),
             WireError::DuplicateKey("title".into()),
@@ -358,6 +367,19 @@ fn a_remove_names_one_to_sixty_four_valid_tags() {
         Ok(DecodedOp::Valid(_))
     ));
     let over: Vec<String> = (1..=LIMITS.tags_per_remove + 1).map(tag).collect();
+    // Tags that are absent or `null` make only this op invalid, not the frame (D135).
+    for body in [
+        r#"{"remove":{"field":"tags","elem":"x"}}"#,
+        r#"{"remove":{"field":"tags","elem":"x","tags":null}}"#,
+    ] {
+        assert_eq!(
+            decode_text(&with_body(body)),
+            invalid(OpFault::Tags {
+                field: field("tags")
+            }),
+            "{body}"
+        );
+    }
     for tags in [
         vec![],
         over,
@@ -733,6 +755,8 @@ fn a_body_with_several_kinds_makes_only_that_op_invalid() {
             r#"{{"put":{{"field":"roles","key":"{owner}","value":1}},"remove_key":{{"field":"roles","key":"{owner}"}}}}"#
         ),
         r#"{"drop":{},"make":{}}"#.to_owned(),
+        // A `remove` without tags is well formed (D135), so it counts as a kind here.
+        r#"{"add":{"field":"tags","elem":"x"},"remove":{"field":"tags","elem":"x"}}"#.to_owned(),
         r#"{"drop":{},"set":{"field":"count","value":1},"add":{"field":"tags","elem":"x"}}"#
             .to_owned(),
     ] {
@@ -782,8 +806,8 @@ fn several_kinds_stay_fatal_when_one_is_unknown_or_malformed() {
             WireError::WrongType("body"),
         ),
         (
-            format!(r#"{{{add},"remove":{{"field":"tags","elem":"x"}}}}"#),
-            WireError::MissingKey("tags"),
+            format!(r#"{{{add},"remove":{{"field":"tags","tags":[]}}}}"#),
+            WireError::MissingKey("elem"),
         ),
         (
             format!(r#"{{{add},"set":{{"field":"count","value":1,"x":1}}}}"#),
@@ -792,4 +816,36 @@ fn several_kinds_stay_fatal_when_one_is_unknown_or_malformed() {
     ] {
         assert_eq!(decode_text(&with_body(&body)), Err(want), "{body}");
     }
+}
+
+// -------------------------------------------------------------------------------------------
+// Hostile: a `remove` without tags inside a batch (D135, AC-55)
+
+/// A peer that leaves out the tags of a `remove` loses that op and nothing else: the ops
+/// before and after it stay valid and the frame keeps the connection open.
+#[test]
+fn a_remove_without_tags_leaves_the_rest_of_the_batch_and_the_connection_alone() {
+    let good = encode_op(&op_with(1, OpBody::Drop), &schema()).unwrap();
+    let untagged = encode_op(&op_with(2, OpBody::Drop), &schema())
+        .unwrap()
+        .replace(
+            r#"{"drop":{}}"#,
+            r#"{"remove":{"elem":"x","field":"tags"}}"#,
+        );
+    let later = encode_op(&op_with(3, OpBody::Drop), &schema()).unwrap();
+    assert_eq!(
+        decode_ops_frame(&ops_frame(&[good, untagged, later])),
+        Ok(ClientMsg::Ops(vec![
+            DecodedOp::Valid(op_with(1, OpBody::Drop)),
+            DecodedOp::Invalid {
+                id: op_id(2),
+                hlc: stamp(),
+                row: row(),
+                fault: OpFault::Tags {
+                    field: field("tags")
+                },
+            },
+            DecodedOp::Valid(op_with(3, OpBody::Drop)),
+        ]))
+    );
 }

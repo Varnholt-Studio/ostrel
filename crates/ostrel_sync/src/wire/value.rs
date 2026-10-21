@@ -15,7 +15,7 @@ use ostrel_core::ids::RowId;
 use ostrel_core::value::{Value, compare_key};
 
 use super::json::{Json, NotSafeInt};
-use crate::protocol::{LIMITS, ValueFault};
+use crate::protocol::{LIMITS, ModelId, ValueFault};
 
 /// The type of a value on the wire: one variant per row of the type table (ARCHITECTURE 5.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,8 +30,10 @@ pub enum WireTy {
     Bytes,
     /// The variant names in declaration order.
     Enum(Vec<String>),
-    /// A row id; the target model plays no part in the wire form.
-    Ref,
+    /// A reference to a row of the given model (D165). On the wire it is the row id alone:
+    /// reading and writing ignore the target, which only a query hop checks
+    /// ([`super::query`]).
+    Ref(ModelId),
     /// `T?`: a value of `T` or `null`.
     Optional(Box<WireTy>),
     Set(Box<WireTy>),
@@ -79,7 +81,7 @@ fn read(ty: &WireTy, json: Json, depth: u32) -> Result<Value, ValueFault> {
                 Err(ValueFault::UnknownVariant)
             }
         }
-        (WireTy::Ref, Json::Str(s)) => RowId::from_hex(&s)
+        (WireTy::Ref(_), Json::Str(s)) => RowId::from_hex(&s)
             .map(Value::Ref)
             .map_err(|_| ValueFault::InvalidRef),
         (WireTy::Rank, Json::Str(s)) => {
