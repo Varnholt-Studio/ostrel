@@ -69,10 +69,12 @@ impl Host for Silent {
     fn print(&mut self, _: &str) {}
 }
 
+/// The step limit every invoke got, per fn.
+type Steps = Rc<RefCell<Vec<(FnId, u64)>>>;
+
 struct Fns {
     image: Image,
-    /// The step limit every invoke got, per fn.
-    steps: Rc<RefCell<Vec<(FnId, u64)>>>,
+    steps: Steps,
 }
 
 impl ServerFns for Fns {
@@ -118,7 +120,7 @@ impl Clock for TestClock {
     }
 }
 
-fn server() -> (CallServer, Rc<RefCell<Vec<(FnId, u64)>>>) {
+fn server() -> (CallServer, Steps) {
     let driver = MemoryDriver::new();
     let writer = block_on(driver.connect("memory:")).unwrap_or_else(|e| panic!("{e:?}"));
     let reader = block_on(driver.connect("memory:")).unwrap_or_else(|e| panic!("{e:?}"));
@@ -157,7 +159,7 @@ fn shortest_spin(server: &CallServer, function: FnId) -> Duration {
 }
 
 #[test]
-fn ac_34_a_call_without_the_lock_that_loops_ends_with_step_limit() {
+fn ac_34_steps_without_lock() {
     let (server, steps) = server();
     assert_eq!(block_on(server.call(None, SPIN, &[])), step_limit());
     assert_eq!(*steps.borrow(), [(SPIN, LOCKED_CALL_STEPS)]);
