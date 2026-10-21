@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use ostrel_core::value::{SafeInt, Value};
-use ostrel_db::api::{Connection, DbError, Driver, RowId, Transaction};
+use ostrel_db::api::{Connection, DbError, Driver, Query, RowId, Transaction};
 use ostrel_db_memory::MemoryDriver;
 use ostrel_server::audit::{AuditRecord, AuditStore};
 use ostrel_server::host::Clock;
@@ -137,6 +137,8 @@ struct Probe {
     steps: RefCell<Vec<(FnId, u64)>>,
     pause_admit: Cell<bool>,
     pause_invoke: Cell<bool>,
+    /// Pauses `count` after its query.
+    pause_after_read: Cell<bool>,
     /// The pre-check refuses with `Denied`.
     deny_pre_check: Cell<bool>,
     /// The repeated admission under the lock refuses with `Denied`.
@@ -209,11 +211,9 @@ impl ServerFns for Fns {
                 (COUNT, CallDb::Read(reader)) => {
                     Pause(&probe.pause_invoke).await;
                     // One read transaction for the one query, ended before the body goes on.
-                    {
-                        let mut conn = reader.lock().await;
-                        let tx = conn.begin().await.map_err(db)?;
-                        tx.rollback().await.map_err(db)?;
-                    }
+                    let rows = reader.query(&Query::all(0)).await.map_err(db)?;
+                    probe.log.borrow_mut().push(format!("read {}", rows.0.len()));
+                    Pause(&probe.pause_after_read).await;
                     let kind = host
                         .extern_call("mail", "send", &[])
                         .await
@@ -446,6 +446,53 @@ fn an_open_call_id_used_again_is_fatal() {
 }
 
 #[test]
+fn an_open_call_id_with_an_unknown_function_is_fatal() {
+    let mut session = Session::new(None);
+    assert!(matches!(
+        session.receive(&call_frame(5, "count", "[]"), &Schema),
+        Incoming::Call(_)
+    ));
+    // Not `return` `NotFound` for call 5: the client would take it as the result of the call
+    // that is still running.
+    assert_eq!(
+        session.receive(&call_frame(5, "nope", "[]"), &Schema),
+        Incoming::Close(r#"{"code":"Protocol","sub":null,"t":"error","v":0}"#.to_owned())
+    );
+}
+
+#[test]
+fn an_open_call_id_with_arguments_that_do_not_fit_is_fatal() {
+    let mut session = Session::new(None);
+    assert!(matches!(
+        session.receive(&call_frame(6, "bump", r#"["a"]"#), &Schema),
+        Incoming::Call(_)
+    ));
+    // Not `return` `Invalid` for call 6, which is still running.
+    assert_eq!(
+        session.receive(&call_frame(6, "bump", "[1]"), &Schema),
+        Incoming::Close(r#"{"code":"Protocol","sub":null,"t":"error","v":0}"#.to_owned())
+    );
+}
+
+#[test]
+fn a_refused_call_beside_an_open_call_gets_its_return_and_the_open_call_stays() {
+    let mut session = Session::new(None);
+    assert!(matches!(
+        session.receive(&call_frame(7, "count", "[]"), &Schema),
+        Incoming::Call(_)
+    ));
+    assert_eq!(
+        session.receive(&call_frame(8, "nope", "[]"), &Schema),
+        Incoming::Reply(r#"{"call":8,"result":{"err":"NotFound"},"t":"return","v":0}"#.to_owned())
+    );
+    assert_eq!(session.open_calls().len(), 1);
+    let frame = session
+        .finish(7, Ok(int(7)), &Schema)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(frame, r#"{"call":7,"result":{"ok":7},"t":"return","v":0}"#);
+}
+
+#[test]
 fn sync_messages_go_on_to_the_sync_engine() {
     let mut session = Session::new(None);
     match session.receive(br#"{"v":0,"t":"unsubscribe","sub":3}"#, &Schema) {
@@ -557,7 +604,20 @@ fn a_call_that_is_not_locking_takes_no_lock_and_runs_beside_a_writer() {
     assert_eq!(poll(call.as_mut()), Poll::Ready(Ok(Ok(int(7)))));
     drop(held);
     assert_eq!(s.server.write_lock().grants(), 1);
-    assert_eq!(log(&s), ["invoke 0 read"]);
+    assert_eq!(log(&s), ["invoke 0 read", "read 0"]);
+}
+
+#[test]
+fn a_query_of_a_call_that_is_not_locking_ends_its_read_transaction_before_it_returns() {
+    let s = setup();
+    s.probe.pause_after_read.set(true);
+    let mut call = pin!(s.server.call(None, COUNT, &[]));
+    assert!(poll(call.as_mut()).is_pending());
+    // The query ran and the fn goes on in the VM: the read connection is free again (D162).
+    assert_eq!(log(&s), ["invoke 0 read", "read 0"]);
+    assert!(!s.server.read_connection().is_held());
+    s.probe.pause_after_read.set(false);
+    assert_eq!(poll(call.as_mut()), Poll::Ready(Ok(Ok(int(7)))));
 }
 
 #[test]

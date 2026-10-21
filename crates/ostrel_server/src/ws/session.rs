@@ -18,7 +18,10 @@
 //!   `Invalid`) and the connection stays; a fatal `error` for everything else.
 //! * A second `hello` is out of order: fatal `Error Protocol`.
 //! * A `call` whose id names a call that is still open is fatal `Error Protocol`: its `return`
-//!   could not be told apart. Ids of closed calls are not remembered (D155).
+//!   could not be told apart. This holds before every other check of the frame, also when
+//!   its function is unknown or its arguments do not fit: a refusal `return` for that id would
+//!   reach the client as the result of the call that is still running. Ids of closed calls are
+//!   not remembered (D155).
 //! * A `return` whose result does not fit one frame is written with `CallError` `Limit` instead
 //!   (D121, done by [`encode_server`]).
 //!
@@ -166,6 +169,11 @@ impl Session {
     }
 
     fn refuse(&self, error: &WireError, schema: &dyn WireSchema) -> Incoming {
+        if let WireError::InvalidCall { call, .. } = error
+            && self.calls.0.contains_key(call)
+        {
+            return Incoming::Close(fatal(ErrorCode::Protocol, schema, &self.calls));
+        }
         let reply = error.reply();
         let frame = encode_server(&reply, schema, &self.calls);
         match frame {

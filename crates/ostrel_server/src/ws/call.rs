@@ -5,7 +5,8 @@
 //! store and the clock. [`CallServer::call`] runs one call in the order of D159 and D161:
 //!
 //! * A fn that is not locking takes no lock. It gets the read connection as
-//!   [`CallDb::Read`] and reads each query in a read transaction of its own, so no read
+//!   [`CallDb::Read`], a [`ReadDb`] that reads each query in a read transaction of its own
+//!   and gives the connection no other way, so no read
 //!   transaction is open while the VM runs, across an `extern js server` call or while it waits
 //!   (D162). Every query in it is filtered by `see`.
 //! * A locking fn (one that can write, is elevated or can call such a fn; the compiler marks
@@ -35,7 +36,7 @@ use std::fmt;
 
 use ostrel_core::ids::RowId;
 use ostrel_core::value::{SafeInt, Value};
-use ostrel_db::api::{Connection, DbError, Transaction};
+use ostrel_db::api::{Connection, DbError, Query, Rows, Transaction};
 use ostrel_sync::protocol::{CallError, FnId};
 use ostrel_vm::host::{
     AuditEntry, AuditError, BoxFuture, ExternError, ExternErrorKind, ServerHost,
@@ -56,9 +57,39 @@ pub enum CallDb<'a, 'c> {
     /// holds the write lock. Every read and write of the call, also of the fns it calls, runs
     /// in it. The caller commits or rolls it back.
     Locked(&'a mut (dyn Transaction<'c> + 'c)),
-    /// A call that is not locking: the read connection. Each query takes the connection, reads
-    /// in a read transaction of its own and ends it before its rows reach the VM (D162).
-    Read(&'a FifoLock<Box<dyn Connection>>),
+    /// A call that is not locking: the read connection, reachable one query at a time
+    /// (D162).
+    Read(ReadDb<'a>),
+}
+
+/// The read connection as a call that is not locking sees it: one query at a time.
+///
+/// [`ReadDb::query`] takes the connection, reads in a read transaction of its own and ends it
+/// before the rows are returned, so no read transaction stays open while the VM runs, across
+/// an `extern js server` call or while the call waits (D162). The connection itself is not
+/// handed out.
+#[derive(Clone, Copy)]
+pub struct ReadDb<'a>(&'a FifoLock<Box<dyn Connection>>);
+
+impl ReadDb<'_> {
+    /// Reads `q` in a read transaction of its own, which has ended when this returns.
+    pub async fn query(&self, q: &Query) -> Result<Rows, DbError> {
+        let mut conn = self.0.lock().await;
+        let mut tx = conn.begin().await?;
+        let rows = tx.query(q).await;
+        // A read transaction has nothing to keep; rolling it back only ends it. A connection
+        // that cannot end it is not trusted with the rows either.
+        let ended = tx.rollback().await;
+        let rows = rows?;
+        ended?;
+        Ok(rows)
+    }
+}
+
+impl fmt::Debug for ReadDb<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ReadDb").field(self.0).finish()
+    }
 }
 
 impl fmt::Debug for CallDb<'_, '_> {
@@ -183,7 +214,7 @@ impl CallServer {
             let result = self
                 .fns
                 .invoke(
-                    CallDb::Read(&self.reader),
+                    CallDb::Read(ReadDb(&self.reader)),
                     &mut host,
                     function,
                     args,
