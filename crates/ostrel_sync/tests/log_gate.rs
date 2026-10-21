@@ -6,8 +6,8 @@ use std::convert::Infallible;
 
 use ostrel_sync::log_gate::{
     BROADCAST_COMMITS, CANDIDATE_PAGE, CLOSURE_BYTES, CLOSURE_ROWS, ClosureReader, EvictAction,
-    LockError, QueueError, ReadRow, Release, SEND_QUEUE_BYTES, SendQueue, WaitError, WaitingRows,
-    WriteLock,
+    LockError, QueueError, ReadRow, Release, Room, SEND_QUEUE_BYTES, SendQueue, WaitError,
+    WaitingRows, WriteLock,
 };
 use ostrel_sync::protocol::{Hlc, ReplicaId, RowId, ServerSeq, SubId};
 
@@ -64,6 +64,49 @@ fn writers_wait_before_the_lock_while_the_broadcast_queue_is_full() {
     assert_eq!(lock.holder(), None, "the waiting task holds nothing");
     lock.commit_released().unwrap();
     assert_eq!(lock.grant(), Some((waiting, 9)));
+}
+
+#[test]
+fn a_quiet_point_task_waits_until_every_commit_is_released() {
+    // RED kira #2455: a closure, a subscription or M0 reads at M = next() - 1, which is a quiet
+    // point only when every commit up to M is released by the broadcast fence (5.4).
+    let mut lock = WriteLock::with_bound(4);
+    let w = lock.request("writer");
+    assert_eq!(lock.grant().map(|g| g.0), Some(w));
+    lock.release(w, Release::Committed).unwrap();
+    let closure = lock.request_quiet("closure");
+    let behind = lock.request("writer behind");
+    assert_eq!(
+        lock.grant(),
+        None,
+        "quiet point granted with a commit unreleased"
+    );
+    assert_eq!(
+        lock.grant(),
+        None,
+        "a writer overtook the queued quiet point task"
+    );
+    lock.commit_released().unwrap();
+    assert_eq!(lock.grant(), Some((closure, "closure")));
+    lock.release(closure, Release::Nothing).unwrap();
+    assert_eq!(lock.grant(), Some((behind, "writer behind")));
+}
+
+#[test]
+fn writers_are_granted_with_unreleased_commits_below_the_bound() {
+    let mut lock = WriteLock::with_bound(4);
+    let w = lock.request(1);
+    lock.grant().unwrap();
+    lock.release(w, Release::Committed).unwrap();
+    let next = lock.request(2);
+    assert_eq!(lock.grant(), Some((next, 2)));
+}
+
+#[test]
+fn a_quiet_point_task_is_granted_at_once_when_all_is_released() {
+    let mut lock = WriteLock::new();
+    let q = lock.request_quiet(());
+    assert_eq!(lock.grant().map(|g| g.0), Some(q));
 }
 
 #[test]
@@ -197,8 +240,12 @@ impl ClosureReader<u32> for Table {
     }
 }
 
-fn rooms(entries: &[(u32, u64)]) -> BTreeMap<u32, u64> {
-    entries.iter().copied().collect()
+/// Rooms of empty queues: the free bytes are the limit.
+fn rooms(entries: &[(u32, u64)]) -> BTreeMap<u32, Room> {
+    entries
+        .iter()
+        .map(|&(s, free)| (s, Room { free, limit: free }))
+        .collect()
 }
 
 fn with_candidates(w: &mut WaitingRows<u32>, session: u32, sub: SubId, rows: &[RowId]) {
@@ -455,6 +502,111 @@ fn a_read_error_changes_nothing() {
     );
     assert_eq!(w.waiting(&1, 1), 1);
     assert!(!w.is_live(&1, 1, row(1), ServerSeq(2)));
+}
+
+#[test]
+fn a_failed_closure_stays_queued() {
+    // RED kira #2456 F3: the request is not consumed by a closure that read nothing.
+    struct Failing;
+    impl ClosureReader<u32> for Failing {
+        type Row = RowId;
+        type Error = &'static str;
+        fn read(
+            &mut self,
+            _: &u32,
+            _: SubId,
+            _: RowId,
+        ) -> Result<Option<ReadRow<RowId>>, &'static str> {
+            Err("connection lost")
+        }
+    }
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1)]);
+    assert!(w.request_closure());
+    assert!(
+        w.run_closure(ServerSeq(1), &rooms(&[(1, MIB)]), &mut Failing)
+            .is_err()
+    );
+    assert!(w.closure_queued(), "the waiting row lost its closure");
+    assert!(
+        !w.request_closure(),
+        "a request joins the closure still owed"
+    );
+    w.run_closure(ServerSeq(1), &rooms(&[(1, MIB)]), &mut Table::default())
+        .unwrap();
+    assert!(!w.closure_queued());
+}
+
+#[test]
+fn a_row_larger_than_the_whole_queue_is_reported_instead_of_waiting() {
+    // RED kira #2456 F4: a row that never fits must not leave its subscription waiting.
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1), row(2)]);
+    with_candidates(&mut w, 2, 1, &[row(3)]);
+    let mut table = Table::sized([(row(1), 500), (row(2), 10), (row(3), 10)]);
+    let rooms: BTreeMap<u32, Room> = [
+        (
+            1,
+            Room {
+                free: 400,
+                limit: 400,
+            },
+        ),
+        (
+            2,
+            Room {
+                free: 400,
+                limit: 400,
+            },
+        ),
+    ]
+    .into();
+    let out = w.run_closure(ServerSeq(2), &rooms, &mut table).unwrap();
+    assert_eq!(out.oversized, vec![(1, 1, row(1))]);
+    assert!(
+        out.starved.is_empty(),
+        "an oversized row is not a starved session"
+    );
+    assert_eq!(
+        w.waiting(&1, 1),
+        1,
+        "only the oversized row left the waiting rows"
+    );
+    assert!(!w.is_live(&1, 1, row(1), ServerSeq(3)));
+    assert!(
+        out.pages
+            .iter()
+            .any(|p| p.session == 2 && p.rows == vec![row(3)])
+    );
+
+    // A row that fits the limit but not the free bytes still waits for room.
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1)]);
+    let mut table = Table::sized([(row(1), 300)]);
+    let rooms: BTreeMap<u32, Room> = [(
+        1,
+        Room {
+            free: 100,
+            limit: 400,
+        },
+    )]
+    .into();
+    let out = w.run_closure(ServerSeq(2), &rooms, &mut table).unwrap();
+    assert!(out.oversized.is_empty());
+    assert_eq!(out.starved, vec![1]);
+}
+
+#[test]
+fn the_space_of_a_queue_is_its_free_bytes_and_limit() {
+    let mut q = SendQueue::with_limit(1_000);
+    q.push_now(300).unwrap();
+    assert_eq!(
+        q.space(),
+        Room {
+            free: 700,
+            limit: 1_000
+        }
+    );
 }
 
 #[test]

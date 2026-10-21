@@ -6,11 +6,14 @@
 //!
 //! * [`WriteLock`] is the single FIFO write lock of the process (D156). Every database
 //!   transaction that writes takes it before `begin` and releases it after `commit` or
-//!   `rollback`, the fence push and the queuing of its outcomes. A holder with no transaction
-//!   open stands at a quiet point M = `next() - 1`: every position at or below M that is ever
-//!   committed is committed, and none above M is allocated. The lock also carries the bound of
-//!   the broadcast queue (D162): while [`BROADCAST_COMMITS`] commits are not yet released, no
-//!   task is granted the lock, so a task waits before the lock and never inside it.
+//!   `rollback`, the fence push and the queuing of its outcomes. A task that needs a quiet point
+//!   (a closure, the registration of a subscription, M0 of a reconnect) is granted the lock
+//!   only when it holds no transaction open and every commit pushed to the broadcast queue is
+//!   released: then M = `next() - 1` is a quiet point, every position at or below M that is
+//!   ever committed is committed and released by the broadcast fence, and none above M is
+//!   allocated (5.4 "Snapshot consistency"). The lock also carries the bound of the broadcast
+//!   queue (D162): while [`BROADCAST_COMMITS`] commits are not yet released, no writer is
+//!   granted the lock, so a task waits before the lock and never inside it.
 //! * [`SendQueue`] counts the encoded frames of one session that are not yet written (5.9, 8
 //!   MiB). Frames queued under the lock or by the broadcast queue never wait: live ops,
 //!   outcomes, and the `Evict` pages and `Reset` of scope re-evaluation. If they would exceed
@@ -33,9 +36,18 @@
 //! (applied twice). The tests in `tests/ac_44_snapshot/` show both faults for a closure that
 //! skips the lock, and that the gated closure has neither.
 //!
-//! The pages of a closure carry mark M. The caller queues them into each session's stream after
-//! everything the broadcast queue releases up to M, so each session's stream stays non
-//! decreasing in [`ServerSeq`] (D62). Splitting pages at the frame limit (D121) is the job of
+//! Released matters as much as committed. The broadcast queue re-evaluates scopes when it
+//! releases a commit: a row leaves (`Evict` or a dropped waiting row) or enters (a waiting row).
+//! If a closure served a row at M while a commit k at or below M was still unreleased, the
+//! release of k would then re-evaluate the scope against a row that already contains later
+//! commits: it could evict the served row and let it enter again as a waiting row while the
+//! client keeps the copy read at M, and a later scope exit would drop the waiting row without an
+//! `Evict` (RED kira #2455). Granting quiet point tasks only with no commit unreleased rules this
+//! out.
+//!
+//! The pages of a closure carry mark M. At a quiet point nothing up to M waits in the broadcast
+//! queue, so the caller queues them into each session's stream at once, behind everything
+//! already released, and each session's stream stays non decreasing in [`ServerSeq`] (D62). Splitting pages at the frame limit (D121) is the job of
 //! the encoder. Mapping [`QueueError::Overloaded`] to the protocol error `Overloaded` is the
 //! server's; the error code itself is part of the protocol contract (ARCHITECTURE 5.4
 //! "Interfaces", D159).
@@ -69,6 +81,16 @@ pub const CANDIDATE_PAGE: usize = 1000;
 /// is the FIFO order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ticket(u64);
+
+/// What a queued task needs from the lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Need {
+    /// A write transaction: granted while the broadcast queue is below its bound.
+    Write,
+    /// A quiet point (closure, registration of a subscription, M0 of a reconnect): granted only
+    /// when every pushed commit is released.
+    QuietPoint,
+}
 
 /// What the holder did before it released the lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,14 +129,17 @@ impl std::error::Error for LockError {}
 /// The single FIFO write lock of a server process (D156) with the bound of the broadcast queue
 /// (D162).
 ///
-/// A task calls [`WriteLock::request`] and waits until [`WriteLock::grant`] hands it the lock.
-/// Grants follow request order. No grant happens while the broadcast queue holds
+/// A writer calls [`WriteLock::request`], a task that reads at a quiet point calls
+/// [`WriteLock::request_quiet`]; both wait until [`WriteLock::grant`] hands them the lock.
+/// Grants follow request order. No writer is granted while the broadcast queue holds
 /// [`BROADCAST_COMMITS`] unreleased commits, so a slow read connection of the broadcast queue
-/// slows writers and never exhausts memory; the holder itself is never stopped, because it
+/// slows writers and never exhausts memory. No quiet point task is granted while any commit is
+/// unreleased, and the tasks queued behind it wait with it (FIFO). The broadcast queue releases
+/// without the lock, so that wait always ends. The holder itself is never stopped, because it
 /// waits on nothing but the writer connection.
 #[derive(Debug)]
 pub struct WriteLock<T> {
-    queue: VecDeque<(Ticket, T)>,
+    queue: VecDeque<(Ticket, Need, T)>,
     holder: Option<Ticket>,
     next_ticket: u64,
     unreleased: usize,
@@ -138,21 +163,39 @@ impl<T> WriteLock<T> {
         }
     }
 
-    /// Joins the end of the queue.
+    /// A writer joins the end of the queue.
     pub fn request(&mut self, task: T) -> Ticket {
+        self.enqueue(Need::Write, task)
+    }
+
+    /// A task that reads at a quiet point joins the end of the queue.
+    pub fn request_quiet(&mut self, task: T) -> Ticket {
+        self.enqueue(Need::QuietPoint, task)
+    }
+
+    fn enqueue(&mut self, need: Need, task: T) -> Ticket {
         let ticket = Ticket(self.next_ticket);
         self.next_ticket += 1;
-        self.queue.push_back((ticket, task));
+        self.queue.push_back((ticket, need, task));
         ticket
     }
 
-    /// Hands the lock to the first queued task, if the lock is free and the broadcast queue is
-    /// below its bound.
+    /// Hands the lock to the first queued task, if the lock is free and the task may start: a
+    /// writer while the broadcast queue is below its bound, a quiet point task when no commit
+    /// is unreleased.
     pub fn grant(&mut self) -> Option<(Ticket, T)> {
-        if self.holder.is_some() || self.unreleased >= self.bound {
+        if self.holder.is_some() {
             return None;
         }
-        let (ticket, task) = self.queue.pop_front()?;
+        let need = self.queue.front()?.1;
+        let ready = match need {
+            Need::Write => self.unreleased < self.bound,
+            Need::QuietPoint => self.unreleased == 0,
+        };
+        if !ready {
+            return None;
+        }
+        let (ticket, _, task) = self.queue.pop_front()?;
         self.holder = Some(ticket);
         Some((ticket, task))
     }
@@ -227,6 +270,15 @@ impl fmt::Display for QueueError {
 
 impl std::error::Error for QueueError {}
 
+/// Room of one session's send queue as a closure sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Room {
+    /// Bytes that still fit before the limit.
+    pub free: u64,
+    /// The limit of the queue; a row larger than it never fits.
+    pub limit: u64,
+}
+
 /// Bytes of encoded frames of one session that are not yet written (5.9).
 #[derive(Debug)]
 pub struct SendQueue {
@@ -260,6 +312,14 @@ impl SendQueue {
     /// Bytes that still fit before the limit.
     pub fn room(&self) -> u64 {
         self.limit.saturating_sub(self.queued)
+    }
+
+    /// Free bytes and limit, for [`WaitingRows::run_closure`].
+    pub fn space(&self) -> Room {
+        Room {
+            free: self.room(),
+            limit: self.limit,
+        }
     }
 
     /// Whether the session was closed by an overflow.
@@ -393,6 +453,11 @@ pub struct ClosureOutput<S, R> {
     pub pages: Vec<SnapshotPage<S, R>>,
     /// Sessions skipped because a row did not fit their room; each marks its queue starved.
     pub starved: Vec<S>,
+    /// Rows larger than the whole send queue of their session: they can never be queued. Each
+    /// left the waiting rows, and the caller ends its session with the fatal `Error Overloaded`
+    /// (D158) instead of letting the subscription wait for room forever. Under the limits of
+    /// 5.9 (`row_bytes` 768 KiB, send queue 8 MiB) no row reaches this.
+    pub oversized: Vec<(S, SubId, RowId)>,
     /// Rows read, the portion counted against [`CLOSURE_ROWS`].
     pub rows_read: usize,
     /// Bytes read, the portion counted against [`CLOSURE_BYTES`].
@@ -658,29 +723,36 @@ impl<S: Ord + Clone> WaitingRows<S> {
         self.closure_queued
     }
 
-    /// One closure. The caller holds the write lock at the quiet point `mark` with no
-    /// transaction open. `rooms` is the room of each session's send queue
-    /// ([`SendQueue::room`]); a session missing from it has no room.
+    /// One closure. The caller holds the write lock, granted through
+    /// [`WriteLock::request_quiet`], at the quiet point `mark` with no transaction open.
+    /// `rooms` is the room of each session's send queue ([`SendQueue::space`]); a session
+    /// missing from it has no room.
     ///
     /// Picks waiting rows round robin over sessions and, inside a session, over its
     /// subscriptions, and reads them by id until [`CLOSURE_ROWS`] rows or [`CLOSURE_BYTES`]
     /// are read (at least one row). A visible row that fits the room left in its session is
     /// served from `mark`; an invisible or deleted row is dropped from the waiting rows; a row
-    /// that does not fit goes back and its session is skipped for the rest of the closure.
-    /// On a read error nothing changes and the error is returned.
+    /// that does not fit goes back and its session is skipped for the rest of the closure; a
+    /// row larger than its session's whole queue is reported in
+    /// [`ClosureOutput::oversized`].
+    ///
+    /// On a read error nothing changes and the error is returned. The closure then stays
+    /// queued ([`WaitingRows::closure_queued`] is true and further requests join it), so the
+    /// caller must queue the closure task at the write lock again, or end the process; the
+    /// waiting rows are never left without a queued closure.
     pub fn run_closure<C: ClosureReader<S>>(
         &mut self,
         mark: ServerSeq,
-        rooms: &BTreeMap<S, u64>,
+        rooms: &BTreeMap<S, Room>,
         reader: &mut C,
     ) -> Result<ClosureOutput<S, C::Row>, C::Error> {
-        self.closure_queued = false;
-        let mut room: BTreeMap<S, u64> = rooms.clone();
+        let mut room: BTreeMap<S, u64> = rooms.iter().map(|(s, r)| (s.clone(), r.free)).collect();
         let mut skipped: BTreeSet<S> = BTreeSet::new();
         let mut picked: BTreeSet<(S, SubId, RowId)> = BTreeSet::new();
         let mut taken: Taken<S, C::Row> = BTreeMap::new();
         let mut dropped: Vec<(S, SubId, RowId)> = Vec::new();
         let mut starved: Vec<S> = Vec::new();
+        let mut oversized: Vec<(S, SubId, RowId)> = Vec::new();
         let mut rows_read = 0usize;
         let mut bytes_read = 0u64;
         let mut last_session = self.last_session.clone();
@@ -706,6 +778,14 @@ impl<S: Ord + Clone> WaitingRows<S> {
                 dropped.push((session, sub, row));
                 continue;
             }
+            let limit = rooms.get(&session).map_or(0, |r| r.limit);
+            if rooms.contains_key(&session) && read.encoded_bytes > limit {
+                // It never fits: report it instead of waiting for room forever (RED kira F4).
+                dropped.push((session.clone(), sub, row));
+                skipped.insert(session.clone());
+                oversized.push((session, sub, row));
+                continue;
+            }
             let left = room.get(&session).copied().unwrap_or(0);
             if read.encoded_bytes > left {
                 // The row stays waiting; the session drains first.
@@ -721,7 +801,8 @@ impl<S: Ord + Clone> WaitingRows<S> {
                 .push((row, read.row, read.encoded_bytes));
         }
 
-        // Every read succeeded: apply the outcome.
+        // Every read succeeded: apply the outcome. Only now the queued closure counts as run.
+        self.closure_queued = false;
         self.last_session = last_session;
         self.last_sub = last_sub;
         for (session, sub, row) in dropped {
@@ -785,6 +866,7 @@ impl<S: Ord + Clone> WaitingRows<S> {
         Ok(ClosureOutput {
             pages,
             starved,
+            oversized,
             rows_read,
             bytes_read,
         })
