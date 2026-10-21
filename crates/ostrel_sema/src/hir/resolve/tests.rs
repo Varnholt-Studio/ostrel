@@ -325,6 +325,24 @@ fn model_names_in_make_and_query_heads() {
 }
 
 #[test]
+fn make_with_a_name_that_is_no_type_is_e0203() {
+    assert_eq!(
+        diags("fn g()\n  print(1)\nfn f()\n  make g { a: 1 }\n"),
+        ["E0203 4:8"]
+    );
+    assert_eq!(
+        diags("view V\n  col\nfn f()\n  make V { a: 1 }\n"),
+        ["E0203 4:8"]
+    );
+}
+
+#[test]
+fn make_with_a_type_that_is_no_model_is_e0205() {
+    assert_eq!(diags("fn f()\n  make Int { a: 1 }\n"), ["E0205 2:8"]);
+    assert_eq!(diags("fn f()\n  make Set { a: 1 }\n"), ["E0205 2:8"]);
+}
+
+#[test]
 fn duplicate_member_is_e0206_at_the_second_name() {
     assert_eq!(diags("data A\n  a: Int\n  a: Text\n"), ["E0206 3:3"]);
     assert_eq!(diags("data A\n  id: Int\n"), ["E0206 2:3"]);

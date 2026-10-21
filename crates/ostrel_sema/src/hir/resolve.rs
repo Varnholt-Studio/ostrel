@@ -120,6 +120,16 @@ fn id(index: usize) -> u32 {
     u32::try_from(index).unwrap_or(u32::MAX)
 }
 
+/// The number of type arguments of a built in type, `None` for any other name.
+fn builtin_arity(name: &str) -> Option<usize> {
+    match name {
+        "Set" | "List" => Some(1),
+        "Map" => Some(2),
+        "Bool" | "Int" | "Float" | "Text" | "Time" | "Bytes" | "Rank" => Some(0),
+        _ => None,
+    }
+}
+
 fn implicit_field(name: &str) -> Option<ImplicitField> {
     Some(match name {
         "id" => ImplicitField::Id,
@@ -530,13 +540,12 @@ impl<'a> Rx<'a> {
     }
 
     fn named_ty(&mut self, name: &ast::Ident, args: &[ast::TyId]) -> Ty {
-        let want = match &*name.text {
-            "Set" | "List" => 1,
-            "Map" => 2,
-            "Bool" | "Int" | "Float" | "Text" | "Time" | "Bytes" | "Rank" => 0,
-            other => match self.defs.get(other).map(|&d| self.def_kind(d)) {
+        let want = match builtin_arity(&name.text) {
+            Some(want) => want,
+            None => match self.defs.get(&*name.text).map(|&d| self.def_kind(d)) {
                 Some(Some(DefKind::Model(_) | DefKind::Enum(_))) => 0,
                 found => {
+                    let other = &name.text;
                     let message = if found.is_some() {
                         format!("`{other}` is not a type")
                     } else {
@@ -1305,9 +1314,10 @@ impl<'a> Rx<'a> {
         }
     }
 
-    /// The model `name` declares (SPEC 12.6): E0205 for a declared name or a
-    /// `local` that is no model, `unknown` for an unknown name (E0203 where a
-    /// type is expected, E0200 in a query head).
+    /// The model `name` declares (SPEC 12.6). In a query head (`unknown` is
+    /// E0200) a declared name or a `local` that is no model is E0205. In a
+    /// type position (`unknown` is E0203, `make T`) only a type that is no
+    /// model is E0205; any other name is E0203.
     fn model(
         &mut self,
         name: &ast::Ident,
@@ -1318,8 +1328,16 @@ impl<'a> Rx<'a> {
         match self.defs.get(&*name.text).map(|&d| (d, self.def_kind(d))) {
             Some((d, Some(DefKind::Model(_)))) if !local => Some(d),
             found => {
-                let (code, message) = if local || found.is_some() {
+                let not_a_model = if unknown == codes::UNKNOWN_TYPE {
+                    builtin_arity(&name.text).is_some()
+                        || matches!(found, Some((_, Some(DefKind::Enum(_)))))
+                } else {
+                    local || found.is_some()
+                };
+                let (code, message) = if not_a_model {
                     (NOT_A_MODEL, format!("{need}; `{}` is not one", name.text))
+                } else if found.is_some() {
+                    (unknown, format!("`{}` is not a type", name.text))
                 } else {
                     (unknown, format!("unknown data type `{}`", name.text))
                 };
