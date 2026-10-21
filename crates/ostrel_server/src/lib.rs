@@ -16,8 +16,9 @@
 //! Secrets never reach a log: tokens, replica secrets and audit arguments have no `Debug`
 //! or `Display` output that shows them (olga #1655, georg #1572 F9, D122).
 //!
-//! The WebSocket transport (`Call`/`Return` frames of ARCHITECTURE 5.4) is not part of this
-//! crate version; it follows once the wire codec of `ostrel_sync` is merged.
+//! * [`ws`] is the server side of the WebSocket session: it reads `Call` frames, runs each
+//!   call under the locking rules of ARCHITECTURE 5.4 and writes its `Return`. The socket
+//!   itself follows in a later version.
 
 // This crate handles requests from untrusted clients: no unwrap, expect, panic or
 // unchecked indexing.
@@ -42,6 +43,7 @@ pub mod host;
 pub mod identity;
 pub mod secret;
 pub mod task;
+pub mod ws;
 
 /// Hex digits of a SHA-256 digest, lowercase, as audit records and logs show it.
 pub fn sha256_hex(digest: &[u8; 32]) -> String {
