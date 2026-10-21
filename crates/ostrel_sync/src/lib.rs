@@ -7,6 +7,7 @@
 //! a server process (ARCHITECTURE 5.6, D126).
 
 pub mod broadcast_fence;
+pub mod log_gate;
 pub mod protocol;
 pub mod replica_id;
 pub mod wire;

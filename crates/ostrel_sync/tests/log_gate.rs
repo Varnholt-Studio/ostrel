@@ -1,0 +1,467 @@
+//! Write lock, send queue and closure rules of `ostrel_sync::log_gate` (ARCHITECTURE 5.4, 5.6,
+//! 5.9; D156 to D162).
+
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+
+use ostrel_sync::log_gate::{
+    BROADCAST_COMMITS, CANDIDATE_PAGE, CLOSURE_BYTES, CLOSURE_ROWS, ClosureReader, EvictAction,
+    LockError, QueueError, ReadRow, Release, SEND_QUEUE_BYTES, SendQueue, WaitError, WaitingRows,
+    WriteLock,
+};
+use ostrel_sync::protocol::{Hlc, ReplicaId, RowId, ServerSeq, SubId};
+
+fn row(n: u64) -> RowId {
+    RowId::new(Hlc::new(1_000 + n, 0, ReplicaId(9)).unwrap())
+}
+
+const MIB: u64 = 1024 * 1024;
+
+// ---------------------------------------------------------------------------------------------
+// Write lock
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_lock_is_granted_in_request_order_and_to_one_holder() {
+    let mut lock = WriteLock::new();
+    let a = lock.request("a");
+    let b = lock.request("b");
+    let c = lock.request("c");
+    assert_eq!(lock.grant(), Some((a, "a")));
+    assert_eq!(lock.grant(), None, "a second holder while a holds the lock");
+    lock.release(a, Release::Nothing).unwrap();
+    assert_eq!(lock.grant(), Some((b, "b")));
+    lock.release(b, Release::Nothing).unwrap();
+    assert_eq!(lock.grant(), Some((c, "c")));
+    assert_eq!(lock.queued(), 0);
+}
+
+#[test]
+fn only_the_holder_releases_the_lock() {
+    let mut lock = WriteLock::new();
+    let a = lock.request(1);
+    let b = lock.request(2);
+    lock.grant().unwrap();
+    assert_eq!(
+        lock.release(b, Release::Committed),
+        Err(LockError::NotHolder { ticket: b })
+    );
+    assert_eq!(lock.holder(), Some(a));
+    assert_eq!(lock.unreleased(), 0);
+}
+
+#[test]
+fn writers_wait_before_the_lock_while_the_broadcast_queue_is_full() {
+    let mut lock = WriteLock::with_bound(2);
+    for n in 0..2 {
+        let t = lock.request(n);
+        assert_eq!(lock.grant().map(|g| g.0), Some(t));
+        lock.release(t, Release::Committed).unwrap();
+    }
+    assert_eq!(lock.unreleased(), 2);
+    let waiting = lock.request(9);
+    assert_eq!(lock.grant(), None, "granted at the bound");
+    assert_eq!(lock.holder(), None, "the waiting task holds nothing");
+    lock.commit_released().unwrap();
+    assert_eq!(lock.grant(), Some((waiting, 9)));
+}
+
+#[test]
+fn a_rollback_does_not_count_against_the_broadcast_bound() {
+    let mut lock = WriteLock::with_bound(1);
+    let t = lock.request(());
+    lock.grant().unwrap();
+    lock.release(t, Release::Nothing).unwrap();
+    let u = lock.request(());
+    assert_eq!(lock.grant().map(|g| g.0), Some(u));
+}
+
+#[test]
+fn the_broadcast_queue_cannot_release_more_than_was_pushed() {
+    let mut lock: WriteLock<()> = WriteLock::new();
+    assert_eq!(lock.commit_released(), Err(LockError::NothingToRelease));
+}
+
+#[test]
+fn the_default_bound_is_1024_commits() {
+    let mut lock = WriteLock::new();
+    for _ in 0..BROADCAST_COMMITS {
+        let t = lock.request(());
+        lock.grant().unwrap();
+        lock.release(t, Release::Committed).unwrap();
+    }
+    lock.request(());
+    assert_eq!(lock.grant(), None);
+    lock.commit_released().unwrap();
+    assert!(lock.grant().is_some());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Send queue
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn live_frames_over_the_limit_overload_and_close_the_session() {
+    let mut queue = SendQueue::new();
+    assert_eq!(SEND_QUEUE_BYTES, 8 * MIB);
+    queue.push_now(8 * MIB - 10).unwrap();
+    queue.push_now(10).unwrap();
+    assert_eq!(queue.push_now(1), Err(QueueError::Overloaded));
+    assert!(queue.is_closed());
+    assert_eq!(queue.queued(), 0, "frames not yet written are dropped");
+    assert_eq!(queue.push_now(1), Err(QueueError::Closed));
+    assert_eq!(queue.push_when_room(1), Err(QueueError::Closed));
+}
+
+#[test]
+fn catch_up_frames_wait_for_room_and_never_overload() {
+    let mut queue = SendQueue::with_limit(100);
+    assert_eq!(queue.push_when_room(80), Ok(true));
+    assert_eq!(queue.push_when_room(30), Ok(false), "must wait");
+    assert!(!queue.is_closed());
+    queue.written(40);
+    assert_eq!(queue.push_when_room(30), Ok(true));
+    assert_eq!(queue.queued(), 70);
+}
+
+#[test]
+fn an_empty_queue_always_takes_one_waiting_frame() {
+    let mut queue = SendQueue::with_limit(10);
+    assert_eq!(queue.push_when_room(50), Ok(true));
+    assert_eq!(queue.push_when_room(1), Ok(false));
+}
+
+#[test]
+fn live_frames_count_while_they_stand_behind_a_waiting_catch_up() {
+    // D161: live ops queued behind a catch up count to the limit.
+    let mut queue = SendQueue::with_limit(100);
+    assert_eq!(queue.push_when_room(90), Ok(true));
+    assert_eq!(queue.push_when_room(20), Ok(false));
+    queue.push_now(10).unwrap();
+    assert_eq!(queue.push_now(1), Err(QueueError::Overloaded));
+}
+
+#[test]
+fn a_starved_session_asks_again_once_below_half() {
+    let mut queue = SendQueue::with_limit(100);
+    queue.push_now(90).unwrap();
+    queue.mark_starved();
+    assert!(!queue.written(30), "60 is not below half");
+    assert!(queue.written(20), "40 is below half");
+    assert!(!queue.written(10), "asks only once");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Waiting rows and closures
+// ---------------------------------------------------------------------------------------------
+
+/// Rows of a fixed size; `hidden` rows fail the filter or `see`, `gone` rows are deleted.
+#[derive(Default)]
+struct Table {
+    size: BTreeMap<RowId, u64>,
+    hidden: Vec<RowId>,
+    gone: Vec<RowId>,
+    reads: Vec<(u32, SubId, RowId)>,
+}
+
+impl Table {
+    fn sized(rows: impl IntoIterator<Item = (RowId, u64)>) -> Self {
+        Self {
+            size: rows.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+}
+
+impl ClosureReader<u32> for Table {
+    type Row = RowId;
+    type Error = Infallible;
+
+    fn read(
+        &mut self,
+        session: &u32,
+        sub: SubId,
+        row: RowId,
+    ) -> Result<Option<ReadRow<RowId>>, Infallible> {
+        self.reads.push((*session, sub, row));
+        if self.gone.contains(&row) {
+            return Ok(None);
+        }
+        let bytes = self.size.get(&row).copied().unwrap_or(100);
+        Ok(Some(ReadRow {
+            row,
+            encoded_bytes: bytes,
+            read_bytes: bytes,
+            visible: !self.hidden.contains(&row),
+        }))
+    }
+}
+
+fn rooms(entries: &[(u32, u64)]) -> BTreeMap<u32, u64> {
+    entries.iter().copied().collect()
+}
+
+fn with_candidates(w: &mut WaitingRows<u32>, session: u32, sub: SubId, rows: &[RowId]) {
+    w.subscribe(session, sub).unwrap();
+    w.begin_candidates(&session, sub).unwrap();
+    w.add_candidates(&session, sub, rows.iter().copied(), true)
+        .unwrap();
+}
+
+#[test]
+fn a_closure_serves_waiting_rows_at_its_mark_and_ends_the_snapshot() {
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 7, &[row(1), row(2)]);
+    let mut table = Table::default();
+    let out = w
+        .run_closure(ServerSeq(40), &rooms(&[(1, MIB)]), &mut table)
+        .unwrap();
+    assert_eq!(out.pages.len(), 1);
+    let page = &out.pages[0];
+    assert_eq!((page.session, page.sub, page.seq), (1, 7, ServerSeq(40)));
+    assert_eq!(page.rows, vec![row(1), row(2)]);
+    assert!(page.last);
+    assert!(w.is_live(&1, 7, row(1), ServerSeq(41)));
+    assert!(
+        !w.is_live(&1, 7, row(1), ServerSeq(40)),
+        "op at the mark is in the row"
+    );
+    assert!(!w.has_work());
+}
+
+#[test]
+fn a_waiting_row_gets_no_op() {
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 7, &[row(1)]);
+    assert!(!w.is_live(&1, 7, row(1), ServerSeq(99)));
+}
+
+#[test]
+fn a_closure_reads_at_most_256_rows() {
+    let mut w = WaitingRows::new();
+    let rows: Vec<RowId> = (0..300).map(row).collect();
+    with_candidates(&mut w, 1, 1, &rows);
+    let mut table = Table::default();
+    let out = w
+        .run_closure(ServerSeq(1), &rooms(&[(1, 8 * MIB)]), &mut table)
+        .unwrap();
+    assert_eq!(out.rows_read, CLOSURE_ROWS);
+    assert_eq!(out.pages[0].rows.len(), CLOSURE_ROWS);
+    assert!(!out.pages[0].last);
+    assert_eq!(w.waiting(&1, 1), 300 - CLOSURE_ROWS);
+    let out = w
+        .run_closure(ServerSeq(2), &rooms(&[(1, 8 * MIB)]), &mut table)
+        .unwrap();
+    assert_eq!(out.pages[0].rows.len(), 300 - CLOSURE_ROWS);
+    assert!(out.pages[0].last);
+}
+
+#[test]
+fn a_closure_stops_after_4_mib_but_reads_at_least_one_row() {
+    let mut w = WaitingRows::new();
+    let rows: Vec<RowId> = (0..10).map(row).collect();
+    with_candidates(&mut w, 1, 1, &rows);
+    // Six rows of 700 KiB pass 4 MiB.
+    let mut table = Table::sized(rows.iter().map(|r| (*r, 700 * 1024)));
+    let out = w
+        .run_closure(ServerSeq(1), &rooms(&[(1, 8 * MIB)]), &mut table)
+        .unwrap();
+    assert_eq!(out.rows_read, 6);
+    assert!(out.bytes_read >= CLOSURE_BYTES);
+
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1), row(2)]);
+    let mut table = Table::sized([(row(1), 5 * MIB), (row(2), 1)]);
+    let out = w
+        .run_closure(ServerSeq(1), &rooms(&[(1, 8 * MIB)]), &mut table)
+        .unwrap();
+    assert_eq!(out.rows_read, 1, "one row over 4 MiB is still read");
+}
+
+#[test]
+fn rows_are_picked_round_robin_over_sessions_and_subscriptions() {
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1), row(2), row(3)]);
+    with_candidates(&mut w, 1, 2, &[row(11), row(12)]);
+    with_candidates(&mut w, 2, 1, &[row(21), row(22), row(23)]);
+    let mut table = Table::default();
+    w.run_closure(ServerSeq(1), &rooms(&[(1, MIB), (2, MIB)]), &mut table)
+        .unwrap();
+    let order: Vec<(u32, SubId)> = table.reads.iter().map(|r| (r.0, r.1)).collect();
+    assert_eq!(
+        order[..6],
+        [(1, 1), (2, 1), (1, 2), (2, 1), (1, 1), (2, 1)],
+        "sessions alternate, a session alternates its subscriptions"
+    );
+}
+
+#[test]
+fn invisible_and_deleted_rows_leave_the_waiting_rows_unsent() {
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1), row(2), row(3)]);
+    let mut table = Table {
+        hidden: vec![row(2)],
+        gone: vec![row(3)],
+        ..Table::default()
+    };
+    let out = w
+        .run_closure(ServerSeq(5), &rooms(&[(1, MIB)]), &mut table)
+        .unwrap();
+    assert_eq!(out.pages[0].rows, vec![row(1)]);
+    assert!(out.pages[0].last);
+    assert!(!w.is_live(&1, 1, row(2), ServerSeq(6)));
+}
+
+#[test]
+fn a_row_that_does_not_fit_the_room_waits_and_its_session_starves() {
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1), row(2)]);
+    with_candidates(&mut w, 2, 1, &[row(3)]);
+    let mut table = Table::sized([(row(1), 60), (row(2), 60), (row(3), 60)]);
+    let out = w
+        .run_closure(ServerSeq(3), &rooms(&[(1, 100), (2, 100)]), &mut table)
+        .unwrap();
+    assert_eq!(out.starved, vec![1]);
+    let one: Vec<_> = out.pages.iter().filter(|p| p.session == 1).collect();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].rows, vec![row(1)]);
+    assert!(!one[0].last, "a row still waits");
+    assert_eq!(w.waiting(&1, 1), 1);
+    assert!(out.pages.iter().any(|p| p.session == 2 && p.last));
+}
+
+#[test]
+fn a_session_without_room_is_skipped_and_others_proceed() {
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1)]);
+    with_candidates(&mut w, 2, 1, &[row(2)]);
+    let mut table = Table::default();
+    let out = w
+        .run_closure(ServerSeq(3), &rooms(&[(2, MIB)]), &mut table)
+        .unwrap();
+    assert_eq!(out.starved, vec![1]);
+    assert_eq!(out.pages.len(), 1);
+    assert_eq!(out.pages[0].session, 2);
+    assert_eq!(w.waiting(&1, 1), 1);
+}
+
+#[test]
+fn only_one_closure_is_queued_and_requests_join_it() {
+    let mut w: WaitingRows<u32> = WaitingRows::new();
+    assert!(w.request_closure());
+    assert!(!w.request_closure());
+    assert!(w.closure_queued());
+    w.run_closure(ServerSeq(0), &BTreeMap::new(), &mut Table::default())
+        .unwrap();
+    assert!(!w.closure_queued());
+    assert!(
+        w.request_closure(),
+        "a request after the start queues the next one"
+    );
+}
+
+#[test]
+fn an_evicted_waiting_row_is_dropped_without_a_message() {
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1), row(2)]);
+    w.run_closure(ServerSeq(1), &rooms(&[(1, 150)]), &mut Table::default())
+        .unwrap();
+    // row(1) served, row(2) still waiting (room for one row of 100 bytes).
+    assert_eq!(w.evict(&1, 1, row(2)), EvictAction::Drop);
+    assert_eq!(w.waiting(&1, 1), 0, "the evicted row no longer waits");
+    assert_eq!(w.evict(&1, 1, row(1)), EvictAction::Send);
+    assert_eq!(w.evict(&1, 1, row(1)), EvictAction::Ignore);
+    assert!(!w.is_live(&1, 1, row(1), ServerSeq(9)));
+}
+
+#[test]
+fn an_entering_row_waits_unless_served() {
+    let mut w = WaitingRows::new();
+    w.resubscribe(1, 1, [row(1)], ServerSeq(10)).unwrap();
+    w.enter(&1, 1, row(1)).unwrap();
+    w.enter(&1, 1, row(2)).unwrap();
+    assert_eq!(w.waiting(&1, 1), 1);
+    assert!(
+        w.is_live(&1, 1, row(1), ServerSeq(11)),
+        "held rows are live from M0"
+    );
+    assert_eq!(w.enter(&1, 2, row(3)), Err(WaitError::Unknown { sub: 2 }));
+}
+
+#[test]
+fn candidates_are_read_lazily_one_page_at_a_time() {
+    let mut w = WaitingRows::new();
+    w.subscribe(1, 1).unwrap();
+    assert!(w.wants_candidates(&1, 1));
+    w.begin_candidates(&1, 1).unwrap();
+    assert!(!w.wants_candidates(&1, 1), "a page is being read");
+    let page: Vec<RowId> = (0..CANDIDATE_PAGE as u64).map(row).collect();
+    w.add_candidates(&1, 1, page, false).unwrap();
+    assert!(!w.wants_candidates(&1, 1), "1 000 rows wait");
+    w.run_closure(ServerSeq(1), &rooms(&[(1, 8 * MIB)]), &mut Table::default())
+        .unwrap();
+    assert!(w.wants_candidates(&1, 1), "fewer than 1 000 rows wait");
+    assert_eq!(
+        w.add_candidates(&1, 1, [row(5000)], true),
+        Err(WaitError::NoCandidateRead { sub: 1 })
+    );
+}
+
+#[test]
+fn served_candidates_are_skipped() {
+    let mut w = WaitingRows::new();
+    w.resubscribe(1, 1, [row(1)], ServerSeq(4)).unwrap();
+    w.begin_candidates(&1, 1).unwrap();
+    w.add_candidates(&1, 1, [row(1), row(2)], true).unwrap();
+    assert_eq!(w.waiting(&1, 1), 1);
+}
+
+#[test]
+fn an_empty_subscription_gets_one_empty_last_page() {
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 3, &[]);
+    assert!(w.has_work());
+    let out = w
+        .run_closure(ServerSeq(8), &rooms(&[(1, MIB)]), &mut Table::default())
+        .unwrap();
+    assert_eq!(out.pages.len(), 1);
+    assert!(out.pages[0].rows.is_empty() && out.pages[0].last);
+    let out = w
+        .run_closure(ServerSeq(9), &rooms(&[(1, MIB)]), &mut Table::default())
+        .unwrap();
+    assert!(out.pages.is_empty(), "the last page is sent once");
+}
+
+#[test]
+fn a_read_error_changes_nothing() {
+    struct Failing;
+    impl ClosureReader<u32> for Failing {
+        type Row = RowId;
+        type Error = &'static str;
+        fn read(
+            &mut self,
+            _: &u32,
+            _: SubId,
+            _: RowId,
+        ) -> Result<Option<ReadRow<RowId>>, &'static str> {
+            Err("connection lost")
+        }
+    }
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1)]);
+    assert_eq!(
+        w.run_closure(ServerSeq(1), &rooms(&[(1, MIB)]), &mut Failing),
+        Err("connection lost")
+    );
+    assert_eq!(w.waiting(&1, 1), 1);
+    assert!(!w.is_live(&1, 1, row(1), ServerSeq(2)));
+}
+
+#[test]
+fn closing_a_session_forgets_its_rows() {
+    let mut w = WaitingRows::new();
+    with_candidates(&mut w, 1, 1, &[row(1)]);
+    w.close_session(&1);
+    assert!(!w.has_work());
+    assert_eq!(w.evict(&1, 1, row(1)), EvictAction::Ignore);
+}
