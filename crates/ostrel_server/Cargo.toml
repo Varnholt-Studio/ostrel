@@ -21,6 +21,11 @@ ostrel_vm.workspace = true
 # Allowlisted by D118, only for this crate: SHA-256 of audit arguments (D117)
 # and of replica secrets (D111).
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
+# ARCHITECTURE 4.1 and 11: the socket runs on tokio `current_thread` with one `LocalSet`.
+tokio = { version = "1.54", default-features = false, features = ["rt", "net", "io-util", "time", "sync", "macros"] }
+# ARCHITECTURE 11: WebSocket framing and the upgrade handshake. Only the re-exported
+# `tungstenite` protocol state is used, driven by tokio I/O in `ws/socket.rs`.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [dev-dependencies]
 ostrel_db_memory = { path = "../ostrel_db_memory" }

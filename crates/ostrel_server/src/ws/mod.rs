@@ -15,14 +15,17 @@
 //!   resume mark and sessions per principal, then supersedes an older session of the same
 //!   replica; it also keeps the `Call` rate per principal (D156, D158, D159, D161).
 //!
-//! The socket itself (tokio, hyper and tokio-tungstenite of ARCHITECTURE 11) and the sync
-//! messages follow in later versions; every part here is driven by plain futures, so tests
-//! replay every interleaving.
+//! * [`socket`] accepts TCP connections, performs the WebSocket upgrade and runs the parts
+//!   above for each connection on tokio `current_thread` (ARCHITECTURE 4.1, 11).
+//!
+//! The sync messages follow in a later version. Every part except [`socket`] is driven by
+//! plain futures, so tests replay every interleaving.
 
 pub mod call;
 pub mod fifo;
 pub mod hello;
 pub mod session;
+pub mod socket;
 
 pub use call::{CallDb, CallServer, CommitFailed, FnFault, LOCKED_CALL_STEPS, ReadDb, ServerFns};
 pub use fifo::{FifoGuard, FifoLock};
