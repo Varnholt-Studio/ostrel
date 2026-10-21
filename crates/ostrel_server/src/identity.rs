@@ -117,8 +117,15 @@ pub fn resolve_principal(
     Ok(dev_identity(credentials))
 }
 
+/// Text that only a build with the feature contains, so a scan of a binary shows whether the
+/// development identity is in it (AC-12, D127).
+#[cfg(feature = "dev-identity")]
+pub const DEV_IDENTITY_MARKER: &str = "ostrel-dev-identity";
+
 #[cfg(feature = "dev-identity")]
 fn dev_identity(credentials: &Credentials) -> Option<RowId> {
+    // Keeps the marker in every binary that can resolve a development identity.
+    std::hint::black_box(DEV_IDENTITY_MARKER);
     credentials.dev_identity
 }
 
