@@ -1,7 +1,8 @@
 # Benchmarks
 
 Status: draft. Owner: QA (ARCHITECTURE 5.9). Sections 2.1 and 2.2 were written with work
-package T207 (Refs #207) as a template for QA. No benchmark values are published yet. This file collects the results required by SPEC (AC-27, AC-28, AC-51, AC-61, AC-65) and
+package T207 (Refs #207) as a template for QA. No benchmark values are published yet.
+This file collects the results required by SPEC (AC-27, AC-28, AC-51, AC-61, AC-65) and
 the limits that a reader must know to compare them. Only results of official runs as defined in
 `MEASUREMENT.md` appear here; values from a development machine never do.
 
@@ -43,7 +44,10 @@ whose measured path calls elevated functions states these fields:
 * the database adapter (SQLite or PostgreSQL);
 * the disk of the audit file (type, file system, write cache);
 * the hold time of the write lock, p50 and p99, with elevated calls;
-* the hold time of the write lock, p50 and p99, without elevated calls.
+* the hold time of the write lock, p50 and p99, without elevated calls;
+* whether the reference stack (REF-A) writes a comparable synchronous audit entry for each
+  privileged call, and if not, that the comparison includes a protection the reference stack
+  lacks.
 
 Values measured on the memory adapter do not count here: it keeps the audit in memory and hides
 the sync. A p99 hold time above 20 ms in the KPI A setup is a blocker (ARCHITECTURE 5.4,
@@ -61,9 +65,23 @@ Details: [`docs/security.md`](docs/security.md), section 2.4.
 
 ### 2.3 Query scans without an index under the write lock
 
-Both database drivers scan every row of the model and filter in `ostrel_db::eval`; a scanned row
-costs 10 VM steps through `scan_limit` (ARCHITECTURE 5.9, 6.1, ARCHITECTURE 16 risk 13 (b), D178).
-This bounds the hold time of the write lock for a scanning call at about 240 ms, far above the
-20 ms of ARCHITECTURE 5.4. Until equality and reference filters are answered from an index (work
-package T224, design in D183), the hold time of KPI A is a blocker, and a result measured before
-then states that it was measured without an index. No value is published yet.
+Today both database drivers scan every row of the model and filter in `ostrel_db::eval`, and
+nothing bounds the number of rows a query scans: on the development branch the hold time of the
+write lock for a scanning call grows with the size of the model, without a limit (ARCHITECTURE 16
+risk 13 (b)). Two open work packages change this:
+
+* T206 (planned, D178): a scanned row will cost 10 VM steps through `Query::scan_limit`. With the
+  step limit of 200 000 this is expected to bound the hold time of a scanning call at about
+  240 ms (ARCHITECTURE 5.9), still far above the 20 ms of ARCHITECTURE 5.4.
+* T224 (planned, D183): equality and reference filters will be answered from an index, so a
+  query reads only candidate rows.
+
+Until both are merged, the hold time of KPI A is a blocker. A result measured before then states
+which of the two was in place, and these fields:
+
+* the number of rows of the largest scanned model;
+* whether a scan limit and an index were in place;
+* whether the reference stack (REF-A) bounds the rows or the time of a query, and if not, that
+  the comparison includes a protection the reference stack lacks.
+
+No value is published yet.
