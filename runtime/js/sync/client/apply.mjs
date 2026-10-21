@@ -205,6 +205,25 @@ export class LocalReplica {
     });
   }
 
+  /**
+   * Drops the confirmed state of (user, replica): every row and the mark. Rejected records
+   * stay. The next `Hello` names no mark, and the rows come back as `Snapshot`. Used when the
+   * confirmed state may hold an op the server rejected and its row is not known (AC-57 (c)).
+   */
+  async dropConfirmed({ user, replica }) {
+    checkPair(user, replica);
+    const range = prefixRange(this.#keyRange, [user, replica]);
+    return this.#transaction([MARKS, ROWS], 'readwrite', (tx, done, step) => {
+      const rowStore = tx.objectStore(ROWS);
+      const read = rowStore.getAll(range);
+      read.onsuccess = step(() => {
+        for (const { model, row } of read.result) rowStore.delete(rowKey(user, replica, model, row.id));
+        tx.objectStore(MARKS).delete(markKey(user, replica));
+        done(read.result.length);
+      });
+    });
+  }
+
   /** Records a rejected own op (an outbox entry) with the server's reason. */
   async reject({ user, replica, entry, reason }) {
     checkPair(user, replica);

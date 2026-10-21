@@ -377,25 +377,54 @@ test('ops are packed into frames that fit the frame limit', async () => {
   await s.done;
 });
 
-test('confirmed ops at or below applied_server_seq are forgotten when the next batch is sent (dana #2735)', async () => {
+test('a reject for an op of an earlier batch ends with a fault; the session keeps one number (D182, dana #2735)', async () => {
   const s = await setup({ ops: 3 });
   await connect(s, { limitOverrides: { ops_per_batch: 1 } });
   await until(() => s.socket.frames.length === 2, 'first batch');
   s.socket.deliver({ t: 'ack', op: s.entries[0].opId, seq: '0000000000000010', restamped: [] });
   await until(() => s.socket.frames.length === 3, 'second batch');
-  // The first batch is decided and lies at or below the mark: a reject naming its op is an
-  // outcome for an op that no longer waits, so the set of confirmed ops stays one batch big.
+  // The first batch is decided and the second is on the wire: a reject naming the confirmed op
+  // of the first batch is never ignored.
   s.socket.deliver({ t: 'reject', op: s.entries[0].opId, reason: 'Denied' });
-  s.socket.deliver({ t: 'ack', op: s.entries[1].opId, seq: '0000000000000011', restamped: [] });
-  await until(() => s.socket.frames.length === 4, 'third batch');
-  assert.equal(s.calls.filter((c) => c.name === 'reject').length, 0);
-  // Within the batch on the wire the order of D182 is still checked.
-  s.socket.deliver({ t: 'ack', op: s.entries[2].opId, seq: '0000000000000012', restamped: [] });
-  s.socket.deliver({ t: 'reject', op: s.entries[2].opId, reason: 'Denied' });
   const result = await s.done;
   assert.equal(result.end, END.FAULT);
+  assert.equal(result.error.kind, 'Protocol');
+  assert.equal(s.socket.closed, true);
   assert.deepEqual(
     s.calls.filter((c) => c.name === 'reject').map((c) => c.payload),
-    [{ op: s.entries[2].opId, reason: 'Denied' }],
+    [{ op: s.entries[0].opId, reason: 'Denied' }],
   );
+  // The op of the batch on the wire stays in the outbox for the next session.
+  assert.deepEqual((await pending(s)).map((e) => e.opId), [s.entries[1].opId, s.entries[2].opId]);
+  assert.equal(s.socket.frames.length, 3);
+});
+
+test('a second reject of a rejected op is a fault; one above every confirmed op is ignored', async () => {
+  const s = await setup({ ops: 3 });
+  await connect(s);
+  await until(() => s.socket.frames.length === 2, 'ops frame');
+  s.socket.deliver({ t: 'reject', op: s.entries[2].opId, reason: 'Denied' });
+  s.socket.deliver(ack(s.entries[1].opId));
+  await until(() => s.calls.some((c) => c.name === 'ack'), 'ack hook');
+  // Op 3 lies above the highest confirmed op: its repeated reject concerns no confirmed op.
+  s.socket.deliver({ t: 'reject', op: s.entries[2].opId, reason: 'Denied' });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(s.calls.filter((c) => c.name === 'reject').length, 1);
+  // A reject for an op of another replica concerns no own op.
+  s.socket.deliver({ t: 'reject', op: OTHER + '00000001', reason: 'Denied' });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(s.calls.filter((c) => c.name === 'reject').length, 1);
+
+  const t = await setup({ ops: 3 });
+  await connect(t);
+  await until(() => t.socket.frames.length === 2, 'ops frame');
+  t.socket.deliver({ t: 'reject', op: t.entries[0].opId, reason: 'Denied' });
+  t.socket.deliver(ack(t.entries[2].opId));
+  await until(() => t.calls.some((c) => c.name === 'ack'), 'ack hook');
+  // Op 1 lies below the confirmed op 3: it is decided, a second reject breaks the protocol.
+  t.socket.deliver({ t: 'reject', op: t.entries[0].opId, reason: 'Denied' });
+  assert.equal((await t.done).end, END.FAULT);
+  assert.equal(t.calls.filter((c) => c.name === 'reject').length, 2);
+  s.controller.abort();
+  assert.equal((await s.done).end, END.ABORTED);
 });

@@ -413,3 +413,104 @@ test('the session applies an acked op to the data store before it leaves the out
   controller.abort();
   await done;
 });
+
+// A session with a data store on one in-memory database; `ops` own ops of replica A are queued.
+async function sessionWithStore({ ops, limitOverrides } = {}) {
+  const indexedDB = new MemoryIndexedDB();
+  const outbox = await openOutbox({ indexedDB, IDBKeyRange: MemoryKeyRange });
+  const local = await store(indexedDB);
+  await local.applyOps({ user: ALICE, replica: A, ops: [{ seq: seq(3), op: makeIssue() }] });
+  const entries = [];
+  for (const [n, row] of ops.entries()) {
+    const body = { make: { title: `mine ${n}`, labels: ['x'], votes: [] } };
+    entries.push(await outbox.append({ user: ALICE, replica: A, op: { model: 'Issue', row, body }, nowMs: 1000 }));
+  }
+  const rejects = [];
+  const socket = new FakeSocket();
+  const controller = new AbortController();
+  const done = runSession({
+    socket,
+    outbox,
+    identity: memoryIdentity({ replica: A }),
+    models: ['Issue'],
+    queue: new EventQueue(),
+    local,
+    signal: controller.signal,
+    hooks: { onReject: async (payload) => rejects.push(payload) },
+    now: () => 1000,
+  });
+  socket.open();
+  await until(() => socket.frames.length === 1, 'hello');
+  socket.deliver(welcome(A, { limitOverrides }));
+  await until(() => socket.frames.length === 2, 'ops frame');
+  return { local, outbox, entries, socket, done, rejects };
+}
+
+test('ac_57_reject_after_ack: a rejected op never stays in the confirmed state (AC-57 (c), D182)', async () => {
+  const mine = '0000000003e80000' + A;
+  const s = await sessionWithStore({ ops: [mine] });
+  s.socket.deliver({ t: 'ack', op: s.entries[0].opId, seq: seq(5), restamped: [] });
+  s.socket.deliver({ t: 'reject', op: s.entries[0].opId, reason: 'Denied' });
+  const result = await s.done;
+  assert.equal(result.end, 'fault');
+  assert.deepEqual(s.rejects, [{ op: s.entries[0].opId, reason: 'Denied' }]);
+  // The row of the op is evicted, a rejected record names it; other rows and the mark stay,
+  // the row comes back as `Snapshot` when it is in scope (D197).
+  assert.equal(await confirmedRow(s.local, ALICE, A, mine), null);
+  assert.equal((await confirmedRow(s.local, ALICE, A)).fields.title, 'first');
+  const rejected = await s.local.rejected({ user: ALICE, replica: A });
+  assert.deepEqual(rejected.map((r) => [r.opId, r.row, r.reason]), [[s.entries[0].opId, mine, 'Denied']]);
+  assert.equal(await s.local.appliedServerSeq({ user: ALICE, replica: A }), seq(5));
+});
+
+test('a reject for a confirmed op of an earlier batch drops the confirmed state (AC-57 (c))', async () => {
+  const first = '0000000003e80000' + A;
+  const second = '0000000003e90000' + A;
+  const s = await sessionWithStore({ ops: [first, second], limitOverrides: { ops_per_batch: 1 } });
+  s.socket.deliver({ t: 'ack', op: s.entries[0].opId, seq: seq(5), restamped: [] });
+  await until(() => s.socket.frames.length === 3, 'second batch');
+  s.socket.deliver({ t: 'reject', op: s.entries[0].opId, reason: 'Denied' });
+  assert.equal((await s.done).end, 'fault');
+  assert.deepEqual(s.rejects, [{ op: s.entries[0].opId, reason: 'Denied' }]);
+  // The row of the op is not known any more: no row and no mark is kept, the next `Hello`
+  // names no mark and the rows are caught up again.
+  assert.deepEqual(await s.local.rows({ user: ALICE, replica: A, model: 'Issue' }), []);
+  assert.equal(await s.local.appliedServerSeq({ user: ALICE, replica: A }), null);
+  // The op of the batch on the wire waits in the outbox for the next session.
+  assert.deepEqual((await s.outbox.pending({ user: ALICE, replica: A })).map((e) => e.opId), [s.entries[1].opId]);
+});
+
+test('dropConfirmed removes rows and mark of one pair only and keeps rejected records', async () => {
+  const local = await store();
+  await local.applyOps({ user: ALICE, replica: A, ops: [{ seq: seq(2), op: makeIssue() }] });
+  await local.applyOps({ user: BOB, replica: A, ops: [{ seq: seq(4), op: makeIssue() }] });
+  const edit = wireOp(A, 2, 1100, { set: { field: 'title', value: 'x' } });
+  await local.reject({ user: ALICE, replica: A, entry: entryOf(edit), reason: 'Denied' });
+  assert.equal(await local.dropConfirmed({ user: ALICE, replica: A }), 1);
+  assert.equal(await confirmedRow(local, ALICE, A), null);
+  assert.equal(await local.appliedServerSeq({ user: ALICE, replica: A }), null);
+  assert.equal((await local.rejected({ user: ALICE, replica: A })).length, 1);
+  assert.equal((await confirmedRow(local, BOB, A)).fields.title, 'first');
+  assert.equal(await local.appliedServerSeq({ user: BOB, replica: A }), seq(4));
+});
+
+test('ops after a reconnect evict leave no row, move the mark and settle an own op (D197)', async () => {
+  const local = await store();
+  await local.applyOps({ user: ALICE, replica: A, ops: [{ seq: seq(2), op: makeIssue() }] });
+  // The reconnect `Evict` removes the row; live ops of that row from M0 follow it.
+  await local.evict({ user: ALICE, replica: A, model: 'Issue', rows: [ISSUE] });
+  const other = wireOp(C, 1, 2000, { set: { field: 'title', value: 'theirs' } });
+  const own = wireOp(A, 1, 2100, { add: { field: 'labels', elem: 'ui' } });
+  const result = await local.applyOps({
+    user: ALICE,
+    replica: A,
+    ops: [
+      { seq: seq(3), op: other },
+      { seq: seq(4), op: own },
+    ],
+  });
+  assert.deepEqual(result, { applied: [other.id, own.id], dropped: [], own: [own.id] });
+  assert.equal(await confirmedRow(local, ALICE, A), null);
+  assert.deepEqual(await local.rows({ user: ALICE, replica: A, model: 'Issue' }), []);
+  assert.equal(await local.appliedServerSeq({ user: ALICE, replica: A }), seq(4));
+});

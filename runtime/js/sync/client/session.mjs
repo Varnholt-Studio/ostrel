@@ -25,14 +25,17 @@
 // and it only leaves the outbox (5.4, D62). `Hello` then names the mark of the data store.
 //
 // The server sends the outcomes of a batch in a fixed order: every `reject`, then the `defer`,
-// then the `ack` frames (D182). So a `reject` for an op that an `ack` of this session already
-// confirmed breaks the protocol: the server never stored that op. The session remembers the
-// ops its acks confirmed only while they can still get an outcome: when it sends the next
-// batch, every remembered op lies at or below `applied_server_seq` and is forgotten, so the
-// set never holds more than one batch (dana #2735). The session reports it
-// through `onReject`, so the app can roll the op back, and ends with a fault; the caller
-// reconnects and catches up. Any other outcome for an op that is not waiting in the current
-// batch is ignored, as the protocol says for an `Ack` of an op that is no longer pending.
+// then the `ack` frames (D182). So a `reject` for an own op that no longer waits and whose `seq`
+// is at or below the highest `seq` an `ack` of this session confirmed breaks the protocol: the
+// op is confirmed (or already decided), and the server never stored a confirmed op it rejects.
+// The session keeps that one number, not the confirmed ops, so its memory does not grow with
+// the session (dana #2735). It reports the op through `onReject`, so the app can roll it back,
+// and ends with a fault; the caller reconnects and catches up. With `local` the op never stays
+// in the confirmed state: when the op is one of the batch last sent, its row is evicted and a
+// rejected record written (the row comes back as `Snapshot`, D197); for an older op the row is
+// not known any more, so the whole confirmed state of the replica is dropped and caught up
+// again. Any other outcome for an op that is not waiting in the current batch is ignored, as
+// the protocol says for an `Ack` of an op that is no longer pending.
 //
 // This part of the client opens no subscription and makes no call, so an `error`, `evict` or
 // `reset` that names a subscription, and a `snapshot` or `return`, concern no open request and
@@ -73,7 +76,8 @@ export const END = Object.freeze({
  * @param {AbortSignal} [deps.signal]
  * @param {EventQueue} [deps.queue]  lets the caller push `{ type: 'wake' }` after a local write
  * @param {object} [deps.local]  the data store of the replica (`apply.mjs`): `appliedServerSeq`,
- *   `applyAck` and `reject` are called before an op leaves the outbox
+ *   `applyAck` and `reject` are called before an op leaves the outbox; `evict` and
+ *   `dropConfirmed` take a confirmed op out of the confirmed state when the server rejects it
  * @param {object} [deps.hooks]  `onWelcome`, `onAck`, `onReject`, `onNotice`; each may be async
  * @param {() => number} [deps.now]
  * @param {Function} [deps.setTimer]
@@ -127,9 +131,11 @@ class Session {
     // The batch on the wire: its outbox entries and per OpId 'waiting', 'confirmed',
     // 'rejected' or 'deferred'.
     this.batch = null;
-    // OpId to the log position of the `ack` that confirmed it, to catch a later `reject` of
-    // one of them (D182). Pruned with `appliedServerSeq` when the next batch is sent.
-    this.confirmed = new Map();
+    // The highest own op `seq` an `ack` of this session confirmed, to catch a later `reject`
+    // of a confirmed op (D182), and the confirmed entries of the batch last sent by OpId, so
+    // such a reject can take its op out of the confirmed state (AC-57 (c)).
+    this.confirmedSeq = null;
+    this.recent = new Map();
     // The highest log position this session knows to be applied: the mark named in `Hello`,
     // then every `ack`.
     this.appliedServerSeq = null;
@@ -270,7 +276,7 @@ class Session {
       limit: this.limits.ops_per_batch,
     });
     if (pending.length === 0) return null;
-    this.forgetSettled();
+    this.recent.clear();
     let entries;
     let frame;
     try {
@@ -331,9 +337,10 @@ class Session {
       });
     }
     await this.outbox.remove(ids);
-    ids.forEach((opId) => {
-      this.batch.state.set(opId, 'confirmed');
-      this.confirmed.set(opId, ack.seq);
+    confirmed.forEach((entry) => {
+      this.batch.state.set(entry.opId, 'confirmed');
+      this.recent.set(entry.opId, entry);
+      if (this.confirmedSeq === null || entry.seq > this.confirmedSeq) this.confirmedSeq = entry.seq;
     });
     if (this.appliedServerSeq === null || ack.seq > this.appliedServerSeq) {
       this.appliedServerSeq = ack.seq;
@@ -349,10 +356,11 @@ class Session {
 
   // Returns the session result if the reject ends the session, else null.
   async reject({ op, reason }) {
-    if (this.confirmed.has(op)) {
+    const entry = this.waiting().find((waiting) => waiting.opId === op);
+    if (entry === undefined && this.isDecided(op)) {
       // An `ack` came before this `reject` (D182 forbids that). The server is authoritative:
       // the op is rejected, and the session no longer trusts the order of its outcomes.
-      this.confirmed.delete(op);
+      await this.unconfirm(op, reason);
       await this.call('onReject', { op, reason });
       return this.end({
         end: END.FAULT,
@@ -363,7 +371,6 @@ class Session {
         ),
       });
     }
-    const entry = this.waiting().find((waiting) => waiting.opId === op);
     if (entry === undefined) return null;
     if (this.local !== null) {
       await this.local.reject({ user: this.user, replica: this.replica, entry, reason });
@@ -387,12 +394,27 @@ class Session {
     this.deferTimer = this.setTimer(() => this.queue.push({ type: 'resume' }), delay);
   }
 
-  // Forgets confirmed ops at or below `appliedServerSeq`. Called before a new batch is sent:
-  // the previous batch is decided then, so none of them can still get an outcome.
-  forgetSettled() {
-    for (const [opId, seq] of this.confirmed) {
-      if (this.appliedServerSeq !== null && seq <= this.appliedServerSeq) this.confirmed.delete(opId);
+  // True when `op` is an own op at or below the highest `seq` an `ack` of this session
+  // confirmed: its outcome is decided, and only the confirmation can be its outcome.
+  isDecided(op) {
+    if (this.confirmedSeq === null) return false;
+    const { replica, seq } = decodeOpId(op);
+    return replica === this.replica && seq <= this.confirmedSeq;
+  }
+
+  // Takes a confirmed op that the server rejects out of the confirmed state (AC-57 (c)).
+  async unconfirm(op, reason) {
+    if (this.local === null) return;
+    const pair = { user: this.user, replica: this.replica };
+    const entry = this.recent.get(op);
+    if (entry === undefined) {
+      // The row of an older op is not known: nothing of the confirmed state can be trusted.
+      await this.local.dropConfirmed(pair);
+      return;
     }
+    this.recent.delete(op);
+    await this.local.evict({ ...pair, model: entry.op.model, rows: [entry.op.row] });
+    await this.local.reject({ ...pair, entry, reason });
   }
 
   // Entries of the current batch that have no outcome yet.
