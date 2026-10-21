@@ -15,7 +15,7 @@ dev-identity = []
 [dependencies]
 ostrel_core.workspace = true
 ostrel_db.workspace = true
-# Message types and limits of the sync protocol (ARCHITECTURE 5.4, 5.9).
+# Message types, limits and wire codec of the sync protocol (ARCHITECTURE 5.4, 5.9).
 ostrel_sync = { path = "../ostrel_sync" }
 ostrel_vm.workspace = true
 # Allowlisted by D118, only for this crate: SHA-256 of audit arguments (D117)
