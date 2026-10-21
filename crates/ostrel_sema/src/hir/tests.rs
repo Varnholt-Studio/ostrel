@@ -41,15 +41,14 @@ fn resolve_of_no_files_is_an_empty_program() {
 }
 
 #[test]
-fn resolve_stub_reports_one_error_in_the_first_non_empty_file() {
+fn resolve_reads_every_file_and_skips_empty_ones() {
     let empty = ast::Module::new();
     let mut module = ast::Module::new();
     let body = module.block_of(Vec::new()).unwrap();
     module.fn_item("main", &[], None, body).unwrap();
-    let other = FileId::from_raw(1);
     let sources = [
         Source {
-            file: other,
+            file: FileId::from_raw(1),
             text: "",
             module: &empty,
         },
@@ -58,18 +57,13 @@ fn resolve_stub_reports_one_error_in_the_first_non_empty_file() {
             text: "fn main()\n",
             module: &module,
         },
-        Source {
-            file: file(),
-            text: "fn main()\n",
-            module: &module,
-        },
     ];
     let (program, diagnostics) = resolve(&sources);
-    assert_eq!(program, Program::default());
-    assert_eq!(diagnostics.len(), 1);
-    assert!(diagnostics[0].is_error());
-    assert_eq!(diagnostics[0].code, crate::codes::NOT_IN_V0_1);
-    assert_eq!(diagnostics[0].span, Span::point(file(), 0));
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(program.defs.len(), 1);
+    assert_eq!(&*program.defs[0].name, "main");
+    assert!(matches!(program.defs[0].kind, DefKind::Fn(_)));
+    assert_eq!(program.defs[0].span.file, file());
 }
 
 #[test]

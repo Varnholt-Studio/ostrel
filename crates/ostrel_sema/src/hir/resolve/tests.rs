@@ -202,11 +202,22 @@ fn types_resolve_to_the_type_table() {
 #[test]
 fn bad_types_are_e0203_once() {
     assert_eq!(diags("data A\n  b: Nope\n"), ["E0203 2:6"]);
-    assert_eq!(diags("data A\n  b: Set\n"), ["E0203 2:6"]);
-    assert_eq!(diags("data A\n  b: Int[Text]\n"), ["E0203 2:6"]);
+    assert_eq!(diags("data A\n  b: Nope[Int]\n"), ["E0203 2:6"]);
     assert_eq!(diags("data A\n  b: Set[Nope]?\n"), ["E0203 2:10"]);
     assert_eq!(diags("fn f() -> Nope\n  1\n"), ["E0203 1:11"]);
     assert_eq!(diags("fn g()\n  1\ndata A\n  b: g\n"), ["E0203 4:6"]);
+}
+
+#[test]
+fn wrong_type_argument_counts_are_e0309_at_the_type_name() {
+    assert_eq!(diags("data A\n  b: Set\n"), ["E0309 2:6"]);
+    assert_eq!(diags("data A\n  b: Int[Text]\n"), ["E0309 2:6"]);
+    assert_eq!(diags("data A\n  b: Map[Text]\n"), ["E0309 2:6"]);
+    assert_eq!(diags("data A\n  b: List[Int, Int]?\n"), ["E0309 2:6"]);
+    assert_eq!(diags("enum E = x\ndata A\n  b: E[Int]\n"), ["E0309 3:6"]);
+    assert_eq!(diags("fn f(s: Set)\n  1\n"), ["E0309 1:9"]);
+    // The right count with an unknown argument is E0203 at the argument.
+    assert_eq!(diags("data A\n  b: Map[Text, Nope]\n"), ["E0203 2:16"]);
 }
 
 #[test]
@@ -231,15 +242,9 @@ fn unknown_field_is_e0204_at_the_field_name() {
     assert_eq!(diags(&src), ["E0204 5:5"]);
     let src = format!("{data}fn f()\n  make Note {{ titel: \"x\" }}\n");
     assert_eq!(diags(&src), ["E0204 5:15"]);
-    let src = format!("{data}fn f()\n  make Note {{ id: \"x\" }}\n");
-    assert_eq!(diags(&src), ["E0204 5:15"]);
     let src = format!("{data}fn f()\n  for n in Note sort titel\n    print(1)\n");
     assert_eq!(diags(&src), ["E0204 5:22"]);
     assert_eq!(diags("data A\n  a: Int\n  edit b if true\n"), ["E0204 3:8"]);
-    assert_eq!(
-        diags("data A\n  a: Int\n  edit made if true\n"),
-        ["E0204 3:8"]
-    );
     // Implicit fields resolve; a field of an unknown base is left to `check`.
     clean(&format!("{data}fn f(n: Note) -> Text\n  n.id\n"));
     let p = clean("fn f(t: Text) -> Int\n  t.len\n");
@@ -251,15 +256,67 @@ fn unknown_field_is_e0204_at_the_field_name() {
 }
 
 #[test]
-fn unknown_model_in_make_is_e0203_and_in_a_query_head_e0200() {
+fn implicit_fields_as_write_targets_are_e0208() {
+    let data = "data Note\n  title: Text\n  see if true\n";
+    let src = format!("{data}fn f()\n  make Note {{ id: \"x\", made: 1, id: 2 }}\n");
+    assert_eq!(diags(&src), ["E0208 5:15", "E0208 5:24", "E0208 5:33"]);
+    let src = format!("{data}fn f(n: Note)\n  n.made = 1\n");
+    assert_eq!(diags(&src), ["E0208 5:5"]);
+    assert_eq!(
+        diags("data A\n  a: Int\n  edit made if true\n"),
+        ["E0208 3:8"]
+    );
+    // Reading is allowed.
+    clean(&format!("{data}fn f(n: Note) -> Int\n  n.made\n"));
+    clean("data A\n  a: Int\n  see if id == id\n");
+}
+
+#[test]
+fn author_without_auth_is_an_unknown_field() {
+    let data = "data Note\n  title: Text\n  see if true\n";
+    let src = format!("{data}fn f(n: Note) -> Text\n  n.author.handle\n");
+    assert_eq!(diags(&src), ["E0204 5:5"]);
+    let (_, d) = run(&src);
+    assert!(d[0].message.contains("auth paseto"), "{}", d[0].message);
+    let src = format!("{data}fn f()\n  make Note {{ author: 1 }}\n");
+    assert_eq!(diags(&src), ["E0204 5:15"]);
+    assert_eq!(
+        diags("data T\n  n: Int serial per author\n"),
+        ["E0204 2:21"]
+    );
+    assert_eq!(
+        diags("data T\n  n: Int\n  edit author if true\n"),
+        ["E0204 3:8"]
+    );
+    assert_eq!(
+        diags("data T\n  n: Int\n  see if author == 1\n"),
+        ["E0204 3:10"]
+    );
+    // With `auth` it is the implicit field; without it a declared one.
+    let auth = "app A\n  auth paseto open\n";
+    clean(&format!("{auth}{data}fn f(n: Note) -> Text\n  n.author\n"));
+    let p = clean("data T\n  author: Text\nfn f(t: T) -> Text\n  t.author\n");
+    assert_eq!(model(&p, "T").fields.len(), 1);
+    assert_eq!(
+        diags(&format!("{auth}data T\n  author: Text\n")),
+        ["E0206 4:3"]
+    );
+}
+
+#[test]
+fn model_names_in_make_and_query_heads() {
     assert_eq!(diags("fn f()\n  make Nope { a: 1 }\n"), ["E0203 2:8"]);
     assert_eq!(
         diags("enum E = a\nfn f()\n  make E { a: 1 }\n"),
-        ["E0203 3:8"]
+        ["E0205 3:8"]
     );
     assert_eq!(
         diags("enum E = a | b\nfn f()\n  for x in E where x\n    print(1)\n"),
-        ["E0200 3:12"]
+        ["E0205 3:12"]
+    );
+    assert_eq!(
+        diags("fn f(xs: List[Int])\n  for x in xs sort a\n    print(1)\n"),
+        ["E0205 2:12"]
     );
     assert_eq!(
         diags("fn f()\n  for x in Nope sort a\n    print(1)\n"),
@@ -344,7 +401,7 @@ fn contextual_names_are_bound_where_they_have_meaning() {
 #[test]
 fn serial_per_resolves_declared_and_implicit_fields() {
     let p = clean(
-        "data T\n  team: Text fixed\n  n: Int serial per team\n  m: Int serial per author\n  k: Int serial\n",
+        "app A\n  auth paseto open\ndata T\n  team: Text fixed\n  n: Int serial per team\n  m: Int serial per author\n  k: Int serial\n",
     );
     let modes: Vec<_> = model(&p, "T").fields.iter().map(|f| f.mode).collect();
     assert_eq!(

@@ -46,6 +46,12 @@ pub(crate) const DUPLICATE_MEMBER: Code = Code::new(206);
 /// A local in scope at a query with the name of a field of the queried type,
 /// or the loop variable used in its own query (SPEC 12.10).
 pub(crate) const LOCAL_NAMES_FIELD: Code = Code::new(207);
+/// A declared name that is not a model where only a model may stand.
+pub(crate) const NOT_A_MODEL: Code = Code::new(205);
+/// An implicit field as a write target (SPEC 12.6).
+pub(crate) const IMPLICIT_WRITE: Code = Code::new(208);
+/// A wrong number of type arguments (SPEC 12.6).
+pub(crate) const TYPE_ARGS: Code = Code::new(309);
 
 /// Resolves the names of all files of one program and builds its HIR.
 pub(super) fn resolve(sources: &[Source<'_>]) -> (Program, Vec<Diagnostic>) {
@@ -88,6 +94,9 @@ struct Rx<'a> {
     variants: HashMap<&'a str, Vec<(DefId, u32)>>,
     /// Declared fields per model; a second field of a name is not listed.
     fields: HashMap<DefId, HashMap<&'a str, FieldId>>,
+    /// Whether the first `app` has an `auth` line; without it no model has
+    /// the implicit `author` (G8, SPEC 12.6).
+    auth: bool,
     /// Names of top level `var`s, which count as locals for SPEC 12.10.
     vars: Vec<&'a str>,
     /// Parameters of every function and view, bound when its body starts.
@@ -111,7 +120,7 @@ fn id(index: usize) -> u32 {
     u32::try_from(index).unwrap_or(u32::MAX)
 }
 
-fn implicit(name: &str) -> Option<ImplicitField> {
+fn implicit_field(name: &str) -> Option<ImplicitField> {
     Some(match name {
         "id" => ImplicitField::Id,
         "made" => ImplicitField::Made,
@@ -161,10 +170,15 @@ impl<'a> Rx<'a> {
         self.p.def(def).map(|d| &d.kind)
     }
 
+    /// The implicit field `name` names in this program.
+    fn implicit(&self, name: &str) -> Option<ImplicitField> {
+        implicit_field(name).filter(|&f| f != ImplicitField::Author || self.auth)
+    }
+
     fn field_ref(&self, model: DefId, name: &str) -> Option<FieldRef> {
         match self.fields.get(&model).and_then(|f| f.get(name)) {
             Some(&field) => Some(FieldRef::Declared(field)),
-            None => implicit(name).map(FieldRef::Implicit),
+            None => self.implicit(name).map(FieldRef::Implicit),
         }
     }
 
@@ -204,6 +218,10 @@ impl<'a> Rx<'a> {
                             );
                         } else {
                             self.p.app = Some(def);
+                            self.auth = d
+                                .items
+                                .iter()
+                                .any(|l| matches!(l.kind, ast::AppItemKind::Auth { .. }));
                         }
                         (None, d.range)
                     }
@@ -376,8 +394,9 @@ impl<'a> Rx<'a> {
             })
             .collect();
         for (i, (f, _)) in decls.iter().enumerate() {
-            if names.contains_key(&*f.name.text) || implicit(&f.name.text).is_some() {
-                let what = if implicit(&f.name.text).is_some() {
+            let implicit = self.implicit(&f.name.text).is_some();
+            if names.contains_key(&*f.name.text) || implicit {
+                let what = if implicit {
                     "is an implicit field of every row"
                 } else {
                     "is already declared"
@@ -442,12 +461,22 @@ impl<'a> Rx<'a> {
     }
 
     fn unknown_field(&mut self, model: DefId, name: &ast::Ident) {
+        let hint = if &*name.text == "author" {
+            "; every row has `author` only when the `app` has `auth paseto`"
+        } else {
+            ""
+        };
         let message = format!(
-            "data type `{}` has no field `{}`",
+            "data type `{}` has no field `{}`{hint}",
             self.def_name(model),
             name.text
         );
         self.error(UNKNOWN_FIELD, name.range, message);
+    }
+
+    fn implicit_write(&mut self, name: &ast::Ident) {
+        let message = format!("`{}` is an implicit field; the system sets it", name.text);
+        self.error(IMPLICIT_WRITE, name.range, message);
     }
 
     /// Parameters as locals; a repeated name is E0202 and not visible.
@@ -482,7 +511,7 @@ impl<'a> Rx<'a> {
     }
 
     fn type_ref(&mut self, ty: &ast::TypeRef) -> Ty {
-        self.named_ty(&ty.name, &[], ty.range)
+        self.named_ty(&ty.name, &[])
     }
 
     fn ty(&mut self, id: ast::TyId) -> Ty {
@@ -492,7 +521,7 @@ impl<'a> Rx<'a> {
         let Some(t) = module.ty(id) else {
             return Ty::Error;
         };
-        let ty = self.named_ty(&t.name, &t.args, t.range);
+        let ty = self.named_ty(&t.name, &t.args);
         match ty {
             Ty::Error => Ty::Error,
             ty if t.optional => Ty::Optional(Box::new(ty)),
@@ -500,23 +529,32 @@ impl<'a> Rx<'a> {
         }
     }
 
-    fn named_ty(&mut self, name: &ast::Ident, args: &[ast::TyId], range: TextRange) -> Ty {
+    fn named_ty(&mut self, name: &ast::Ident, args: &[ast::TyId]) -> Ty {
         let want = match &*name.text {
             "Set" | "List" => 1,
             "Map" => 2,
-            _ => 0,
+            "Bool" | "Int" | "Float" | "Text" | "Time" | "Bytes" | "Rank" => 0,
+            other => match self.defs.get(other).map(|&d| self.def_kind(d)) {
+                Some(Some(DefKind::Model(_) | DefKind::Enum(_))) => 0,
+                found => {
+                    let message = if found.is_some() {
+                        format!("`{other}` is not a type")
+                    } else {
+                        format!("unknown type `{other}`")
+                    };
+                    self.error(codes::UNKNOWN_TYPE, name.range, message);
+                    return Ty::Error;
+                }
+            },
         };
-        let plural = if want == 1 { "" } else { "s" };
         if args.len() != want {
-            self.error(
-                codes::UNKNOWN_TYPE,
-                range,
-                format!(
-                    "`{}` takes {want} type argument{plural}, found {}",
-                    name.text,
-                    args.len()
-                ),
+            let plural = if want == 1 { "" } else { "s" };
+            let message = format!(
+                "`{}` takes {want} type argument{plural}, found {}",
+                name.text,
+                args.len()
             );
+            self.error(TYPE_ARGS, name.range, message);
             return Ty::Error;
         }
         let args: Vec<Ty> = args.iter().map(|&a| self.ty(a)).collect();
@@ -542,15 +580,7 @@ impl<'a> Rx<'a> {
             other => match self.defs.get(other).map(|&d| (d, self.def_kind(d))) {
                 Some((d, Some(DefKind::Model(_)))) => Ty::Ref(d),
                 Some((d, Some(DefKind::Enum(_)))) => Ty::Enum(d),
-                found => {
-                    let message = if found.is_some() {
-                        format!("`{other}` is not a type")
-                    } else {
-                        format!("unknown type `{other}`")
-                    };
-                    self.error(codes::UNKNOWN_TYPE, name.range, message);
-                    Ty::Error
-                }
+                _ => Ty::Error,
             },
         }
     }
@@ -684,7 +714,11 @@ impl<'a> Rx<'a> {
                     );
                     Some(f)
                 }
-                _ => {
+                Some(FieldRef::Implicit(_)) => {
+                    self.implicit_write(name);
+                    return None;
+                }
+                None => {
                     self.unknown_field(model, name);
                     return None;
                 }
@@ -883,10 +917,26 @@ impl<'a> Rx<'a> {
                 }
             }
             ast::StmtKind::Drop { source } => StmtKind::Drop(self.expr(*source)),
-            ast::StmtKind::Assign { target, value } => StmtKind::Assign {
-                target: self.expr(*target),
-                value: self.expr(*value),
-            },
+            ast::StmtKind::Assign { target, value } => {
+                let target_at = self.module.and_then(|m| m.expr(*target));
+                let target = self.expr(*target);
+                if let Some(ast::ExprKind::Field { name, .. }) = target_at.map(|e| &e.kind)
+                    && let Some(Expr {
+                        kind:
+                            ExprKind::Field {
+                                field: (_, FieldRef::Implicit(_)),
+                                ..
+                            },
+                        ..
+                    }) = self.p.expr(target)
+                {
+                    self.implicit_write(name);
+                }
+                StmtKind::Assign {
+                    target,
+                    value: self.expr(*value),
+                }
+            }
             _ => {
                 self.error(
                     codes::NOT_IN_V0_1,
@@ -1169,6 +1219,12 @@ impl<'a> Rx<'a> {
         {
             return Res::Field(model, field);
         }
+        if let Some(model) = self.field_scope
+            && implicit_field(text).is_some()
+        {
+            self.unknown_field(model, name);
+            return Res::Error;
+        }
         if self.banned.contains(&text) {
             return Res::Error;
         }
@@ -1211,7 +1267,12 @@ impl<'a> Rx<'a> {
     }
 
     fn make(&mut self, m: &'a ast::MakeExpr) -> ExprKind {
-        let model = self.model(&m.ty, "`make` needs a data type", codes::UNKNOWN_TYPE);
+        let model = self.model(
+            &m.ty,
+            false,
+            "`make` needs a data type",
+            codes::UNKNOWN_TYPE,
+        );
         let mut fields = Vec::with_capacity(m.fields.len());
         let mut seen: Vec<&str> = Vec::new();
         for init in m.fields.iter() {
@@ -1231,11 +1292,7 @@ impl<'a> Rx<'a> {
                         fields.push((field, value));
                     }
                 }
-                Some(FieldRef::Implicit(_)) => self.error(
-                    UNKNOWN_FIELD,
-                    init.name.range,
-                    format!("`{name}` is an implicit field; `make` cannot set it"),
-                ),
+                Some(FieldRef::Implicit(_)) => self.implicit_write(&init.name),
                 None => self.unknown_field(model, &init.name),
             }
         }
@@ -1248,16 +1305,23 @@ impl<'a> Rx<'a> {
         }
     }
 
-    /// The model `name` declares, or `code` at `name` (SPEC 12.6: E0203 where
-    /// a type is expected, E0200 in a query head).
-    fn model(&mut self, name: &ast::Ident, need: &str, code: Code) -> Option<DefId> {
+    /// The model `name` declares (SPEC 12.6): E0205 for a declared name or a
+    /// `local` that is no model, `unknown` for an unknown name (E0203 where a
+    /// type is expected, E0200 in a query head).
+    fn model(
+        &mut self,
+        name: &ast::Ident,
+        local: bool,
+        need: &str,
+        unknown: Code,
+    ) -> Option<DefId> {
         match self.defs.get(&*name.text).map(|&d| (d, self.def_kind(d))) {
-            Some((d, Some(DefKind::Model(_)))) => Some(d),
+            Some((d, Some(DefKind::Model(_)))) if !local => Some(d),
             found => {
-                let message = if found.is_some() {
-                    format!("{need}; `{}` is not one", name.text)
+                let (code, message) = if local || found.is_some() {
+                    (NOT_A_MODEL, format!("{need}; `{}` is not one", name.text))
                 } else {
-                    format!("unknown data type `{}`", name.text)
+                    (unknown, format!("unknown data type `{}`", name.text))
                 };
                 self.error(code, name.range, message);
                 None
@@ -1279,6 +1343,7 @@ impl<'a> Rx<'a> {
             _ if clauses => {
                 let _ = self.model(
                     &q.head,
+                    local,
                     "a query with `where`, `sort`, `limit` or `last` needs a data type",
                     codes::UNKNOWN_NAME,
                 );

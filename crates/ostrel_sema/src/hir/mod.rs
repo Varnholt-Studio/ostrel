@@ -17,11 +17,11 @@
 //! them. The HIR grows by addition; enums are `non_exhaustive` where a later
 //! milestone adds variants (`extern` blocks arrive with the bridge).
 //!
-//! Status: stub. The types are the freeze proposal; [`resolve`] and [`check`]
-//! have their final shape but no implementation yet. The v0.1 checker in the
-//! crate root stays the one the CLI calls until the move to the HIR.
+//! Status: [`resolve`] is implemented; [`check`] is a stub. The v0.1 checker
+//! in the crate root stays the one the CLI calls until the move to the HIR.
 
 mod body;
+mod resolve;
 mod ty;
 
 #[cfg(test)]
@@ -401,23 +401,8 @@ pub struct Local {
 ///
 /// Never panics on any tree. Reports unknown and duplicate names; the result
 /// is complete when no diagnostic is an error.
-///
-/// Stub: reports every non empty input as not yet supported (`E0100`) and
-/// returns an empty program.
 pub fn resolve(sources: &[Source<'_>]) -> (Program, Vec<Diagnostic>) {
-    let diagnostics = sources
-        .iter()
-        .find(|s| !s.module.items().is_empty())
-        .map(|s| {
-            Diagnostic::error(
-                crate::codes::NOT_IN_V0_1,
-                Span::point(s.file, 0),
-                "this program needs the v0.2 checker, which is not available yet",
-            )
-        })
-        .into_iter()
-        .collect();
-    (Program::default(), diagnostics)
+    resolve::resolve(sources)
 }
 
 /// Checks types, placement and rules, and fills [`Expr::ty`],
