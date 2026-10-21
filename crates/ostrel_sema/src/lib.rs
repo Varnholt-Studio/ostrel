@@ -28,6 +28,7 @@
 
 mod check;
 pub mod hir;
+pub mod rule_deltas;
 
 use std::collections::HashMap;
 

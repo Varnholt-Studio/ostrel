@@ -363,8 +363,37 @@ pub struct Rule {
     /// the model arguments were resolved; other rules have none and read
     /// their row with [`InstKind::RuleField`] and [`InstKind::RuleDelta`].
     pub pred: FuncId,
+    /// The directions a field rule on a `Set` or `Map` field admits; `Some`
+    /// exactly for such a rule (D187). Every rule evaluator checks it before
+    /// the predicate: an op of a direction it does not admit is `Denied`
+    /// without running [`Rule::pred`].
+    pub deltas: Option<Deltas>,
     /// The rule line.
     pub span: Span,
+}
+
+/// The directions of a field rule on a `Set` or `Map` field: those its
+/// condition mentions by `added` or `removed` (D187, G12). A direction the
+/// condition does not mention is denied before the predicate runs, so no
+/// other atom (`signed`, `me`, a constant) can admit it. A `Map` value change
+/// is a removal and then an addition and needs both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Deltas {
+    /// The condition mentions `added`.
+    pub added: bool,
+    /// The condition mentions `removed`.
+    pub removed: bool,
+}
+
+impl Deltas {
+    /// True if an op of direction `dir` may reach the predicate; false means
+    /// `Denied` without evaluating it.
+    pub fn admits(self, dir: Delta) -> bool {
+        match dir {
+            Delta::Added => self.added,
+            Delta::Removed => self.removed,
+        }
+    }
 }
 
 /// A top level `var`.

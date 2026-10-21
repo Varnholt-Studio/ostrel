@@ -11,8 +11,8 @@ use ostrel_core::{FileId, Span};
 use super::query::{Filter, Hop, Path, QueryPlan, See};
 use super::view::{ForSource, Thunk, ViewNode, ViewNodeKind};
 use super::{
-    Auth, FieldMode, FieldRef, FnKind, FuncId, Function, ImplicitField, InstKind, ModelId,
-    Placement, Program, RuleOp, Ty,
+    Auth, Deltas, FieldMode, FieldRef, FnKind, FuncId, Function, ImplicitField, InstKind, ModelId,
+    Placement, Program, RuleId, RuleOp, Ty,
 };
 
 /// One broken rule of the contract.
@@ -93,6 +93,12 @@ pub enum Problem {
     /// A view thunk, handler, field default or `var` initialiser that does
     /// not run on the client.
     NotOnClient,
+    /// [`Rule::deltas`](super::Rule::deltas) is `Some` for a rule that is not
+    /// a field rule of its model on a `Set` or `Map` field, or `None` for
+    /// such a rule, or a predicate reads a direction with
+    /// [`InstKind::RuleDelta`] that its rule does not admit (D187). A `check`
+    /// invariant admits no direction.
+    BadDeltas,
 }
 
 /// Where the contract is broken and how.
@@ -138,11 +144,30 @@ impl Validator<'_> {
     }
 
     fn rules(&mut self) {
-        for rule in &self.program.rules {
-            match self.program.function(rule.pred) {
+        let program = self.program;
+        for (index, rule) in program.rules.iter().enumerate() {
+            match program.function(rule.pred) {
                 Some(f) if f.kind == FnKind::Predicate => {}
                 Some(_) => self.report(None, rule.span, Problem::RuleWithoutPredicate),
                 None => self.report(None, rule.span, Problem::UnknownId),
+            }
+            let id = RuleId(index as u32);
+            let owner = program.models.iter().find(|m| m.rules.contains(&id));
+            let collection = match (owner, rule.field) {
+                (Some(model), Some(field)) => model
+                    .fields
+                    .get(field.index())
+                    .is_some_and(|f| matches!(f.ty, Ty::Set(_) | Ty::Map(..))),
+                _ => false,
+            };
+            if collection != rule.deltas.is_some() {
+                self.report(None, rule.span, Problem::BadDeltas);
+            }
+            let admitted = rule.deltas.unwrap_or_default();
+            if let Some(f) = program.function(rule.pred)
+                && reads_unadmitted_delta(f, admitted)
+            {
+                self.report(Some(rule.pred), rule.span, Problem::BadDeltas);
             }
         }
     }
@@ -190,7 +215,11 @@ impl Validator<'_> {
             }
             for check in &model.checks {
                 match program.function(*check) {
-                    Some(f) if f.kind == FnKind::Predicate => {}
+                    Some(f) if f.kind == FnKind::Predicate => {
+                        if reads_unadmitted_delta(f, Deltas::default()) {
+                            self.report(Some(*check), model.span, Problem::BadDeltas);
+                        }
+                    }
                     Some(_) => self.report(None, model.span, Problem::RuleWithoutPredicate),
                     None => self.report(None, model.span, Problem::UnknownId),
                 }
@@ -597,4 +626,13 @@ fn hops_end(
         at = hop.model;
     }
     Some(at)
+}
+
+/// True if `f` reads a direction with [`InstKind::RuleDelta`] that `admitted`
+/// does not list (D187).
+fn reads_unadmitted_delta(f: &Function, admitted: Deltas) -> bool {
+    f.blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .any(|inst| matches!(inst.kind, InstKind::RuleDelta { dir, .. } if !admitted.admits(dir)))
 }

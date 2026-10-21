@@ -29,6 +29,8 @@ mod body;
 mod filter;
 
 #[cfg(test)]
+mod deltas_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
@@ -308,7 +310,7 @@ impl<'h> Cx<'h> {
                     );
                     fb.params(&f.params)?;
                     let pred = fb.predicate(rule.cond, RuleCx::call())?;
-                    Some(push_rule(out, RuleOp::Call, None, pred, rule.span))
+                    Some(push_rule(out, RuleOp::Call, None, None, pred, rule.span))
                 }
                 None => None,
             };
@@ -389,9 +391,21 @@ impl<'h> Cx<'h> {
                     false,
                     rule.span,
                 );
+                // The directions the rule admits, from the one function the
+                // E0316 warning uses too (D187).
+                let deltas =
+                    ostrel_sema::rule_deltas::rule_deltas(self.hir, def_id, rule).map(|d| {
+                        super::Deltas {
+                            added: d.added,
+                            removed: d.removed,
+                        }
+                    });
+                if deltas.is_some() != delta.is_some() {
+                    return Err(LowerError::Unchecked(rule.span));
+                }
                 let pred = fb.predicate(rule.cond, RuleCx::row(def_id, state, delta))?;
                 let field = rule.field.map(|f| super::FieldId(f.0));
-                let rule_id = push_rule(out, op, field, pred, rule.span);
+                let rule_id = push_rule(out, op, field, deltas, pred, rule.span);
                 if let Some(m) = out.models.get_mut(id.index()) {
                     m.rules.push(rule_id);
                 }
@@ -546,6 +560,7 @@ fn push_rule(
     out: &mut Program,
     op: RuleOp,
     field: Option<super::FieldId>,
+    deltas: Option<super::Deltas>,
     pred: super::Function,
     span: Span,
 ) -> RuleId {
@@ -554,6 +569,7 @@ fn push_rule(
         op,
         field,
         pred,
+        deltas,
         span,
     });
     RuleId(out.rules.len() as u32 - 1)
