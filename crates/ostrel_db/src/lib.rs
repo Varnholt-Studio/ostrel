@@ -9,5 +9,9 @@
 //! the query filter and keyset cursor, the change set of `Set` tags (D49) and `Map` entries,
 //! the schema hash and enum columns of migration plans, and the applied schema (D79). Migration
 //! steps are not designed yet.
+//!
+//! Drivers that keep rows outside SQL (the in memory driver, the SQLite driver with its schema
+//! free row store) share the query evaluation and the collection write rules of [`eval`] (D129).
 
 pub mod api;
+pub mod eval;

@@ -41,7 +41,8 @@ use ostrel_sync::wire::{Requests, WireError, WireSchema, decode_client, encode_s
 
 /// The fatal `error` frame with code `Protocol`, written by hand only for the case that the
 /// encoder refused an `error` frame, which carries no value and names no model.
-const PROTOCOL_ERROR_FRAME: &str = r#"{"code":"Protocol","sub":null,"t":"error","v":0}"#;
+const PROTOCOL_ERROR_FRAME: &str =
+    r#"{"code":"Protocol","retry_after_ms":null,"sub":null,"t":"error","v":0}"#;
 
 /// What the transport does with one received frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -195,7 +196,7 @@ impl fmt::Debug for Session {
 
 /// A fatal `error` frame with `code`.
 fn fatal(code: ErrorCode, schema: &dyn WireSchema, requests: &dyn Requests) -> String {
-    let msg = ServerMsg::Error(ProtocolError { sub: None, code });
+    let msg = ServerMsg::Error(ProtocolError::fatal(code));
     encode_server(&msg, schema, requests).unwrap_or_else(|_| PROTOCOL_ERROR_FRAME.to_owned())
 }
 

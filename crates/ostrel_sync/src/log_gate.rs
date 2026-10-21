@@ -13,7 +13,10 @@
 //!   ever committed is committed and released by the broadcast fence, and none above M is
 //!   allocated (5.4 "Snapshot consistency"). The lock also carries the bound of the broadcast
 //!   queue (D162): while [`BROADCAST_COMMITS`] commits are not yet released, no writer is
-//!   granted the lock, so a task waits before the lock and never inside it.
+//!   granted the lock, so a task waits before the lock and never inside it. Quiet point tasks
+//!   share the wait for the broadcast queue in quiet phases (see [`WriteLock`]), so writers
+//!   wait for at most one such phase however many quiet point tasks are queued between them
+//!   (RED kira #2498).
 //! * [`SendQueue`] counts the encoded frames of one session that are not yet written (5.9, 8
 //!   MiB). Frames queued under the lock or by the broadcast queue never wait: live ops,
 //!   outcomes, and the `Evict` pages and `Reset` of scope re-evaluation. If they would exceed
@@ -47,8 +50,8 @@
 //!
 //! The pages of a closure carry mark M. At a quiet point nothing up to M waits in the broadcast
 //! queue, so the caller queues them into each session's stream at once, behind everything
-//! already released, and each session's stream stays non decreasing in [`ServerSeq`] (D62). Splitting pages at the frame limit (D121) is the job of
-//! the encoder. Mapping [`QueueError::Overloaded`] to the protocol error `Overloaded` is the
+//! already released, and each session's stream stays non decreasing in [`ServerSeq`] (D62).
+//! Splitting pages at the frame limit (D121) is the job of the encoder. Mapping [`QueueError::Overloaded`] to the protocol error `Overloaded` is the
 //! server's; the error code itself is part of the protocol contract (ARCHITECTURE 5.4
 //! "Interfaces", D159).
 
@@ -131,12 +134,26 @@ impl std::error::Error for LockError {}
 ///
 /// A writer calls [`WriteLock::request`], a task that reads at a quiet point calls
 /// [`WriteLock::request_quiet`]; both wait until [`WriteLock::grant`] hands them the lock.
-/// Grants follow request order. No writer is granted while the broadcast queue holds
-/// [`BROADCAST_COMMITS`] unreleased commits, so a slow read connection of the broadcast queue
-/// slows writers and never exhausts memory. No quiet point task is granted while any commit is
-/// unreleased, and the tasks queued behind it wait with it (FIFO). The broadcast queue releases
-/// without the lock, so that wait always ends. The holder itself is never stopped, because it
-/// waits on nothing but the writer connection.
+/// Grants follow request order, with one exception for quiet phases below. No writer is
+/// granted while the broadcast queue holds [`BROADCAST_COMMITS`] unreleased commits, so a slow
+/// read connection of the broadcast queue slows writers and never exhausts memory. No quiet
+/// point task is granted while any commit is unreleased, and the tasks queued behind it wait
+/// with it: a writer never overtakes a waiting quiet point task, or the broadcast queue might
+/// never run empty. The broadcast queue releases without the lock, so that wait always ends.
+/// The holder itself is never stopped, because it waits on nothing but the writer connection.
+///
+/// Quiet phase (RED kira #2498). Emptying the broadcast queue is the expensive part of a quiet
+/// point: every writer behind the quiet point task waits for it. So when a quiet point task is
+/// first in the queue and no commit is unreleased, a quiet phase begins. It covers every quiet
+/// point task queued at that moment, also those queued behind writers, and grants them one
+/// after the other before any writer; they push no commit, so the queue stays empty and one
+/// emptying serves them all. A quiet point task queued after the phase began (for example the
+/// next closure requested by the last one) waits behind the writers already queued. Hence a
+/// writer waits for at most one quiet phase, and a quiet point task waits for at most the
+/// writers queued before it and one emptying of the broadcast queue. The phase lets a quiet
+/// point task overtake writers queued earlier; each such task holds the lock only briefly (a
+/// closure is bounded by 5.9, a registration or M0 reads nothing) and at most one closure is
+/// queued at any time.
 #[derive(Debug)]
 pub struct WriteLock<T> {
     queue: VecDeque<(Ticket, Need, T)>,
@@ -144,6 +161,8 @@ pub struct WriteLock<T> {
     next_ticket: u64,
     unreleased: usize,
     bound: usize,
+    /// While a quiet phase runs: the first ticket it does not cover.
+    phase_end: Option<Ticket>,
 }
 
 impl<T> WriteLock<T> {
@@ -160,6 +179,7 @@ impl<T> WriteLock<T> {
             next_ticket: 0,
             unreleased: 0,
             bound: bound.max(1),
+            phase_end: None,
         }
     }
 
@@ -180,24 +200,53 @@ impl<T> WriteLock<T> {
         ticket
     }
 
-    /// Hands the lock to the first queued task, if the lock is free and the task may start: a
-    /// writer while the broadcast queue is below its bound, a quiet point task when no commit
-    /// is unreleased.
+    /// Hands the lock to the next task, if the lock is free and the task may start. During a
+    /// quiet phase that is the next quiet point task the phase covers, granted when no commit
+    /// is unreleased. Otherwise it is the first queued task: a writer while the broadcast queue
+    /// is below its bound, a quiet point task when no commit is unreleased, which begins a
+    /// quiet phase.
     pub fn grant(&mut self) -> Option<(Ticket, T)> {
         if self.holder.is_some() {
             return None;
         }
-        let need = self.queue.front()?.1;
-        let ready = match need {
-            Need::Write => self.unreleased < self.bound,
-            Need::QuietPoint => self.unreleased == 0,
-        };
-        if !ready {
-            return None;
+        match self.next_in_phase() {
+            Some(_) if self.unreleased > 0 => return None,
+            Some(at) => return self.hand_over(at),
+            None => self.phase_end = None,
         }
-        let (ticket, _, task) = self.queue.pop_front()?;
+        let need = self.queue.front()?.1;
+        match need {
+            Need::Write if self.unreleased < self.bound => self.hand_over(0),
+            Need::QuietPoint if self.unreleased == 0 => {
+                self.phase_end = Some(Ticket(self.next_ticket));
+                self.hand_over(0)
+            }
+            _ => None,
+        }
+    }
+
+    /// Index of the next queued quiet point task the running phase covers.
+    fn next_in_phase(&self) -> Option<usize> {
+        let end = self.phase_end?;
+        self.queue
+            .iter()
+            .position(|(t, need, _)| *need == Need::QuietPoint && *t < end)
+    }
+
+    /// Grants the task at `at` and ends the quiet phase once it covers no queued task.
+    fn hand_over(&mut self, at: usize) -> Option<(Ticket, T)> {
+        let (ticket, _, task) = self.queue.remove(at)?;
         self.holder = Some(ticket);
+        if self.next_in_phase().is_none() {
+            self.phase_end = None;
+        }
         Some((ticket, task))
+    }
+
+    /// Whether a quiet phase runs: a queued quiet point task it covers goes before every
+    /// writer.
+    pub fn in_quiet_phase(&self) -> bool {
+        self.phase_end.is_some()
     }
 
     /// The ticket that holds the lock.
