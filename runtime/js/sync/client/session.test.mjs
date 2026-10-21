@@ -376,3 +376,26 @@ test('ops are packed into frames that fit the frame limit', async () => {
   s.controller.abort();
   await s.done;
 });
+
+test('confirmed ops at or below applied_server_seq are forgotten when the next batch is sent (dana #2735)', async () => {
+  const s = await setup({ ops: 3 });
+  await connect(s, { limitOverrides: { ops_per_batch: 1 } });
+  await until(() => s.socket.frames.length === 2, 'first batch');
+  s.socket.deliver({ t: 'ack', op: s.entries[0].opId, seq: '0000000000000010', restamped: [] });
+  await until(() => s.socket.frames.length === 3, 'second batch');
+  // The first batch is decided and lies at or below the mark: a reject naming its op is an
+  // outcome for an op that no longer waits, so the set of confirmed ops stays one batch big.
+  s.socket.deliver({ t: 'reject', op: s.entries[0].opId, reason: 'Denied' });
+  s.socket.deliver({ t: 'ack', op: s.entries[1].opId, seq: '0000000000000011', restamped: [] });
+  await until(() => s.socket.frames.length === 4, 'third batch');
+  assert.equal(s.calls.filter((c) => c.name === 'reject').length, 0);
+  // Within the batch on the wire the order of D182 is still checked.
+  s.socket.deliver({ t: 'ack', op: s.entries[2].opId, seq: '0000000000000012', restamped: [] });
+  s.socket.deliver({ t: 'reject', op: s.entries[2].opId, reason: 'Denied' });
+  const result = await s.done;
+  assert.equal(result.end, END.FAULT);
+  assert.deepEqual(
+    s.calls.filter((c) => c.name === 'reject').map((c) => c.payload),
+    [{ op: s.entries[2].opId, reason: 'Denied' }],
+  );
+});

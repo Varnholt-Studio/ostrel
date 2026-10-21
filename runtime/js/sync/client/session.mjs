@@ -19,9 +19,17 @@
 // later op of the batch undecided, the session waits `retry_after_ms` and then sends again
 // from the outbox. Confirmed and rejected ops leave the outbox.
 //
+// With `local` (the data store of `apply.mjs`), confirmed own ops are applied to the confirmed
+// state and rejected ones recorded BEFORE they leave the outbox. A tab that dies in between
+// keeps the op in the outbox; it is sent again, its replayed `Ack` lies at or below the mark,
+// and it only leaves the outbox (5.4, D62). `Hello` then names the mark of the data store.
+//
 // The server sends the outcomes of a batch in a fixed order: every `reject`, then the `defer`,
 // then the `ack` frames (D182). So a `reject` for an op that an `ack` of this session already
-// confirmed breaks the protocol: the server never stored that op. The session reports it
+// confirmed breaks the protocol: the server never stored that op. The session remembers the
+// ops its acks confirmed only while they can still get an outcome: when it sends the next
+// batch, every remembered op lies at or below `applied_server_seq` and is forgotten, so the
+// set never holds more than one batch (dana #2735). The session reports it
 // through `onReject`, so the app can roll the op back, and ends with a fault; the caller
 // reconnects and catches up. Any other outcome for an op that is not waiting in the current
 // batch is ignored, as the protocol says for an `Ack` of an op that is no longer pending.
@@ -64,6 +72,8 @@ export const END = Object.freeze({
  * @param {Iterable<string>} [deps.models]  model names of the compiled schema
  * @param {AbortSignal} [deps.signal]
  * @param {EventQueue} [deps.queue]  lets the caller push `{ type: 'wake' }` after a local write
+ * @param {object} [deps.local]  the data store of the replica (`apply.mjs`): `appliedServerSeq`,
+ *   `applyAck` and `reject` are called before an op leaves the outbox
  * @param {object} [deps.hooks]  `onWelcome`, `onAck`, `onReject`, `onNotice`; each may be async
  * @param {() => number} [deps.now]
  * @param {Function} [deps.setTimer]
@@ -77,6 +87,7 @@ export async function runSession({
   models = [],
   signal = new AbortController().signal,
   queue = new EventQueue(),
+  local = null,
   hooks = {},
   now = Date.now,
   setTimer = setTimeout,
@@ -88,6 +99,7 @@ export async function runSession({
     identity,
     models: [...models],
     queue,
+    local,
     hooks,
     now,
     setTimer,
@@ -115,8 +127,12 @@ class Session {
     // The batch on the wire: its outbox entries and per OpId 'waiting', 'confirmed',
     // 'rejected' or 'deferred'.
     this.batch = null;
-    // OpIds an `ack` of this session confirmed, to catch a later `reject` of one of them (D182).
-    this.confirmed = new Set();
+    // OpId to the log position of the `ack` that confirmed it, to catch a later `reject` of
+    // one of them (D182). Pruned with `appliedServerSeq` when the next batch is sent.
+    this.confirmed = new Map();
+    // The highest log position this session knows to be applied: the mark named in `Hello`,
+    // then every `ack`.
+    this.appliedServerSeq = null;
     this.deferTimer = null;
   }
 
@@ -126,13 +142,18 @@ class Session {
 
     const stored = await this.identity.load();
     this.user = stored.user;
+    let lastServerSeq = stored.lastServerSeq ?? null;
+    if (this.local !== null && stored.replica != null && this.user != null) {
+      lastServerSeq = await this.local.appliedServerSeq({ user: this.user, replica: stored.replica });
+    }
+    this.appliedServerSeq = lastServerSeq;
     this.socket.send(
       encodeClient({
         t: 'hello',
         token: stored.token ?? null,
         replica: stored.replica ?? null,
         replica_secret: stored.replicaSecret ?? null,
-        last_server_seq: stored.lastServerSeq ?? null,
+        last_server_seq: lastServerSeq,
       }),
     );
     this.requested = stored.replica ?? null;
@@ -249,6 +270,7 @@ class Session {
       limit: this.limits.ops_per_batch,
     });
     if (pending.length === 0) return null;
+    this.forgetSettled();
     let entries;
     let frame;
     try {
@@ -299,11 +321,23 @@ class Session {
     const confirmed = this.waiting().filter((entry) => entry.seq <= acked.seq);
     if (confirmed.length === 0) return;
     const ids = confirmed.map((entry) => entry.opId);
+    if (this.local !== null) {
+      await this.local.applyAck({
+        user: this.user,
+        replica: this.replica,
+        seq: ack.seq,
+        entries: confirmed,
+        restamped: ack.restamped,
+      });
+    }
     await this.outbox.remove(ids);
     ids.forEach((opId) => {
       this.batch.state.set(opId, 'confirmed');
-      this.confirmed.add(opId);
+      this.confirmed.set(opId, ack.seq);
     });
+    if (this.appliedServerSeq === null || ack.seq > this.appliedServerSeq) {
+      this.appliedServerSeq = ack.seq;
+    }
     this.closeBatchIfDecided();
     await this.call('onAck', {
       op: ack.op,
@@ -329,7 +363,11 @@ class Session {
         ),
       });
     }
-    if (!this.waiting().some((entry) => entry.opId === op)) return null;
+    const entry = this.waiting().find((waiting) => waiting.opId === op);
+    if (entry === undefined) return null;
+    if (this.local !== null) {
+      await this.local.reject({ user: this.user, replica: this.replica, entry, reason });
+    }
     await this.outbox.remove([op]);
     this.batch.state.set(op, 'rejected');
     this.closeBatchIfDecided();
@@ -347,6 +385,14 @@ class Session {
     this.closeBatchIfDecided();
     if (this.deferTimer !== null) this.clearTimer(this.deferTimer);
     this.deferTimer = this.setTimer(() => this.queue.push({ type: 'resume' }), delay);
+  }
+
+  // Forgets confirmed ops at or below `appliedServerSeq`. Called before a new batch is sent:
+  // the previous batch is decided then, so none of them can still get an outcome.
+  forgetSettled() {
+    for (const [opId, seq] of this.confirmed) {
+      if (this.appliedServerSeq !== null && seq <= this.appliedServerSeq) this.confirmed.delete(opId);
+    }
   }
 
   // Entries of the current batch that have no outcome yet.
