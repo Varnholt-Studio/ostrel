@@ -27,6 +27,7 @@
 )]
 
 mod check;
+pub mod elevated;
 pub mod hir;
 
 use std::collections::HashMap;

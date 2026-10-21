@@ -32,7 +32,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const USAGE: &str = "usage: ostrel run [--max-steps N] FILE\n       ostrel check FILE\n       ostrel --help | --version\n";
+const USAGE: &str = "usage: ostrel run [--max-steps N] FILE\n       ostrel check [--list-elevated] FILE\n       ostrel --help | --version\n";
 const STEP_LIMIT_MESSAGE: &str =
     "runtime error[StepLimit]: program exceeded its step limit; raise it with `--max-steps`";
 

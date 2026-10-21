@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! ostrel run [--max-steps N] FILE
-//! ostrel check FILE
+//! ostrel check [--list-elevated] FILE
 //! ostrel --help | --version
 //! ```
 //!
@@ -28,6 +28,8 @@ pub enum Command {
     Check {
         /// The source file, exactly as given on the command line.
         file: OsString,
+        /// `--list-elevated`: also list every `as system` function (AC-32).
+        list_elevated: bool,
     },
     /// `ostrel --help`.
     Help,
@@ -46,7 +48,7 @@ impl fmt::Display for UsageError {
 }
 
 /// The usage text, printed for `--help` and after a usage error.
-pub const USAGE: &str = "usage: ostrel run [--max-steps N] FILE\n       ostrel check FILE\n       ostrel --help | --version\n";
+pub const USAGE: &str = "usage: ostrel run [--max-steps N] FILE\n       ostrel check [--list-elevated] FILE\n       ostrel --help | --version\n";
 
 /// Parses the arguments after the program name.
 pub fn parse<I>(args: I) -> Result<Command, UsageError>
@@ -72,6 +74,7 @@ where
 
     let mut file: Option<OsString> = None;
     let mut max_steps: Option<u64> = None;
+    let mut list_elevated = false;
     let mut flags_done = false;
     while let Some(arg) = args.next() {
         let text = arg.to_str();
@@ -95,6 +98,7 @@ where
                     .ok_or_else(|| UsageError("`--max-steps` needs a value".to_string()))?;
                 max_steps = Some(steps(&value.to_string_lossy())?);
             }
+            "--list-elevated" if !run => list_elevated = true,
             _ if run && flag.starts_with("--max-steps=") => {
                 max_steps = Some(steps(flag.trim_start_matches("--max-steps="))?);
             }
@@ -107,7 +111,10 @@ where
     Ok(if run {
         Command::Run { file, max_steps }
     } else {
-        Command::Check { file }
+        Command::Check {
+            file,
+            list_elevated,
+        }
     })
 }
 
@@ -142,7 +149,29 @@ mod tests {
         assert_eq!(
             p(&["check", "a.ostl"]),
             Ok(Command::Check {
-                file: "a.ostl".into()
+                file: "a.ostl".into(),
+                list_elevated: false
+            })
+        );
+    }
+
+    #[test]
+    fn list_elevated_belongs_to_check() {
+        let listed = Ok(Command::Check {
+            file: "a.ostl".into(),
+            list_elevated: true,
+        });
+        assert_eq!(p(&["check", "--list-elevated", "a.ostl"]), listed);
+        assert_eq!(p(&["check", "a.ostl", "--list-elevated"]), listed);
+        assert_eq!(
+            p(&["check", "--list-elevated", "--list-elevated", "a.ostl"]),
+            listed
+        );
+        assert_eq!(
+            p(&["check", "--", "--list-elevated"]),
+            Ok(Command::Check {
+                file: "--list-elevated".into(),
+                list_elevated: false
             })
         );
     }
@@ -181,7 +210,9 @@ mod tests {
             &["check"][..],
             &["run", "--no-such-flag-55", "a.ostl"][..],
             &["check", "--max-steps", "5", "a.ostl"][..],
-            &["check", "--list-elevated", "a.ostl"][..],
+            &["run", "--list-elevated", "a.ostl"][..],
+            &["check", "--list-elevated"][..],
+            &["check", "--list-elevated=yes", "a.ostl"][..],
             &["run", "a.ostl", "b.ostl"][..],
             &["run", "--max-steps"][..],
             &["run", "--max-steps", "0", "a.ostl"][..],
