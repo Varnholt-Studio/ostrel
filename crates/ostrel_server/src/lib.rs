@@ -11,6 +11,8 @@
 //!   canonical encoding of its argument list, never the arguments themselves (D117, D118).
 //! * [`key_status`] checks the status of the device key behind a token on every `Hello` and
 //!   HTTP request and closes the open sessions of a revoked key (D102).
+//! * [`revoke_scope`] decides who may revoke which device key (D128) and persists a
+//!   revocation before it closes the sessions of the key.
 //! * [`secret`] holds a `replica_secret` (D111) and keeps it out of every `Debug` output.
 //! * [`outbound`] keeps every message to the client within the frame limit (D121): it
 //!   pages snapshots and server ops by bytes and turns an oversized `Return` into
@@ -48,6 +50,7 @@ pub mod host;
 pub mod identity;
 pub mod key_status;
 pub mod outbound;
+pub mod revoke_scope;
 pub mod secret;
 pub mod task;
 pub mod ws;
