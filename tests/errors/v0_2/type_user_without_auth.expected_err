@@ -1,0 +1,1 @@
+tests/errors/v0_2/type_user_without_auth.ostl:4:10: error[E0203]: unknown type `User`; the std `User` exists only when the `app` has `auth paseto`

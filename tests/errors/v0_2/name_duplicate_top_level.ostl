@@ -1,7 +1,6 @@
 app Golden
 
-data f
+data Post
   a: Int
 
-fn f()
-  print(1)
+enum Post = a | b

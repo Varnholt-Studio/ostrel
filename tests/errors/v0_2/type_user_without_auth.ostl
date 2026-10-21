@@ -1,0 +1,5 @@
+app Golden
+
+data Post
+  owner: User
+  see if true

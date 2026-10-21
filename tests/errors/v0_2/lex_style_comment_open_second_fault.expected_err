@@ -1,0 +1,2 @@
+tests/errors/v0_2/lex_style_comment_open_second_fault.ostl:4:3: error[E0015]: unterminated `/*` comment in a `style` block; close it with `*/`
+tests/errors/v0_2/lex_style_comment_open_second_fault.ostl:8:12: error[E0008]: unexpected character `@`
