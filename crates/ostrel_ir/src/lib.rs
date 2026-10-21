@@ -9,6 +9,10 @@
 //!
 //! The slice grows by addition only. [`lower`] builds it from the checked
 //! program.
+//!
+//! The full IR of v0.2 (freeze F2) lives in [`full`], next to the slice, until
+//! the CLI and the VM move to the HIR; it shares only [`INT_MIN`] and
+//! [`INT_MAX`] with the slice.
 
 // This crate processes data derived from untrusted input: no unwrap, expect,
 // panic or unchecked indexing.
@@ -19,6 +23,7 @@
     clippy::indexing_slicing
 )]
 
+pub mod full;
 mod lower;
 
 pub use lower::{LowerError, lower};

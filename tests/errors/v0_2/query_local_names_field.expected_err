@@ -1,0 +1,1 @@
+tests/errors/v0_2/query_local_names_field.ostl:8:19: error[E0207]: local `pos` has the name of a field of `Post`; rename the local

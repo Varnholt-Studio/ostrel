@@ -1,0 +1,1 @@
+tests/errors/v0_2/field_unknown_access.ostl:8:5: error[E0204]: data type `Post` has no field `nope`

@@ -1,0 +1,5 @@
+data User
+  handle: Text fixed
+  name: Text
+  see if signed
+  edit name if handle == me.handle

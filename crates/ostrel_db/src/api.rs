@@ -310,6 +310,18 @@ pub trait Transaction<'c> {
     /// already in the log, was recorded as rejected or appears twice in `ops` gives
     /// [`DbError::Conflict`], and no op of the call is appended. For every replica in `ops`,
     /// [`Self::last_seq`] becomes the larger of its old value and the largest `seq` appended.
+    ///
+    /// Position contract (D154), the only one the sync layer relies on:
+    /// * The positions of one call increase in the order of `ops`.
+    /// * If transaction A commits before transaction B calls `append_ops` and B commits, every
+    ///   position of B is above every position of A.
+    /// * A committed position is never given again.
+    /// * A position of a transaction that rolled back may be given again or be left out, so
+    ///   the log may have gaps. Positions are not contiguous across transactions.
+    ///
+    /// Two transactions that are open at the same time may get the same position; then at
+    /// most one of them commits. The case file `ac_10_positions.json` of the conformance suite
+    /// checks the contract.
     fn append_ops<'a>(&'a mut self, ops: &'a [NewOp]) -> BoxFuture<'a, Result<ServerSeq, DbError>>;
     /// Returns at most `limit` ops with a position greater than `after`, in position order.
     fn ops_since<'a>(

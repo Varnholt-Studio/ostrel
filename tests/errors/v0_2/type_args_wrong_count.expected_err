@@ -1,0 +1,1 @@
+tests/errors/v0_2/type_args_wrong_count.ostl:4:6: error[E0309]: `Map` takes 2 type arguments, found 1

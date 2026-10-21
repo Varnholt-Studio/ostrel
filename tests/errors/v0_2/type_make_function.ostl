@@ -1,0 +1,7 @@
+app Golden
+
+fn g()
+  print(1)
+
+fn f()
+  make g { a: 1 }

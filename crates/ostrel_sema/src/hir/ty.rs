@@ -26,6 +26,8 @@ pub enum Ty {
     Bytes,
     /// Table: `Rank`, a fractional index key.
     Rank,
+    /// Table: `Url`, a text the URL rule accepted (SPEC 12.13).
+    Url,
     /// Table: a variant of the enum declared by this definition.
     Enum(DefId),
     /// Table: a reference to a row of the model declared by this definition.
@@ -64,6 +66,7 @@ impl Ty {
             | Ty::Time
             | Ty::Bytes
             | Ty::Rank
+            | Ty::Url
             | Ty::Enum(_)
             | Ty::Ref(_) => true,
             Ty::Optional(inner) => !matches!(**inner, Ty::Optional(_)) && inner.is_field_type(),

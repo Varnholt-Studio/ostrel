@@ -1,0 +1,1 @@
+tests/errors/v0_2/field_unknown_serial_per.ostl:4:21: error[E0204]: data type `Post` has no field `nope`

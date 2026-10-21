@@ -1,0 +1,5 @@
+app Golden
+  auth paseto open
+
+data Post
+  author: Text

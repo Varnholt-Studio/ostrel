@@ -80,9 +80,80 @@ test("parseUrl refuses control characters that browsers would strip", () => {
   for (const url of refused) assert.equal(parseUrl(url), null, JSON.stringify(url));
 });
 
-test("parseUrl refuses absolute http URLs the URL parser rejects", () => {
+test("parseUrl refuses absolute http URLs the host rule rejects", () => {
   assert.equal(parseUrl("http://"), null);
   assert.equal(parseUrl("https://exa mple.org"), null);
+});
+
+test("parseUrl does not use the WHATWG URL parser", () => {
+  // D144: the server implements the same rule without a URL parser, so the client may not
+  // depend on one either. Built from parts so this test does not match itself.
+  const source = readFileSync(new URL("./url.js", import.meta.url), "utf8");
+  assert.ok(!source.includes(["new", "URL("].join(" ")));
+});
+
+// Shared URL corpus (ARCHITECTURE 7.5, SPEC 12.13). The VM side of Url.parse runs the same
+// file, so every case here is also a promise about server code.
+
+const CORPUS = new URL("../../../../tests/hostile/url/corpus.txt", import.meta.url);
+
+// Decodes the escapes of the corpus format: \t, \\ and \u{H} only.
+function unescapeCorpus(text, where) {
+  return text.replace(/\\(t|\\|u\{([0-9A-Fa-f]{1,6})\}|.?)/g, (escape, kind, hex) => {
+    if (kind === "t") return "\t";
+    if (kind === "\\") return "\\";
+    const scalar = hex === undefined ? -1 : parseInt(hex, 16);
+    const isScalarValue = scalar >= 0 && scalar <= 0x10ffff && !(scalar >= 0xd800 && scalar <= 0xdfff);
+    if (isScalarValue) return String.fromCodePoint(scalar);
+    throw new Error(`${where}: unknown escape ${JSON.stringify(escape)}`);
+  });
+}
+
+// Returns [{ where, input, expected }], expected being null for a "none" case.
+function readCorpus() {
+  const lines = readFileSync(CORPUS, "utf8").split("\n");
+  assert.equal(lines.pop(), "", "the corpus ends with a line end");
+  return lines.map((line, index) => {
+    const where = `corpus.txt:${index + 1}`;
+    assert.ok(!/[\u0000-\u0008\u000a-\u001f\u007f-\u009f]/.test(line), `${where}: raw control character`);
+    const fields = line.split("\t");
+    const [verdict, input] = fields;
+    if (verdict === "ok" && fields.length === 3) {
+      return { where, input: unescapeCorpus(input, where), expected: unescapeCorpus(fields[2], where) };
+    }
+    if (verdict === "none" && fields.length === 2) {
+      return { where, input: unescapeCorpus(input, where), expected: null };
+    }
+    throw new Error(`${where}: expected "ok<TAB>input<TAB>expected" or "none<TAB>input"`);
+  });
+}
+
+test("corpus escapes decode exactly as the format says", () => {
+  assert.equal(unescapeCorpus("a\\tb\\\\c\\u{FC}\\u{1F600}", "x"), "a\tb\\c\u00fc\u{1F600}");
+  for (const bad of ["\\n", "\\u{}", "\\u{110000}", "\\u{D800}", "\\u{41", "\\"]) {
+    assert.throws(() => unescapeCorpus(bad, "x"), /unknown escape/, bad);
+  }
+});
+
+test("parseUrl gives the expected result for every case of the shared URL corpus", () => {
+  const cases = readCorpus();
+  assert.ok(cases.length >= 21 + 17, "the 21 cases of SPEC 12.13 and the host rule cases of D144");
+  const inputs = new Set();
+  for (const { where, input, expected } of cases) {
+    assert.ok(!inputs.has(input), `${where}: duplicate input`);
+    inputs.add(input);
+    assert.equal(parseUrl(input), expected, `${where}: ${JSON.stringify(input)}`);
+  }
+});
+
+test("every corpus URL that parseUrl accepts is written by the href and src sinks", () => {
+  for (const { where, input, expected } of readCorpus()) {
+    for (const [tag, name] of [["a", "href"], ["img", "src"]]) {
+      const e = element(tag);
+      setAttr(e, name, input);
+      assert.equal(e.attributes.get(name), expected ?? undefined, `${where}: ${tag} ${name}`);
+    }
+  }
 });
 
 test("parseUrl refuses non strings", () => {

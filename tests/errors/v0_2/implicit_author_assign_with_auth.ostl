@@ -1,0 +1,9 @@
+app Golden
+  auth paseto open
+
+data Post
+  pos: Int
+  see if true
+
+fn f(p: Post)
+  p.author = 1

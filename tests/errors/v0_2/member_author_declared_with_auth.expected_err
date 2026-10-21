@@ -1,0 +1,1 @@
+tests/errors/v0_2/member_author_declared_with_auth.ostl:5:3: error[E0206]: field `author` is an implicit field of every row in `Post`

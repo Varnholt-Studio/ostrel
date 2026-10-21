@@ -41,7 +41,7 @@ Plain text, one `key: value` per line, indented lines continue the key above.
 | `a_optional_ordering` | (a) | `priority >= 3` with `priority: Int?` compiles, or only warns |
 | `b_rule_runtime_error` | (b) | a failed division inside `not (...)` is read as `false`, so the rule allows |
 | `c_set_directions` | (c) | a removal is allowed because the rule expression is true, though the rule mentions only additions |
-| `d_call_denied_fallback` | (d) | `discount(c) ?? 0` turns `Denied` or `OutcomeUnknown` into `0` |
+| `d_call_denied_fallback` | (d) | a fallback swallows more than `Offline`: `discount(c) ?? 0` shows `0` after `Denied` or `OutcomeUnknown`, though `??` turns only `Offline` into its fallback (ARCHITECTURE 3.2 G11, 5.7) |
 | `e_limit_after_see` | (e) | `limit 3` and `last 3` are cut before the `see` rule filters, so a reader gets fewer rows |
 
 ## Open points
