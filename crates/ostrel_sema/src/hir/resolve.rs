@@ -60,6 +60,8 @@ pub(crate) const NOT_A_MODEL: Code = Code::new(205);
 pub(crate) const IMPLICIT_WRITE: Code = Code::new(208);
 /// A wrong number of type arguments (SPEC 12.6).
 pub(crate) const TYPE_ARGS: Code = Code::new(309);
+/// A field after `serial per` that is not allowed (D136, SPEC 12.6).
+pub(crate) const SERIAL_KEY: Code = Code::new(307);
 
 /// The file of the std sources; no source map entry has this id.
 pub(crate) const STD_FILE: FileId = FileId::from_raw(u32::MAX);
@@ -524,11 +526,44 @@ impl<'a> Rx<'a> {
                 merge,
             });
         }
-        DefKind::Model(ModelDef {
+        let model = ModelDef {
             fields,
             rules: Vec::new(),
             checks: Vec::new(),
-        })
+        };
+        self.serial_keys(&model, d);
+        DefKind::Model(model)
+    }
+
+    /// E0307 at each name after `serial per` that is a field of the model but
+    /// no allowed key; an unknown name already has E0204, and a key whose
+    /// type is unknown already has its own diagnostic.
+    fn serial_keys(&mut self, model: &ModelDef, d: &ast::DataDecl) {
+        for (field, m) in model
+            .fields
+            .iter()
+            .zip(d.members.iter().filter_map(|m| match &m.kind {
+                ast::MemberKind::Field(f) => Some(f),
+                _ => None,
+            }))
+        {
+            let (FieldMode::Serial(Some(key)), Some(ast::FieldMode::Serial { per: Some(per) })) =
+                (field.mode, &m.mode)
+            else {
+                continue;
+            };
+            let unknown = matches!(key, FieldRef::Declared(f)
+                if model.fields.get(f.index()).is_some_and(|f| f.ty == Ty::Error));
+            if !unknown && !model.is_serial_key(key) {
+                self.error(
+                    SERIAL_KEY,
+                    per.range,
+                    "serial per needs a fixed field of type Bool, Int, Text, Time, Bytes, an enum \
+                     or a reference, or author"
+                        .to_string(),
+                );
+            }
+        }
     }
 
     fn unknown_field(&mut self, model: DefId, name: &ast::Ident) {
