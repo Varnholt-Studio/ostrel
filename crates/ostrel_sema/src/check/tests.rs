@@ -954,10 +954,35 @@ fn ac_29_list_with_none_against_a_plain_list_is_e0304_at_the_none() {
 }
 
 #[test]
-fn ac_29_common_attribute_words_on_a_view_element() {
-    clean(&with_note(
-        "view Other\n  text \"a\"\nview Main\n  Other look: strong\n",
+fn ac_29_common_attribute_words_are_no_view_arguments() {
+    // `look` and `scroll` are common attributes of std elements only
+    // (SYNTAX 4.8); on the element of a view the word needs a binding.
+    let src = with_note("view Other\n  text \"a\"\nview Main\n  Other look: strong\n");
+    assert_eq!(diags(&src), ["E0200 10:15"]);
+    let src = with_note("view Badge(look: Text)\n  text \"a\"\nview Main\n  Badge look: strong\n");
+    assert_eq!(diags(&src), ["E0200 10:15"]);
+}
+
+#[test]
+fn ac_29_view_argument_word_resolves_to_its_variant() {
+    let program = clean(&with_note(
+        "enum Tone = strong | soft\nview Badge(look: Tone)\n  text \"a\"\nview Main\n  Badge look: strong\n",
     ));
+    let tone = program
+        .defs
+        .iter()
+        .position(|d| &*d.name == "Tone")
+        .unwrap();
+    let words: Vec<_> = program
+        .exprs
+        .iter()
+        .filter_map(|e| match e.kind {
+            ExprKind::Name(r @ (Res::Variant(..) | Res::Std(_))) => Some(r),
+            ExprKind::Word { .. } => panic!("a word is left after check"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(words, [Res::Variant(crate::hir::DefId(tone as u32), 0)]);
 }
 
 /// Probes of review #2565: literals and variables of the same type get the

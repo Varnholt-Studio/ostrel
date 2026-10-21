@@ -17,7 +17,7 @@
 //! expression is not decided yet (properties other than `len` and `trim`,
 //! methods of collections, contextual names, std names other than
 //! `Url.parse`, attribute values of std elements other than `img src`,
-//! `link href`, and `look` and `scroll` on any element), the expression gets [`Ty::Error`] and nothing is reported,
+//! `link href`, `look` and `scroll`), the expression gets [`Ty::Error`] and nothing is reported,
 //! so a valid program never fails here. Not yet covered: `E0300` and the
 //! ordering of optionals (both stand at the operator, which the HIR does not
 //! record) and placement.
@@ -428,9 +428,11 @@ impl<'p> Cx<'p> {
             // URLs of `img` and `link` (SPEC 12.13) and the words of `look`
             // and `scroll` (SYNTAX 5); the other attribute types are not
             // declared yet.
-            // `look` and `scroll` are common attributes (SYNTAX 4.8), so
-            // their words hold on the element of a view as well.
-            if let Some(ExprKind::Word { name: word, .. }) = self.p.expr(*value).map(|x| &x.kind)
+            // The common attributes of SYNTAX 4.8 belong to std elements. On
+            // the element of a view an attribute is an argument of a view
+            // parameter, and its words resolve like any other name (D142).
+            if let (Some(_), Some(ExprKind::Word { name: word, .. })) =
+                (std, self.p.expr(*value).map(|x| &x.kind))
                 && let Some(v) = std_value(name, word)
             {
                 self.words.push((*value, Res::Std(StdName::Value(v))));
