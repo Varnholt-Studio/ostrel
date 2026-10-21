@@ -14,32 +14,30 @@ use crate::paseto::{Error, PublicKey, SecretKey, Verified, sign, verify};
 /// Length of an `app_id` in bytes.
 pub const APP_ID_LEN: usize = 16;
 
-/// Upper bound for the length of an app name in bytes.
-pub const MAX_APP_NAME_LEN: usize = 128;
-
 /// Prefix of every implicit assertion; names the version of the binding.
 const ASSERTION_PREFIX: &str = "ostrel-v1:";
 
 /// The app a server process verifies tokens for: its name and its `app_id`.
 ///
-/// It is the only way this crate signs or verifies a session token with an implicit
-/// assertion, so no caller can forget the binding or build the assertion differently.
+/// It is the only way other crates sign or verify a PASETO token with this crate: the plain
+/// `sign` and `verify` that take a free assertion are private to the crate, so no caller can
+/// forget the binding or build the assertion differently.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppBinding {
     assertion: String,
 }
 
 impl AppBinding {
-    /// The binding for the app `name` with `app_id`, or `None` when `name` is empty, longer
-    /// than [`MAX_APP_NAME_LEN`] or contains a byte other than an ASCII letter, digit or `_`.
+    /// The binding for the app `name` with `app_id`, or `None` when `name` is empty or
+    /// contains a byte other than an ASCII letter, digit or `_`.
     ///
-    /// App names are identifiers (SYNTAX: `app Chat`), so this never refuses the name of a
-    /// program that compiles. Refusing every other byte keeps the assertion unambiguous:
-    /// a name can never contain the `:` that separates it from the `app_id`.
+    /// App names are identifiers (SYNTAX: `app Chat`), which have no length limit (SPEC 12)
+    /// and consist of exactly these bytes, so this never refuses the name of a program that
+    /// compiles. Refusing every other byte keeps the assertion unambiguous: a name can never
+    /// contain the `:` that separates it from the `app_id`. The assertion is not part of the
+    /// token, so a long name does not make the token longer.
     pub fn new(name: &str, app_id: &[u8; APP_ID_LEN]) -> Option<Self> {
-        let ok = !name.is_empty()
-            && name.len() <= MAX_APP_NAME_LEN
-            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        let ok = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
         if !ok {
             return None;
         }
@@ -120,28 +118,32 @@ mod tests {
 
     #[test]
     fn app_names_are_identifiers() {
-        for good in [
-            "Chat",
-            "Issues2",
-            "my_app",
-            "A",
-            &"N".repeat(MAX_APP_NAME_LEN),
-        ] {
+        for good in ["Chat", "Issues2", "my_app", "A"] {
             assert!(AppBinding::new(good, &ID_A).is_some(), "{good:?}");
         }
-        let too_long = "N".repeat(MAX_APP_NAME_LEN + 1);
-        for bad in [
-            "",
-            "a:b",
-            "Chat:",
-            "a b",
-            "a-b",
-            "Ch\u{e4}t",
-            "a\0",
-            &too_long,
-        ] {
+        for bad in ["", "a:b", "Chat:", "a b", "a-b", "Ch\u{e4}t", "a\0"] {
             assert!(AppBinding::new(bad, &ID_A).is_none(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn long_app_names_are_accepted() {
+        // uma #2794 B1: identifiers have no length limit, `app` with a 200 byte name compiles.
+        let name = "A".repeat(200);
+        let app = binding(&name, &ID_A);
+        let mut expected = format!("ostrel-v1:{name}:").into_bytes();
+        expected.extend_from_slice(b"000102030405060708090a0b0c0d0eff");
+        assert_eq!(app.assertion(), expected.as_slice());
+        let token = app.sign(&server_key(), MESSAGE, b"");
+        let verified = app.verify(&server_key().public_key(), &token);
+        assert_eq!(verified.map(|v| v.message), Ok(MESSAGE.to_vec()));
+        let shorter = binding(&"A".repeat(199), &ID_A);
+        assert_eq!(
+            shorter
+                .verify(&server_key().public_key(), &token)
+                .map(|v| v.message),
+            Err(Error::BadSignature)
+        );
     }
 
     #[test]

@@ -92,6 +92,10 @@ impl std::error::Error for RevokeError {}
 
 /// Whether `by` may revoke the key `kid` of `user`, by the rules of the module documentation.
 ///
+/// The signer is checked before the target is read: a key of another user, or a key the
+/// signer's user does not have, gets [`RevokeError::Denied`] whatever the target is, so the
+/// answer never tells whether a key of another user exists or is a user key.
+///
 /// This reads only the key table. [`revoke_device_key`] also checks the status of the
 /// signing key before it calls this.
 pub fn authorize(
@@ -100,22 +104,27 @@ pub fn authorize(
     user: RowId,
     kid: &KeyId,
 ) -> Result<(), RevokeError> {
+    let signer_kind = match by {
+        Revoker::Operator => None,
+        Revoker::Key(signer) => {
+            if signer.user != user {
+                return Err(RevokeError::Denied);
+            }
+            match keys.kind(signer.user, &signer.kid) {
+                Some(kind) => Some((kind, signer)),
+                None => return Err(RevokeError::Denied),
+            }
+        }
+    };
     match keys.kind(user, kid) {
         None => return Err(RevokeError::UnknownKey),
         Some(KeyKind::User) => return Err(RevokeError::UserKey),
         Some(KeyKind::Device) => {}
     }
-    let signer = match by {
-        Revoker::Operator => return Ok(()),
-        Revoker::Key(signer) => signer,
-    };
-    if signer.user != user {
-        return Err(RevokeError::Denied);
-    }
-    match keys.kind(signer.user, &signer.kid) {
-        Some(KeyKind::User) => Ok(()),
-        Some(KeyKind::Device) if signer.kid == *kid => Ok(()),
-        Some(KeyKind::Device) | None => Err(RevokeError::Denied),
+    match signer_kind {
+        None | Some((KeyKind::User, _)) => Ok(()),
+        Some((KeyKind::Device, signer)) if signer.kid == *kid => Ok(()),
+        Some((KeyKind::Device, _)) => Err(RevokeError::Denied),
     }
 }
 
@@ -350,6 +359,30 @@ mod tests {
     }
 
     #[test]
+    fn foreign_targets_are_all_denied_alike() {
+        // uma #2794 F1: a key of another user learns nothing about the target. An unknown kid,
+        // the user key and a device key of user 1, and a user without keys, all give Denied.
+        let log = Log::default();
+        let table = Arc::new(Table::new(&log));
+        let board = KeyStatusBoard::new(&*table);
+        for by in [signed(2, "dev-a"), signed(2, "root")] {
+            for (n, target) in [(1, "dev-z"), (1, "root"), (1, "dev-b"), (9, "dev-a")] {
+                assert_eq!(
+                    authorize(&*table, &by, user(n), &kid(target)),
+                    Err(RevokeError::Denied),
+                    "{by:?} on {n}/{target}"
+                );
+                assert_eq!(
+                    revoke_device_key(&board, &*table, &by, user(n), &kid(target)),
+                    Err(RevokeError::Denied),
+                    "{by:?} on {n}/{target}"
+                );
+            }
+        }
+        assert!(log_of(&log).is_empty(), "nothing persisted, nothing closed");
+    }
+
+    #[test]
     fn user_key_is_never_revoked() {
         let log = Log::default();
         let table = Arc::new(Table::new(&log));
@@ -377,11 +410,15 @@ mod tests {
             revoke_device_key(&board, &*table, &signed(1, "dev-z"), user(1), &kid("dev-a")),
             Err(RevokeError::Denied)
         );
-        // Through the scope check alone an unknown signer is denied too.
-        assert_eq!(
-            authorize(&*table, &signed(1, "dev-z"), user(1), &kid("dev-a")),
-            Err(RevokeError::Denied)
-        );
+        // Through the scope check alone an unknown signer is denied too, also when the
+        // target does not exist or is the user key.
+        for target in ["dev-a", "dev-z", "root"] {
+            assert_eq!(
+                authorize(&*table, &signed(1, "dev-z"), user(1), &kid(target)),
+                Err(RevokeError::Denied),
+                "{target}"
+            );
+        }
     }
 
     #[test]

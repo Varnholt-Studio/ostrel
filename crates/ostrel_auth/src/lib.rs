@@ -7,7 +7,7 @@
 //! and the binding of every session token to one app through the implicit assertion
 //! (D128, [`AppBinding`]).
 //!
-//! Every token handed to [`verify`] is treated as hostile input: its length is bounded,
+//! Every token handed to [`AppBinding::verify`] is treated as hostile input: its length is bounded,
 //! its encoding must be canonical, and only `v4.public` is accepted.
 
 // This crate handles untrusted input: no unwrap, expect, panic or unchecked indexing.
@@ -22,13 +22,13 @@ mod app;
 mod claims;
 mod paseto;
 
-pub use app::{APP_ID_LEN, AppBinding, MAX_APP_NAME_LEN};
+pub use app::{APP_ID_LEN, AppBinding};
 
 pub use claims::{
     Claim, ClaimInput, Claims, ClaimsError, MAX_KID_LEN, Policy, SUB_HEX_LEN, UnixTime,
     check_claims,
 };
 
-pub use paseto::{
-    Error, MAX_TOKEN_LEN, PublicKey, SecretKey, V4_PUBLIC_HEADER, Verified, pae, sign, verify,
-};
+// `sign` and `verify` with a free implicit assertion stay private to the crate: other crates
+// sign and verify only through `AppBinding`, which always binds the token to one app (D128).
+pub use paseto::{Error, MAX_TOKEN_LEN, PublicKey, SecretKey, V4_PUBLIC_HEADER, Verified, pae};
