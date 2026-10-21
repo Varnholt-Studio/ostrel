@@ -1,0 +1,1 @@
+tests/errors/check_v0_2_enum_declaration.ostl:4:1: error[E0100]: `enum` declaration is not available in v0.1
