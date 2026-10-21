@@ -12,6 +12,9 @@
 //! * [`key_status`] checks the status of the device key behind a token on every `Hello` and
 //!   HTTP request and closes the open sessions of a revoked key (D102).
 //! * [`secret`] holds a `replica_secret` (D111) and keeps it out of every `Debug` output.
+//! * [`outbound`] keeps every message to the client within the frame limit (D121): it
+//!   pages snapshots and server ops by bytes and turns an oversized `Return` into
+//!   `CallError` `Limit`.
 //! * [`host`] is the [`ostrel_vm::host::ServerHost`] of one VM task, and [`task`] runs a
 //!   program image with it next to the database connection of the task.
 //!
@@ -44,6 +47,7 @@ pub mod audit;
 pub mod host;
 pub mod identity;
 pub mod key_status;
+pub mod outbound;
 pub mod schema;
 pub mod secret;
 pub mod task;
