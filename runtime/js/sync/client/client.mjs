@@ -17,7 +17,12 @@
 //   `Overloaded` the client catches up with back pressure (5.4);
 // * `Superseded`: a newer session of the same replica exists, so this tab stops leading and
 //   opens no session until it leads again (D32, Q27 (b));
-// * `Unauthorized`, `ReplicaExpired`, and an outbox whose oldest op cannot be sent: another
+// * `Unauthorized` (an expired or refused token, D194): the outbox stays as it is. The client
+//   signs in again with the device key (`identity.signIn()`, ARCHITECTURE 8) and opens a new
+//   session, which sends the same ops with the same `seq`. It signs in once per refusal: if the
+//   new token is refused too, or sign in fails (a revoked key), the tab stays offline as below;
+//   the ops wait in the outbox until the replica expires (5.5 step 1);
+// * `ReplicaExpired`, a failed sign in, and an outbox whose oldest op cannot be sent: another
 //   attempt would fail the same way. The tab keeps leading but stays offline until the app
 //   calls `reconnect()` (for example after a new sign in or after dropping the replica as the
 //   notice of 5.5 says). `onNotice` tells the app.
@@ -45,7 +50,9 @@ const OUTCOME = 'outcome';
  * @param {(name: string) => BroadcastChannel} deps.openChannel
  * @param {() => WebSocket} deps.connect  opens a new WebSocket to the app's sync endpoint
  * @param {import('../outbox/outbox.mjs').Outbox} deps.outbox
- * @param {{load: Function, saveReplica: Function}} deps.identity  see `runSession`
+ * @param {{load: Function, saveReplica: Function, signIn?: Function}} deps.identity  see
+ *   `runSession`; `signIn()` gets a new token with the device key and stores it, so the next
+ *   `load()` returns it, and resolves to whether it succeeded
  * @param {Iterable<string>} [deps.models]  model names of the compiled schema
  * @param {object} [deps.hooks]
  *   `onWelcome(info)` on the leader; `onAck(outcome)` and `onReject(outcome)` on every tab;
@@ -122,8 +129,22 @@ export function createSyncClient({
     });
   }
 
+  // Gets a new token after `Unauthorized`. False when there is no way to sign in or it failed.
+  async function signIn() {
+    if (typeof identity.signIn !== 'function') return false;
+    try {
+      return (await identity.signIn()) === true;
+    } catch (error) {
+      report(error);
+      return false;
+    }
+  }
+
   async function onLead({ signal }) {
     let delay = reconnectMs;
+    // True from a sign in after `Unauthorized` until a session is welcomed: a second
+    // `Unauthorized` in that time means the new token is refused too, so no loop of sign ins.
+    let signedInAgain = false;
     while (!signal.aborted) {
       current = new EventQueue();
       let result;
@@ -140,8 +161,18 @@ export function createSyncClient({
       } finally {
         current = null;
       }
-      if (result.welcomed) delay = reconnectMs;
+      if (result.welcomed) {
+        delay = reconnectMs;
+        signedInAgain = false;
+      }
       if (result.end === END.ABORTED) return;
+      if (result.end === END.FATAL && result.code === 'Unauthorized' && !signedInAgain) {
+        // D194: the outbox is untouched, so the next session resends its ops with their `seq`.
+        if (await signIn()) {
+          signedInAgain = true;
+          continue;
+        }
+      }
       if (result.end === END.FATAL && result.code === 'Superseded') {
         await hook('onNotice')({ kind: 'superseded' });
         return;
@@ -149,6 +180,8 @@ export function createSyncClient({
       if (result.end === END.FATAL && !RETRY_CODES.has(result.code)) {
         await hook('onNotice')({ kind: 'session-refused', code: result.code });
         await pause(null, signal);
+        // `reconnect()` starts afresh: an `Unauthorized` after it may sign in once more.
+        signedInAgain = false;
         continue;
       }
       if (result.end === END.STUCK) {

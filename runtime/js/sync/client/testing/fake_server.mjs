@@ -100,3 +100,42 @@ export async function until(predicate, what, timeoutMs = 1000) {
     await new Promise((resolve) => setTimeout(resolve, 2));
   }
 }
+
+/**
+ * The compiled schema of the Rust codec tests (`crates/ostrel_sync/tests/wire_messages.rs`) in
+ * the form of the JS backend, plus the function list of T228: `Room` and `Person`, and the
+ * server functions `rename(room: Room, name: Text) -> Bool`, `count() -> Int`,
+ * `names() -> List[Text]` and `touch() -> Unit`.
+ */
+export const ROOMS_SCHEMA = Object.freeze({
+  app: { name: 'rooms', auth: 'open' },
+  enums: [{ name: 'Level', variants: ['member', 'admin'] }],
+  models: [
+    {
+      name: 'Room',
+      fields: [
+        { name: 'name', type: 'Text', mode: 'plain', merge: 'default' },
+        { name: 'topic', type: { optional: 'Text' }, mode: 'plain', merge: 'default' },
+        { name: 'owner', type: { ref: 1 }, mode: 'plain', merge: 'default' },
+        { name: 'members', type: { set: { ref: 1 } }, mode: 'plain', merge: 'default' },
+        { name: 'roles', type: { map: [{ ref: 1 }, { enum: 0 }] }, mode: 'plain', merge: 'default' },
+        { name: 'size', type: 'Int', mode: 'plain', merge: 'default' },
+        { name: 'keys', type: { list: 'Int' }, mode: 'plain', merge: 'default' },
+      ],
+    },
+    {
+      name: 'Person',
+      fields: [
+        { name: 'handle', type: 'Text', mode: 'fixed', merge: 'default' },
+        { name: 'home', type: { optional: { ref: 0 } }, mode: 'plain', merge: 'default' },
+        { name: 'age', type: 'Int', mode: 'plain', merge: 'default' },
+      ],
+    },
+  ],
+  functions: [
+    { name: 'rename', params: [{ ref: 0 }, 'Text'], result: 'Bool' },
+    { name: 'count', params: [], result: 'Int' },
+    { name: 'names', params: [], result: { list: 'Text' } },
+    { name: 'touch', params: [], result: 'Unit' },
+  ],
+});

@@ -46,7 +46,7 @@ function harness({ retryMs = 20 } = {}) {
     return socket;
   }
 
-  async function tab(id) {
+  async function tab(id, { identity = memoryIdentity({ user: ALICE, replica: REPLICA }) } = {}) {
     const outbox = await openOutbox({ indexedDB, IDBKeyRange: MemoryKeyRange });
     const events = [];
     const record = (name) => (payload) => events.push({ name, payload });
@@ -56,7 +56,7 @@ function harness({ retryMs = 20 } = {}) {
       openChannel: (name) => new BroadcastChannel(name),
       connect,
       outbox,
-      identity: memoryIdentity({ user: ALICE, replica: REPLICA }),
+      identity,
       models: ['Issue'],
       hooks: {
         onWelcome: record('welcome'),
@@ -69,7 +69,7 @@ function harness({ retryMs = 20 } = {}) {
       maxReconnectMs: 20,
       leaderOptions: { channelName, retryMs },
     });
-    const handle = { id, client, outbox, events };
+    const handle = { id, client, outbox, events, identity };
     tabs.push(handle);
     return handle;
   }
@@ -219,6 +219,90 @@ test('when the leader stops, the next tab takes over and drains the outbox', asy
     assert.equal(h.sockets[0].closed, true);
     await until(() => h.sockets[1]?.frames.length === 2, 'b sends the pending op');
     assert.deepEqual(h.sockets[1].sent()[1].ops.map((o) => o.id), [entry.opId]);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// An identity whose `signIn()` stores the next token of `tokens` (false: sign in fails).
+function signingIdentity(tokens) {
+  const identity = memoryIdentity({ user: ALICE, replica: REPLICA, token: 'token-1' });
+  identity.signIns = 0;
+  identity.signIn = async () => {
+    const next = tokens[identity.signIns];
+    identity.signIns += 1;
+    if (next === false || next === undefined) return false;
+    identity.state.token = next;
+    return true;
+  };
+  return identity;
+}
+
+test('Unauthorized on an open session: sign in again and resend the same ops with their seq (D194)', async () => {
+  const h = harness();
+  try {
+    const a = await h.tab('a', { identity: signingIdentity(['token-2']) });
+    const first = await a.outbox.append({ user: ALICE, replica: REPLICA, op: op(1), nowMs: 1000 });
+    const second = await a.outbox.append({ user: ALICE, replica: REPLICA, op: op(2), nowMs: 1001 });
+    a.client.start();
+    await until(() => h.sockets[0]?.frames.length === 2, 'first ops frame');
+    const sentBefore = h.sockets[0].sent()[1].ops;
+    // The token expires while the batch waits (5.5 step 1): no outcome, fatal Unauthorized.
+    h.sockets[0].deliver({ t: 'error', sub: null, code: 'Unauthorized', retry_after_ms: null });
+    await until(() => h.sockets[1]?.frames.length === 2, 'ops frame after sign in');
+    assert.equal(a.identity.signIns, 1);
+    const [hello, ops] = h.sockets[1].sent();
+    assert.equal(hello.token, 'token-2');
+    assert.equal(hello.replica, REPLICA);
+    // The same ops, same ids (replica and seq), same stamps: the outbox kept them as they were.
+    assert.deepEqual(ops.ops, sentBefore);
+    assert.deepEqual(ops.ops.map((o) => o.id), [first.opId, second.opId]);
+    assert.equal(named(a, 'notice').length, 0);
+    assert.equal(named(a, 'reject').length, 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a new token refused again keeps the tab offline with its outbox; no loop of sign ins', async () => {
+  const h = harness();
+  try {
+    h.server.refuse = 'Unauthorized';
+    const a = await h.tab('a', { identity: signingIdentity(['token-2', 'token-3']) });
+    const entry = await a.outbox.append({ user: ALICE, replica: REPLICA, op: op(1), nowMs: 1000 });
+    a.client.start();
+    await until(() => named(a, 'notice').length === 1, 'notice');
+    assert.deepEqual(named(a, 'notice')[0].payload, { kind: 'session-refused', code: 'Unauthorized' });
+    await tick(40);
+    assert.equal(a.identity.signIns, 1);
+    assert.equal(h.sockets.length, 2, 'one attempt with the new token, then offline');
+    assert.deepEqual(
+      (await a.outbox.pending({ user: ALICE, replica: REPLICA, limit: 10 })).map((e) => e.opId),
+      [entry.opId],
+    );
+    // reconnect() tries again; a refusal after it may sign in once more.
+    a.client.reconnect();
+    await until(() => a.identity.signIns === 2, 'second sign in');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a failed sign in keeps the tab offline and the outbox as it is', async () => {
+  const h = harness();
+  try {
+    h.server.refuse = 'Unauthorized';
+    const a = await h.tab('a', { identity: signingIdentity([false]) });
+    const entry = await a.outbox.append({ user: ALICE, replica: REPLICA, op: op(1), nowMs: 1000 });
+    a.client.start();
+    await until(() => named(a, 'notice').length === 1, 'notice');
+    await tick(40);
+    assert.equal(a.identity.signIns, 1);
+    assert.equal(h.sockets.length, 1);
+    assert.deepEqual(
+      (await a.outbox.pending({ user: ALICE, replica: REPLICA, limit: 10 })).map((e) => e.opId),
+      [entry.opId],
+    );
   } finally {
     await h.cleanup();
   }
