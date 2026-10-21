@@ -1,0 +1,9 @@
+fn area(w: Int, h: Int) -> Int
+  return w * h
+
+fn main()
+  let n = -3
+  let m = n - -n
+  for i in 1..3
+    print("area {area(i, i + 1)} of {i}")
+  print(m % 2 == 0 and not (n >= 0))

@@ -323,6 +323,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostrel_fmt"
+version = "0.1.0"
+dependencies = [
+ "ostrel_core",
+ "ostrel_syntax",
+]
+
+[[package]]
 name = "ostrel_ir"
 version = "0.1.0"
 dependencies = [
