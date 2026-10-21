@@ -20,46 +20,42 @@
 //! * Final outcomes of ops (D110) are the op log plus a map of rejected op ids; `last_seq` per
 //!   replica is kept next to them and changes in the same transaction.
 //!
-//! Ordering of query results follows the column order of the contract (`ostrel_db::api` query
-//! module): `Null` and missing fields first, enum columns by declaration order, `Bytes` byte by
-//! byte, everything else by [`compare_key`]. `Set` tags and `Map` entries are kept in
-//! [`compare_key`] order of their elements and keys (D61, D79).
+//! * Live rows are shared [`LiveRow`]s, so copying the state for a transaction copies no row;
+//!   a write copies the one row it changes. Deleted rows leave only their id behind.
+//!
+//! Filters, ordering, cursor and limit of queries, the enum check of writes, the rules of `Set`
+//! and `Map` changes and the transitions of one row ([`LiveRow::inserted`], [`LiveRow::check`],
+//! [`LiveRow::update`]) are those of [`ostrel_db::eval`], shared with every driver that keeps
+//! rows outside SQL (D129, D139). What stays here is the storage: the map of live rows, the ids
+//! of deleted rows and the rule that an id stays taken, the op log and the transactions. A new
+//! driver of that kind keeps its rows its own way and uses the shared rules the same way.
 
 use std::cell::RefCell;
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use ostrel_db::api::{
-    AppliedSchema, BoxFuture, Capabilities, CmpOp, CollectionChange, CollectionState, Connection,
-    DbError, Dir, Driver, EnumColumn, Expr, FieldId, Hop, MigrationPlan, ModelId, NewOp, OpId,
-    Path, Query, ReplayOutcome, ReplicaId, Row, RowId, Rows, ServerSeq, SetChange, SetTag,
-    StoredOp, Transaction, Value, Write, check_reject_reason, check_writes, compare_key,
+    AppliedSchema, BoxFuture, Capabilities, Connection, DbError, Driver, EnumColumn, MigrationPlan,
+    NewOp, OpId, Query, ReplayOutcome, ReplicaId, RowId, Rows, ServerSeq, StoredOp, Transaction,
+    Write, check_reject_reason, check_writes,
 };
+use ostrel_db::eval::{self, LiveRow, Lookup};
 
 /// The URL scheme this driver serves.
 pub const SCHEME: &str = "memory:";
-
-/// One stored row. `deleted` rows are tombstones: they keep the id taken (rule "ids are never
-/// reused") and hold no fields or collections.
-#[derive(Clone, Debug)]
-struct Stored {
-    model: ModelId,
-    version: u64,
-    deleted: bool,
-    fields: BTreeMap<FieldId, Value>,
-    collections: BTreeMap<FieldId, CollectionState>,
-}
 
 /// Everything a transaction or a migration may change. Cloned at the start of every
 /// transaction.
 #[derive(Clone, Debug, Default)]
 struct State {
-    rows: BTreeMap<RowId, Stored>,
+    /// Live rows of every model.
+    rows: BTreeMap<RowId, Rc<LiveRow>>,
+    /// Ids of deleted rows: they stay taken (rule "ids are never reused").
+    deleted: BTreeSet<RowId>,
     /// The op log. The op at index `i` has the position `i + 1`.
     ops: Vec<StoredOp>,
-    /// Ops rejected for good, with their reason code.
-    rejects: BTreeMap<OpId, String>,
+    /// The final outcome of every op in the log or rejected for good (D110).
+    outcomes: BTreeMap<OpId, ReplayOutcome>,
     /// Highest `seq` with a final outcome, per replica.
     last_seqs: BTreeMap<ReplicaId, u32>,
     sequences: BTreeMap<String, u64>,
@@ -70,31 +66,17 @@ struct State {
 }
 
 impl State {
-    /// Whether `op` already has a final outcome.
-    fn decided(&self, op: OpId) -> bool {
-        self.rejects.contains_key(&op) || self.ops.iter().any(|o| o.op.id == op)
-    }
-
-    /// Raises `last_seq` of the op's replica to the op's `seq`.
-    fn raise_last_seq(&mut self, op: OpId) {
+    /// Stores the final outcome of `op` and raises `last_seq` of its replica to its `seq`.
+    fn decide(&mut self, op: OpId, outcome: ReplayOutcome) {
+        self.outcomes.insert(op, outcome);
         let last = self.last_seqs.entry(op.replica).or_insert(0);
         *last = (*last).max(op.seq);
     }
+}
 
-    fn replay_outcome(&self, op: OpId) -> Option<ReplayOutcome> {
-        if let Some(reason) = self.rejects.get(&op) {
-            return Some(ReplayOutcome::Rejected(reason.clone()));
-        }
-        let stored = self.ops.iter().find(|o| o.op.id == op)?;
-        Some(ReplayOutcome::Accepted(stored.clone()))
-    }
-
-    /// Declaration order of an enum column, if `(model, field)` is one.
-    fn variants(&self, model: ModelId, field: FieldId) -> Option<&[String]> {
-        self.enums
-            .iter()
-            .find(|c| c.model == model && c.field == field)
-            .map(|c| c.variants.as_slice())
+impl Lookup for State {
+    fn live(&self, id: RowId) -> Result<Option<Rc<LiveRow>>, DbError> {
+        Ok(self.rows.get(&id).cloned())
     }
 }
 
@@ -240,7 +222,7 @@ impl<'c> Transaction<'c> for MemoryTransaction<'c> {
             self.step(|s| {
                 // Both checks run before the first write, so a refused batch changes nothing.
                 check_writes(w)?;
-                check_enums(s, w)?;
+                eval::check_enums(&s.enums, w)?;
                 w.iter().try_for_each(|w| apply_write(s, w))
             })
         })
@@ -251,21 +233,23 @@ impl<'c> Transaction<'c> for MemoryTransaction<'c> {
         Box::pin(async move {
             self.step(|s| {
                 // Every id is checked before the first op is appended, so a refused call
-                // appends nothing.
-                for (i, op) in ops.iter().enumerate() {
-                    let earlier = ops.get(..i).unwrap_or_default();
-                    if s.decided(op.id) || earlier.iter().any(|o| o.id == op.id) {
-                        return Err(DbError::Conflict);
-                    }
+                // appends nothing. An id twice in the call conflicts like a decided one.
+                let mut seen = BTreeSet::new();
+                if ops
+                    .iter()
+                    .any(|o| s.outcomes.contains_key(&o.id) || !seen.insert(o.id))
+                {
+                    return Err(DbError::Conflict);
                 }
                 for op in ops {
                     // The driver assigns the position.
                     let seq = ServerSeq(s.ops.len() as u64 + 1);
-                    s.ops.push(StoredOp {
+                    let stored = StoredOp {
                         seq,
                         op: op.clone(),
-                    });
-                    s.raise_last_seq(op.id);
+                    };
+                    s.decide(op.id, ReplayOutcome::Accepted(stored.clone()));
+                    s.ops.push(stored);
                 }
                 Ok(ServerSeq(s.ops.len() as u64))
             })
@@ -296,11 +280,10 @@ impl<'c> Transaction<'c> for MemoryTransaction<'c> {
         Box::pin(async move {
             self.step(|s| {
                 check_reject_reason(reason)?;
-                if s.decided(op) {
+                if s.outcomes.contains_key(&op) {
                     return Err(DbError::Conflict);
                 }
-                s.rejects.insert(op, reason.to_owned());
-                s.raise_last_seq(op);
+                s.decide(op, ReplayOutcome::Rejected(reason.to_owned()));
                 Ok(())
             })
         })
@@ -314,7 +297,7 @@ impl<'c> Transaction<'c> for MemoryTransaction<'c> {
         &'a mut self,
         op: OpId,
     ) -> BoxFuture<'a, Result<Option<ReplayOutcome>, DbError>> {
-        Box::pin(async move { self.step(|s| Ok(s.replay_outcome(op))) })
+        Box::pin(async move { self.step(|s| Ok(s.outcomes.get(&op).cloned())) })
     }
 
     fn next_in_sequence<'a>(&'a mut self, key: &'a str) -> BoxFuture<'a, Result<u64, DbError>> {
@@ -359,7 +342,7 @@ fn failed_earlier() -> DbError {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Writes
+// Writes and queries
 // ---------------------------------------------------------------------------------------------
 
 /// Applies one write to the state, following the rules of [`Write`].
@@ -371,21 +354,12 @@ fn apply_write(s: &mut State, w: &Write) -> Result<(), DbError> {
             fields,
             collections,
         } => {
-            // The id is taken while a live row or a tombstone holds it, in any model.
-            if s.rows.contains_key(row) {
+            // The id is taken while a live row or a deleted one holds it, in any model.
+            if s.rows.contains_key(row) || s.deleted.contains(row) {
                 return Err(DbError::Conflict);
             }
-            let mut stored = Stored {
-                model: *model,
-                version: 1,
-                deleted: false,
-                fields: fields.iter().cloned().collect(),
-                collections: BTreeMap::new(),
-            };
-            for (f, c) in collections {
-                apply_collection(&mut stored, *f, c);
-            }
-            s.rows.insert(*row, stored);
+            let new = LiveRow::inserted(*model, fields, collections);
+            s.rows.insert(*row, Rc::new(new));
         }
         Write::Update {
             model,
@@ -394,361 +368,29 @@ fn apply_write(s: &mut State, w: &Write) -> Result<(), DbError> {
             fields,
             collections,
         } => {
-            let r = live_row(s, *model, *row, *expect_version)?;
-            r.version += 1;
-            r.fields.extend(fields.iter().cloned());
-            for (f, c) in collections {
-                apply_collection(r, *f, c);
-            }
+            // A deleted row is no longer in `rows`, so it is not found like a missing one.
+            let r = s.rows.get_mut(row).ok_or(DbError::NotFound)?;
+            r.check(*model, *expect_version)?;
+            // Copies the row only if a copy of the state still shares it.
+            Rc::make_mut(r).update(fields, collections);
         }
         Write::Delete {
             model,
             row,
             expect_version,
         } => {
-            let r = live_row(s, *model, *row, *expect_version)?;
-            r.version += 1;
-            r.deleted = true;
-            r.fields.clear();
-            r.collections.clear();
+            let r = s.rows.get(row).ok_or(DbError::NotFound)?;
+            r.check(*model, *expect_version)?;
+            s.rows.remove(row);
+            s.deleted.insert(*row);
         }
     }
     Ok(())
 }
 
-/// The live row `row` of `model`, checked against `expect_version`.
-fn live_row(
-    s: &mut State,
-    model: ModelId,
-    row: RowId,
-    expect_version: u64,
-) -> Result<&mut Stored, DbError> {
-    let r = s
-        .rows
-        .get_mut(&row)
-        .filter(|r| r.model == model && !r.deleted)
-        .ok_or(DbError::NotFound)?;
-    if r.version != expect_version {
-        return Err(DbError::VersionMismatch);
-    }
-    Ok(r)
-}
-
-/// Applies the changes of one collection field. A field stored as the other collection kind
-/// starts over as the new kind; the compiler never emits that.
-fn apply_collection(stored: &mut Stored, field: FieldId, change: &CollectionChange) {
-    let state = stored
-        .collections
-        .entry(field)
-        .or_insert_with(|| match change {
-            CollectionChange::Set(_) => CollectionState::Set(Vec::new()),
-            CollectionChange::Map(_) => CollectionState::Map(Vec::new()),
-        });
-    match (change, state) {
-        (CollectionChange::Set(changes), CollectionState::Set(tags)) => {
-            changes.iter().for_each(|c| apply_set_change(tags, c));
-            tags.sort_by(|a, b| compare_key(&a.elem, &b.elem).then(a.tag.cmp(&b.tag)));
-        }
-        (CollectionChange::Map(entries), CollectionState::Map(stored_entries)) => {
-            for e in entries {
-                stored_entries.retain(|x| compare_key(&x.key, &e.key).is_ne());
-                stored_entries.push(e.clone());
-            }
-            stored_entries.sort_by(|a, b| compare_key(&a.key, &b.key));
-        }
-        (_, state) => {
-            *state = match change {
-                CollectionChange::Set(_) => CollectionState::Set(Vec::new()),
-                CollectionChange::Map(_) => CollectionState::Map(Vec::new()),
-            };
-            apply_collection(stored, field, change);
-        }
-    }
-}
-
-/// One tag change of a `Set` field: at most one live tag per (element, replica) (D49).
-fn apply_set_change(tags: &mut Vec<SetTag>, change: &SetChange) {
-    match change {
-        SetChange::Add { elem, tag } => {
-            let same =
-                |t: &SetTag| compare_key(&t.elem, elem).is_eq() && t.tag.replica == tag.replica;
-            match tags.iter_mut().find(|t| same(t)) {
-                // Replay of this add or of an older one of the same replica.
-                Some(t) if t.tag.seq >= tag.seq => {}
-                Some(t) => t.tag = *tag,
-                None => tags.push(SetTag {
-                    elem: elem.clone(),
-                    tag: *tag,
-                }),
-            }
-        }
-        SetChange::Remove { elem, tag } => {
-            tags.retain(|t| !(compare_key(&t.elem, elem).is_eq() && t.tag == *tag));
-        }
-    }
-}
-
-/// Refuses values of enum columns, and of `Map` fields whose values are enums, that are not
-/// declared variants (contract rules in `ostrel_db::api`). `Set` elements and `Map` keys are
-/// not checked (D87).
-fn check_enums(s: &State, writes: &[Write]) -> Result<(), DbError> {
-    let declared = |model: ModelId, f: FieldId, v: &Value| match s.variants(model, f) {
-        Some(vs) if *v != Value::Null => ordinal(vs, v).is_some(),
-        _ => true,
-    };
-    for w in writes {
-        let (Write::Insert {
-            model,
-            fields,
-            collections,
-            ..
-        }
-        | Write::Update {
-            model,
-            fields,
-            collections,
-            ..
-        }) = w
-        else {
-            continue;
-        };
-        let bad_field = fields.iter().any(|(f, v)| !declared(*model, *f, v));
-        let bad_value = collections.iter().any(|(f, c)| match c {
-            CollectionChange::Map(entries) => entries
-                .iter()
-                .filter_map(|e| e.value.as_ref())
-                .any(|v| !declared(*model, *f, v)),
-            CollectionChange::Set(_) => false,
-        });
-        if bad_field || bad_value {
-            return Err(DbError::Invalid("enum value is not a declared variant"));
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------------------------
-// Queries
-// ---------------------------------------------------------------------------------------------
-
-/// Live rows of the queried model in query order, after filter and cursor, at most `limit`.
+/// Runs a query on the state through [`eval::run`].
 fn run_query(s: &State, q: &Query) -> Result<Rows, DbError> {
-    q.check(&s.enums)?;
-    let mut keyed: Vec<(Vec<Value>, Row)> = Vec::new();
-    for (id, r) in &s.rows {
-        if r.model != q.model || r.deleted {
-            continue;
-        }
-        if let Some(f) = &q.filter
-            && !matches!(eval(s, *id, r, f), Ok(v) if truthy(&v))
-        {
-            continue;
-        }
-        let values: Vec<Value> = q
-            .order
-            .iter()
-            .map(|(f, _)| r.fields.get(f).cloned().unwrap_or(Value::Null))
-            .collect();
-        if let Some(c) = &q.after
-            && compare_pos(s, q, (&values, *id), (&c.values, c.id)).is_le()
-        {
-            continue;
-        }
-        let row = Row {
-            id: *id,
-            version: r.version,
-            fields: r.fields.iter().map(|(f, v)| (*f, v.clone())).collect(),
-            collections: r.collections.iter().map(|(f, c)| (*f, c.clone())).collect(),
-        };
-        keyed.push((values, row));
-    }
-    keyed.sort_by(|(va, a), (vb, b)| compare_pos(s, q, (va, a.id), (vb, b.id)));
-    keyed.truncate(q.limit.map_or(usize::MAX, |n| n as usize));
-    Ok(Rows(keyed.into_iter().map(|(_, r)| r).collect()))
-}
-
-/// Query order of two row positions `(sort key values, id)`. [`Query::check`] has made sure a
-/// cursor has one value per sort key.
-fn compare_pos(s: &State, q: &Query, a: (&[Value], RowId), b: (&[Value], RowId)) -> Ordering {
-    for ((f, dir), (x, y)) in q.order.iter().zip(a.0.iter().zip(b.0)) {
-        let o = directed(*dir, column_order(s.variants(q.model, *f), x, y));
-        if o.is_ne() {
-            return o;
-        }
-    }
-    let tie = q.order.last().map_or(Dir::Asc, |(_, d)| *d);
-    directed(tie, a.1.cmp(&b.1))
-}
-
-fn directed(dir: Dir, o: Ordering) -> Ordering {
-    match dir {
-        Dir::Asc => o,
-        Dir::Desc => o.reverse(),
-    }
-}
-
-/// Ordinal of an enum value in declaration order.
-fn ordinal(variants: &[String], v: &Value) -> Option<usize> {
-    match v {
-        Value::Enum(name) => variants.iter().position(|x| x == name),
-        _ => None,
-    }
-}
-
-/// Column order of the contract. `variants` is the declaration order when the column is enum
-/// typed. Writes refuse undeclared variants, so the name fallback only keeps the order total.
-fn column_order(variants: Option<&[String]>, a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Less,
-        (_, Value::Null) => Ordering::Greater,
-        (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
-        (Value::Enum(_), Value::Enum(_)) => {
-            match variants.map(|vs| (ordinal(vs, a), ordinal(vs, b))) {
-                Some((Some(x), Some(y))) => x.cmp(&y),
-                _ => compare_key(a, b),
-            }
-        }
-        _ => compare_key(a, b),
-    }
-}
-
-/// The enum column an operand of a comparison names, if any. [`Query::check`] has refused two
-/// enum columns with different variants (D87), so either side gives the same order.
-fn enum_side<'s>(s: &'s State, model: ModelId, e: &Expr) -> Option<&'s [String]> {
-    let target = |p: &Path| p.hops.last().map_or(model, |h| h.model);
-    match e {
-        Expr::Field(p) => s.variants(target(p), p.field),
-        Expr::MapGet { map, .. } => s.variants(target(map), map.field),
-        Expr::Coalesce(a, _) => enum_side(s, model, a),
-        _ => None,
-    }
-}
-
-/// Ordered comparison of two non null values; `None` makes the comparison false.
-fn ordered(
-    s: &State,
-    model: ModelId,
-    a: &Expr,
-    b: &Expr,
-    x: &Value,
-    y: &Value,
-) -> Option<Ordering> {
-    if let (Value::Enum(_), Value::Enum(_)) = (x, y) {
-        let vs = enum_side(s, model, a).or_else(|| enum_side(s, model, b))?;
-        return Some(ordinal(vs, x)?.cmp(&ordinal(vs, y)?));
-    }
-    Some(column_order(None, x, y))
-}
-
-/// Marker: a hop did not reach a live row, so the whole filter is false (fail closed).
-struct HopFailed;
-
-/// Id and row reached from the row `id` through `hops`.
-fn follow<'s>(
-    s: &'s State,
-    id: RowId,
-    start: &'s Stored,
-    hops: &[Hop],
-) -> Result<(RowId, &'s Stored), HopFailed> {
-    let (mut id, mut row) = (id, start);
-    for hop in hops {
-        let Some(Value::Ref(next)) = row.fields.get(&hop.field) else {
-            return Err(HopFailed);
-        };
-        row = s
-            .rows
-            .get(next)
-            .filter(|r| r.model == hop.model && !r.deleted)
-            .ok_or(HopFailed)?;
-        id = *next;
-    }
-    Ok((id, row))
-}
-
-fn truthy(v: &Value) -> bool {
-    *v == Value::Bool(true)
-}
-
-/// `Eq` of the contract: equal under [`compare_key`], and `Null` equals only `Null`.
-fn equal(x: &Value, y: &Value) -> bool {
-    compare_key(x, y).is_eq() && (*x == Value::Null) == (*y == Value::Null)
-}
-
-/// Evaluates a filter expression on the row `id`. [`Query::check`] bounds the size of the
-/// expression, so the recursion is bounded too.
-fn eval(s: &State, id: RowId, row: &Stored, e: &Expr) -> Result<Value, HopFailed> {
-    let reach = |p: &Path| -> Result<&Stored, HopFailed> { Ok(follow(s, id, row, &p.hops)?.1) };
-    Ok(match e {
-        Expr::Const(v) => v.clone(),
-        Expr::Field(p) => reach(p)?
-            .fields
-            .get(&p.field)
-            .cloned()
-            .unwrap_or(Value::Null),
-        Expr::RowId(hops) => Value::Ref(follow(s, id, row, hops)?.0),
-        Expr::Cmp(op, a, b) => {
-            let (x, y) = (eval(s, id, row, a)?, eval(s, id, row, b)?);
-            let r = match op {
-                CmpOp::Eq => equal(&x, &y),
-                CmpOp::Ne => !equal(&x, &y),
-                _ if x == Value::Null || y == Value::Null => false,
-                _ => ordered(s, row.model, a, b, &x, &y).is_some_and(|o| match op {
-                    CmpOp::Lt => o.is_lt(),
-                    CmpOp::Le => o.is_le(),
-                    CmpOp::Gt => o.is_gt(),
-                    _ => o.is_ge(),
-                }),
-            };
-            Value::Bool(r)
-        }
-        // Every operand is evaluated, so a failed hop anywhere fails the whole filter.
-        Expr::And(items) => {
-            let mut all = true;
-            for i in items {
-                all &= truthy(&eval(s, id, row, i)?);
-            }
-            Value::Bool(all)
-        }
-        Expr::Or(items) => {
-            let mut any = false;
-            for i in items {
-                any |= truthy(&eval(s, id, row, i)?);
-            }
-            Value::Bool(any)
-        }
-        Expr::Not(a) => Value::Bool(!truthy(&eval(s, id, row, a)?)),
-        Expr::InSet { elem, set } => {
-            let x = eval(s, id, row, elem)?;
-            Value::Bool(match reach(set)?.collections.get(&set.field) {
-                Some(CollectionState::Set(tags)) => {
-                    tags.iter().any(|t| compare_key(&t.elem, &x).is_eq())
-                }
-                _ => false,
-            })
-        }
-        Expr::InMap { key, map } => {
-            let k = eval(s, id, row, key)?;
-            Value::Bool(map_get(reach(map)?.collections.get(&map.field), &k).is_some())
-        }
-        Expr::MapGet { map, key } => {
-            let k = eval(s, id, row, key)?;
-            map_get(reach(map)?.collections.get(&map.field), &k).unwrap_or(Value::Null)
-        }
-        Expr::Coalesce(a, c) => match eval(s, id, row, a)? {
-            Value::Null => c.clone(),
-            v => v,
-        },
-    })
-}
-
-/// Value of the not removed entry for `key`.
-fn map_get(state: Option<&CollectionState>, key: &Value) -> Option<Value> {
-    match state {
-        Some(CollectionState::Map(entries)) => entries
-            .iter()
-            .find(|e| compare_key(&e.key, key).is_eq())
-            .and_then(|e| e.value.clone()),
-        _ => None,
-    }
+    let rows = s.rows.iter().filter(|(_, r)| r.model == q.model);
+    let rows = rows.map(|(id, r)| (*id, Rc::clone(r))).collect();
+    eval::run(&s.enums, s, q, rows)
 }
