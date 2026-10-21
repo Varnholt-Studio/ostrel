@@ -14,13 +14,14 @@ pub(super) enum Missing {
 }
 
 /// Checks the body of a function with a result type. Without branches the
-/// last expression statement is the result (SYNTAX 4.10).
+/// last expression statement is the result (SYNTAX 4.10); a `for` is no
+/// branch.
 pub(super) fn missing_return(p: &Program, body: BlockId) -> Option<Missing> {
     let stmts = p.block(body).map_or(&[][..], |b| &b.stmts);
     let branches = stmts.iter().any(|&s| {
         matches!(
             p.stmt(s).map(|st| &st.kind),
-            Some(StmtKind::If { .. } | StmtKind::IfLet { .. } | StmtKind::For { .. })
+            Some(StmtKind::If { .. } | StmtKind::IfLet { .. })
         )
     });
     let last = stmts.last().and_then(|&s| p.stmt(s)).map(|s| &s.kind);

@@ -16,8 +16,8 @@
 //! The checker reports only what it can prove. Where the type of an
 //! expression is not decided yet (properties other than `len` and `trim`,
 //! methods of collections, contextual names, std names other than
-//! `Url.parse`, attribute values of std elements other than `img src` and
-//! `link href`), the expression gets [`Ty::Error`] and nothing is reported,
+//! `Url.parse`, attribute values of std elements other than `img src`,
+//! `link href`, `look` and `scroll`), the expression gets [`Ty::Error`] and nothing is reported,
 //! so a valid program never fails here. Not yet covered: `E0300` and the
 //! ordering of optionals (both stand at the operator, which the HIR does not
 //! record) and placement.
@@ -228,41 +228,11 @@ impl<'p> Cx<'p> {
     }
 
     fn describe(&self, ty: &Ty) -> String {
-        match ty {
-            Ty::Unit => "nothing".to_string(),
-            Ty::Error => "an unknown type".to_string(),
-            _ => format!("`{}`", self.name(ty)),
-        }
+        describe(self.p, ty)
     }
 
     fn name(&self, ty: &Ty) -> String {
-        let def = |d: &DefId| {
-            self.p
-                .def(*d)
-                .map_or("?".to_string(), |d| d.name.to_string())
-        };
-        match ty {
-            Ty::Bool => "Bool".into(),
-            Ty::Int => "Int".into(),
-            Ty::Float => "Float".into(),
-            Ty::Text => "Text".into(),
-            Ty::Time => "Time".into(),
-            Ty::Bytes => "Bytes".into(),
-            Ty::Rank => "Rank".into(),
-            Ty::Url => "Url".into(),
-            Ty::Enum(d) | Ty::Ref(d) => def(d),
-            // The type of `none` alone.
-            Ty::Optional(t) if **t == Ty::Error => "none".into(),
-            Ty::Optional(t) => format!("{}?", self.name(t)),
-            Ty::Set(t) => format!("Set[{}]", self.name(t)),
-            Ty::List(t) => format!("List[{}]", self.name(t)),
-            Ty::Map(k, v) => format!("Map[{}, {}]", self.name(k), self.name(v)),
-            Ty::Remote(t) => format!("Remote {}", self.name(t)),
-            Ty::Rows(d) => format!("rows of {}", def(d)),
-            Ty::Range(t) => format!("range of {}", self.name(t)),
-            Ty::Unit => "nothing".into(),
-            Ty::Error => "?".into(),
-        }
+        ty_name(self.p, ty)
     }
 
     // Statements.
@@ -288,7 +258,7 @@ impl<'p> Cx<'p> {
     fn branches(&self, s: StmtId) -> bool {
         matches!(
             self.p.stmt(s).map(|st| &st.kind),
-            Some(StmtKind::If { .. } | StmtKind::IfLet { .. } | StmtKind::For { .. })
+            Some(StmtKind::If { .. } | StmtKind::IfLet { .. })
         )
     }
 
@@ -455,14 +425,22 @@ impl<'p> Cx<'p> {
             ElementName::View(_) => None,
         };
         for (name, value) in e.attrs.iter() {
-            // URLs of `img` and `link` (SPEC 12.13); the other attribute
-            // types are not declared yet.
+            // URLs of `img` and `link` (SPEC 12.13) and the words of `look`
+            // and `scroll` (SYNTAX 5); the other attribute types are not
+            // declared yet.
+            if let (Some(_), Some(ExprKind::Word { name: word, .. })) =
+                (std, self.p.expr(*value).map(|x| &x.kind))
+                && let Some(v) = std_value(name, word)
+            {
+                self.words.push((*value, Res::Std(StdName::Value(v))));
+                continue;
+            }
             let want = matches!(
                 (std, &**name),
                 (Some("img"), "src") | (Some("link"), "href")
             )
             .then_some(Ty::Url);
-            let found = self.word(*value, want.as_ref(), true);
+            let found = self.word(*value, want.as_ref());
             if let Some(want) = &want {
                 self.expect(*value, want, &found);
             }
@@ -510,7 +488,7 @@ impl<'p> Cx<'p> {
                 Ty::Text
             }
             ExprKind::Name(res) => self.name_ty(*res),
-            ExprKind::Word { .. } => self.word(e, None, false),
+            ExprKind::Word { .. } => self.word(e, None),
             ExprKind::Unary { op, operand } => {
                 let want = match op {
                     UnaryOp::Neg => Ty::Int,
@@ -558,12 +536,24 @@ impl<'p> Cx<'p> {
                 ..
             } => {
                 // SYNTAX 4.4: a none element is not in the collection; a map
-                // holds its keys.
+                // holds its keys. A collection literal takes its element type
+                // from the element, unless the element is a word (D142).
+                let set = match p.expr(*collection).map(|x| &x.kind) {
+                    Some(ExprKind::Set(_)) => Some(true),
+                    Some(ExprKind::List(_)) => Some(false),
+                    _ => None,
+                };
+                if let Some(set) = set.filter(|_| !self.is_word(*element)) {
+                    let item = Box::new(unwrap_optional(self.expr(*element)));
+                    let want = if set { Ty::Set(item) } else { Ty::List(item) };
+                    self.hinted(*collection, &want);
+                    return Ty::Bool;
+                }
                 let item = match self.expr(*collection) {
                     Ty::Set(t) | Ty::List(t) | Ty::Range(t) | Ty::Map(t, _) => Some(*t),
                     _ => None,
                 };
-                let found = unwrap_optional(self.word(*element, item.as_ref(), false));
+                let found = unwrap_optional(self.word(*element, item.as_ref()));
                 if let Some(t) = &item {
                     self.expect(*element, t, &found);
                 }
@@ -725,7 +715,7 @@ impl<'p> Cx<'p> {
                 inner.clone()
             }
             _ => {
-                let found = self.word(e, Some(want), false);
+                let found = self.word(e, Some(want));
                 self.expect(e, want, &found);
                 if matches!(kind, Some(ExprKind::NoneValue)) && fits(want, &found) {
                     self.retype(e, want);
@@ -776,15 +766,17 @@ impl<'p> Cx<'p> {
     }
 
     fn binary(&mut self, op: BinaryOp, lhs: ExprId, rhs: ExprId) -> Ty {
-        // A word takes its type from the other operand (D142).
-        let (l, r) = match (self.is_word(lhs), self.is_word(rhs)) {
+        // A word or a collection literal takes its type from the other
+        // operand (D142).
+        let takes = |cx: &Self, e| cx.is_word(e) || cx.is_literal(e);
+        let (l, r) = match (takes(self, lhs), takes(self, rhs)) {
             (true, false) => {
                 let r = self.expr(rhs);
-                (self.word(lhs, Some(&r), false), r)
+                (self.hinted(lhs, &r), r)
             }
             (false, true) => {
                 let l = self.expr(lhs);
-                let r = self.word(rhs, Some(&l), false);
+                let r = self.hinted(rhs, &l);
                 (l, r)
             }
             _ => (self.expr(lhs), self.expr(rhs)),
@@ -890,6 +882,35 @@ impl<'p> Cx<'p> {
         }
     }
 
+    fn is_literal(&self, e: ExprId) -> bool {
+        matches!(
+            self.p.expr(e).map(|x| &x.kind),
+            Some(ExprKind::Set(_) | ExprKind::List(_) | ExprKind::Map(_))
+        )
+    }
+
+    /// Checks a word or a collection literal against the type `want` of the
+    /// other side, if `want` says what it means: a literal of the shape of
+    /// `want` is checked element by element (E0304 at the element). Anything
+    /// else is inferred, and the caller compares.
+    fn hinted(&mut self, e: ExprId, want: &Ty) -> Ty {
+        let shaped = match (
+            self.p.expr(e).map(|x| &x.kind),
+            unwrap_optional(want.clone()),
+        ) {
+            (Some(ExprKind::Set(_)), Ty::Set(w)) | (Some(ExprKind::List(_)), Ty::List(w)) => {
+                *w != Ty::Error
+            }
+            (Some(ExprKind::Map(_)), Ty::Map(k, v)) => *k != Ty::Error && *v != Ty::Error,
+            _ => false,
+        };
+        if shaped {
+            self.value(e, want)
+        } else {
+            self.word(e, Some(want))
+        }
+    }
+
     fn is_word(&self, e: ExprId) -> bool {
         matches!(self.p.expr(e).map(|x| &x.kind), Some(ExprKind::Word { .. }))
     }
@@ -898,10 +919,7 @@ impl<'p> Cx<'p> {
     /// `want` with a variant of that name wins, else what the name binds
     /// where it stands, else E0200 at the word naming the expected type or
     /// the enums that declare the name. Any other expression is inferred.
-    /// An attribute word that binds nothing and has neither an expected type
-    /// nor a candidate enum stays undecided (`attribute`): the attribute
-    /// types of the std elements are not declared yet.
-    fn word(&mut self, e: ExprId, want: Option<&Ty>, attribute: bool) -> Ty {
+    fn word(&mut self, e: ExprId, want: Option<&Ty>) -> Ty {
         let p = self.p;
         let Some(ExprKind::Word { name, lexical }) = p.expr(e).map(|x| &x.kind) else {
             return self.expr(e);
@@ -929,12 +947,6 @@ impl<'p> Cx<'p> {
         let res = match chosen {
             Some((d, v)) => Res::Variant(d, v),
             None if *lexical != Res::Error => *lexical,
-            None if attribute && want.is_none() && candidates.is_empty() => {
-                if let Some(slot) = self.exprs.get_mut(e.index()) {
-                    *slot = Some(Ty::Error);
-                }
-                return Ty::Error;
-            }
             None => {
                 let enums: Vec<String> = candidates
                     .iter()
@@ -1047,6 +1059,54 @@ impl<'p> Cx<'p> {
             self.value(a, want);
         }
     }
+}
+
+/// A type as diagnostics name it: `nothing`, `an unknown type` or the
+/// type in backticks.
+pub(crate) fn describe(p: &Program, ty: &Ty) -> String {
+    match ty {
+        Ty::Unit => "nothing".to_string(),
+        Ty::Error => "an unknown type".to_string(),
+        _ => format!("`{}`", ty_name(p, ty)),
+    }
+}
+
+fn ty_name(p: &Program, ty: &Ty) -> String {
+    let def = |d: &DefId| p.def(*d).map_or("?".to_string(), |d| d.name.to_string());
+    let name = |t: &Ty| ty_name(p, t);
+    match ty {
+        Ty::Bool => "Bool".into(),
+        Ty::Int => "Int".into(),
+        Ty::Float => "Float".into(),
+        Ty::Text => "Text".into(),
+        Ty::Time => "Time".into(),
+        Ty::Bytes => "Bytes".into(),
+        Ty::Rank => "Rank".into(),
+        Ty::Url => "Url".into(),
+        Ty::Enum(d) | Ty::Ref(d) => def(d),
+        // The type of `none` alone.
+        Ty::Optional(t) if **t == Ty::Error => "none".into(),
+        Ty::Optional(t) => format!("{}?", name(t)),
+        Ty::Set(t) => format!("Set[{}]", name(t)),
+        Ty::List(t) => format!("List[{}]", name(t)),
+        Ty::Map(k, v) => format!("Map[{}, {}]", name(k), name(v)),
+        Ty::Remote(t) => format!("Remote {}", name(t)),
+        Ty::Rows(d) => format!("rows of {}", def(d)),
+        Ty::Range(t) => format!("range of {}", name(t)),
+        Ty::Unit => "nothing".into(),
+        Ty::Error => "?".into(),
+    }
+}
+
+/// The word `word` of the fixed vocabulary of the std attribute `attr`
+/// (SYNTAX 5).
+fn std_value(attr: &str, word: &str) -> Option<&'static str> {
+    let words: &[&'static str] = match attr {
+        "look" => &["title", "strong", "muted"],
+        "scroll" => &["end"],
+        _ => &[],
+    };
+    words.iter().copied().find(|w| *w == word)
 }
 
 /// True if a value of type `found` may stand where `want` is required.

@@ -775,6 +775,7 @@ impl<'a> Rx<'a> {
         if matches!(f.result, Ty::Unit | Ty::Error) {
             return;
         }
+        let result = crate::check::describe(&self.p, &f.result);
         match flow::missing_return(&self.p, body) {
             Some(flow::Missing::Implicit(e)) => {
                 let span = self.p.expr(e).map(|x| x.span);
@@ -791,8 +792,8 @@ impl<'a> Rx<'a> {
                 codes::MISSING_RETURN,
                 name.range,
                 format!(
-                    "`{}` can end without returning a value; add `return`",
-                    name.text
+                    "`{}` can end without returning {}; add `return`",
+                    name.text, result
                 ),
             ),
             None => {}
@@ -1305,7 +1306,16 @@ impl<'a> Rx<'a> {
                 callee: self.expr(*callee),
                 args: args.iter().map(|&a| self.expr(a)).collect(),
             },
-            ast::ExprKind::Paren(inner) => return self.expr(*inner),
+            // The span of a parenthesized expression keeps its parentheses,
+            // as in the v0.1 checker.
+            ast::ExprKind::Paren(inner) => {
+                let e = self.expr(*inner);
+                let span = self.span(range);
+                if let Some(x) = self.p.exprs.get_mut(e.index()) {
+                    x.span = span;
+                }
+                return e;
+            }
             ast::ExprKind::Keyword(k) => match k {
                 ast::KeywordValue::NoneValue => ExprKind::NoneValue,
                 ast::KeywordValue::Me => ExprKind::Me,

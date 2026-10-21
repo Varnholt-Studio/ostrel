@@ -54,6 +54,9 @@ pub enum StdName {
     /// `Url`, as in `Url.parse(t)` (SYNTAX 4.8); in a type position it is
     /// [`Ty::Url`].
     Url,
+    /// A word of the fixed vocabulary of a std attribute (`look: strong`,
+    /// `scroll: end`, SYNTAX 5), set by `check` (D142).
+    Value(&'static str),
 }
 
 /// An expression with its source position and, after `check`, its type.

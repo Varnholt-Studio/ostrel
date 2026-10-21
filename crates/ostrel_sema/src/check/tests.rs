@@ -193,8 +193,11 @@ fn mismatch_in_assignment() {
 fn mismatch_in_set_literal_and_in() {
     let src = with_note("fn f() -> Bool\n  return 1 in {2, \"x\"}\n");
     assert_eq!(diags(&src), ["E0304 8:19"]);
+    // A set literal takes the element type of the element (D142), so the
+    // finding stands at the literal's element, as for the right operand of
+    // `==`.
     let src = with_note("fn f() -> Bool\n  return \"a\" in {1}\n");
-    assert_eq!(diags(&src), ["E0304 8:10"]);
+    assert_eq!(diags(&src), ["E0304 8:18"]);
 }
 
 // SYNTAX 4.4: `x in c` with `x` none is false, so an optional element fits.
@@ -280,7 +283,7 @@ fn none_is_named_in_messages() {
 fn optional_element_must_fit_inside() {
     assert_eq!(
         diags("app A\ndata Post\n  n: Int?\n  see if n in {\"a\"}\n"),
-        ["E0304 4:10"]
+        ["E0304 4:16"]
     );
 }
 
@@ -849,4 +852,80 @@ fn ac_29_ranges_and_remote_values_join() {
         _ => None,
     });
     assert_eq!(var, Some(Ty::List(Box::new(Ty::Range(Box::new(Ty::Int))))));
+}
+
+// T204 fix after yannick #2502 and ivo #2505.
+
+#[test]
+fn ac_29_collection_literal_takes_the_type_of_the_other_side() {
+    // `in`: the literal takes the element type (Y1).
+    for literal in ["{open, shut}", "[open]"] {
+        clean(&format!(
+            "{WORDS}fn f(c: Card) -> Bool\n  return c.door in {literal}\n"
+        ));
+    }
+    // `==`: the literal takes the type of the other operand (G2).
+    clean(&format!(
+        "{WORDS}fn f(xs: List[Phase]) -> Bool\n  return xs == [open]\n"
+    ));
+    clean(&format!(
+        "{WORDS}fn f(xs: List[Phase]) -> Bool\n  return [open] != xs\n"
+    ));
+    // A wrong element is reported at the element.
+    let src = format!("{WORDS}fn f(c: Card) -> Bool\n  return c.door in {{open, 1}}\n");
+    assert_eq!(diags(&src), ["E0304 11:27"]);
+    let src = format!("{WORDS}fn f(xs: List[Phase]) -> Bool\n  return xs == [shut]\n");
+    assert_eq!(diags(&src), ["E0304 11:17"]);
+}
+
+#[test]
+fn ac_29_attribute_words_are_decided() {
+    let (program, diagnostics) = run(&with_note(
+        "view Main\n  text \"a\" look: strong\n  col scroll: end\n    text \"b\" look: muted\n",
+    ));
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert!(
+        !program
+            .exprs
+            .iter()
+            .any(|e| matches!(e.kind, ExprKind::Word { .. })),
+        "a word is left after check"
+    );
+    let src = with_note("view Main\n  text \"a\" look: loud\n");
+    assert_eq!(diags(&src), ["E0200 8:18"]);
+    let src = with_note("view Main\n  text \"a\" scroll: strong\n");
+    assert_eq!(diags(&src), ["E0200 8:20"]);
+}
+
+#[test]
+fn ac_29_for_is_no_branch() {
+    clean(&with_note(
+        "server fn count() -> Int\n  for n in Note\n    drop n\n  0\n",
+    ));
+    let src = with_note("server fn count() -> Int\n  for n in Note\n    drop n\n  \"x\"\n");
+    assert_eq!(diags(&src), ["E0304 10:3"]);
+}
+
+#[test]
+fn ac_29_missing_return_names_the_result_type() {
+    let src = with_note("fn sign(n: Int) -> Int?\n  let m = n\n");
+    let module = parse(&src);
+    let (_, d) = hir::resolve(&[hir::Source {
+        file: FILE,
+        text: &src,
+        module: &module,
+    }]);
+    let messages: Vec<_> = d.into_iter().map(|d| d.message).collect();
+    assert_eq!(
+        messages,
+        ["`sign` can end without returning `Int?`; add `return`"]
+    );
+}
+
+#[test]
+fn ac_29_parenthesized_lower_bound_is_reported_at_the_parenthesis() {
+    assert_eq!(
+        diags("app A\ndata T\n  n: Int\n  check n in (3)..1\n"),
+        ["E0311 4:14"]
+    );
 }
