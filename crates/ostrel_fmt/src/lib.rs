@@ -40,7 +40,7 @@
 mod print;
 pub mod space;
 
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 
 use ostrel_core::{Diagnostic, FileId};
 use ostrel_syntax::lex::{self, Token, TokenKind};
@@ -132,14 +132,19 @@ struct Digest {
 }
 
 fn digest(src: &str, tokens: &[Token]) -> Digest {
-    let mut h = DefaultHasher::new();
+    let mut h = Fold::default();
     for tok in tokens {
         tok.kind.hash(&mut h);
         match tok.kind {
             TokenKind::Nl | TokenKind::Indent | TokenKind::Dedent | TokenKind::Eof => {}
             TokenKind::Comment => {
-                for line in comment_lines(text(src, *tok)) {
-                    line.hash(&mut h);
+                let body = text(src, *tok);
+                if body.contains('\n') {
+                    for line in comment_lines(body) {
+                        line.hash(&mut h);
+                    }
+                } else {
+                    body.trim_end().hash(&mut h);
                 }
             }
             _ => text(src, *tok).hash(&mut h),
@@ -148,6 +153,36 @@ fn digest(src: &str, tokens: &[Token]) -> Digest {
     Digest {
         count: tokens.len(),
         hash: h.finish(),
+    }
+}
+
+/// A fast hash for [`digest`]: eight bytes per step. It guards against
+/// formatter defects, not against chosen input: the formatter's output is a
+/// function of its input, so an input cannot pick a colliding output.
+#[derive(Default)]
+struct Fold(u64);
+
+impl Hasher for Fold {
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(chunk);
+            self.0 = (self.0 ^ u64::from_le_bytes(word))
+                .wrapping_mul(K)
+                .rotate_left(29);
+        }
+        let mut word = [0u8; 8];
+        for (w, b) in word.iter_mut().zip(chunks.remainder()) {
+            *w = *b;
+        }
+        let tail = u64::from_le_bytes(word) ^ ((bytes.len() as u64) << 56);
+        self.0 = (self.0 ^ tail).wrapping_mul(K).rotate_left(29);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 

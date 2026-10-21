@@ -188,7 +188,13 @@ impl Printer<'_> {
         }
 
         if comment {
-            let mut lines = comment_lines(text(self.src, tok));
+            let body = text(self.src, tok);
+            if !body.contains('\n') {
+                self.push_str(body.trim_end());
+                self.prev_end = tok.span.end as usize;
+                return;
+            }
+            let mut lines = comment_lines(body);
             if let Some(first) = lines.next() {
                 self.push_str(first);
             }
@@ -298,15 +304,23 @@ impl Printer<'_> {
     }
 
     fn push_spaces(&mut self, n: usize) {
-        for _ in 0..n {
-            self.out.push(' ');
+        const SPACES: &str = "                                ";
+        let mut left = n;
+        while left > 0 {
+            let step = left.min(SPACES.len());
+            self.out.push_str(SPACES.get(..step).unwrap_or(""));
+            left -= step;
         }
         self.width += n;
     }
 
     fn push_str(&mut self, s: &str) {
         self.out.push_str(s);
-        self.width += s.chars().count();
+        self.width += if s.is_ascii() {
+            s.len()
+        } else {
+            s.chars().count()
+        };
     }
 
     /// Ends the current output line.
