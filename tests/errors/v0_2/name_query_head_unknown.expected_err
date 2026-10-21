@@ -1,0 +1,1 @@
+tests/errors/v0_2/name_query_head_unknown.ostl:4:12: error[E0200]: unknown data type `Nope`

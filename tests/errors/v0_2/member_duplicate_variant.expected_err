@@ -1,0 +1,1 @@
+tests/errors/v0_2/member_duplicate_variant.ostl:3:28: error[E0206]: variant `red` is already declared in `Color`

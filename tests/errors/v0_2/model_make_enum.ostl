@@ -1,0 +1,6 @@
+app Golden
+
+enum Color = red | green
+
+fn f()
+  make Color { a: 1 }

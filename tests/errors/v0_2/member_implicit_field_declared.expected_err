@@ -1,0 +1,1 @@
+tests/errors/v0_2/member_implicit_field_declared.ostl:4:3: error[E0206]: field `id` is an implicit field of every row in `Post`

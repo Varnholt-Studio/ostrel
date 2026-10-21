@@ -1,0 +1,1 @@
+tests/errors/v0_2/member_duplicate_make_field.ostl:8:23: error[E0206]: field `pos` is already given in this `make`
