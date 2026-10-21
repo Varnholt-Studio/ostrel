@@ -1,0 +1,1 @@
+tests/errors/lex_css_unclosed_comment.ostl:4:5: error[E0015]: unterminated `/*` comment in a `style` block; close it with `*/`

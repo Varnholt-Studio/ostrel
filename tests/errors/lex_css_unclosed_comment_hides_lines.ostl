@@ -1,0 +1,11 @@
+style
+  .a {
+    color: red;
+  }
+  /* rows below stay hidden until this comment is closed
+  .b { color: blue; }
+    fn main() @ ;
+      "x
+
+fn main()
+  print(1)
