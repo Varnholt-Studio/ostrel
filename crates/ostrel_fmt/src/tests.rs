@@ -254,3 +254,49 @@ fn formatting_is_linear_in_the_number_of_comment_lines() -> Result<(), String> {
         ))
     }
 }
+
+#[test]
+fn tokens_that_would_merge_keep_a_space() {
+    use crate::space::{Side, space};
+    use ostrel_syntax::lex::{Keyword, TokenKind as K};
+    let unary_minus = Side::flagged(K::Minus, true);
+    let word = [K::Ident, K::Int, K::Kw(Keyword::Me), K::Kw(Keyword::None)];
+    let mut pairs = vec![
+        (Side::plain(K::Dot), Side::plain(K::Dot)),
+        (Side::plain(K::Dot), Side::plain(K::DotDot)),
+        (Side::plain(K::DotDot), Side::plain(K::Dot)),
+        (Side::plain(K::DotDot), Side::plain(K::DotDot)),
+        (Side::plain(K::Question), Side::plain(K::Question)),
+        (Side::plain(K::Question), Side::plain(K::QuestionQuestion)),
+        (unary_minus, Side::plain(K::Minus)),
+        (unary_minus, Side::plain(K::Gt)),
+        (unary_minus, Side::plain(K::Ge)),
+        (unary_minus, Side::plain(K::Arrow)),
+    ];
+    for a in word {
+        for b in word {
+            pairs.push((Side::plain(a), Side::plain(b)));
+        }
+    }
+    for (a, b) in pairs {
+        assert!(space(a, b), "no space between {a:?} and {b:?}");
+    }
+}
+
+#[test]
+fn format_keeps_tokens_apart_that_would_merge() {
+    // These texts lex but do not parse, so only `format` reaches them; the
+    // spacing rules alone would write `a...b`, `b??` and `-->`.
+    for (src, want) in [
+        ("a.. .b ? ?\n", "a.. .b? ?\n"),
+        ("a . .. b\n", "a. ..b\n"),
+        ("a - - > b\n", "a - - > b\n"),
+        ("a - - >= b\n", "a - - >= b\n"),
+        ("a - - -> b\n", "a - - -> b\n"),
+    ] {
+        let (tokens, diags) = ostrel_syntax::lex::lex(src, FILE);
+        assert!(!diags.iter().any(|d| d.is_error()), "{src:?}: {diags:?}");
+        let got = format(src, FILE, &tokens).map(|f| f.text);
+        assert_eq!(got, Ok(want.to_string()), "{src:?}");
+    }
+}
