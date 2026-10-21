@@ -638,6 +638,8 @@ golden!(parse_unclosed_paren);
 golden!(parse_continuation_bracket_same_column);
 golden!(parse_continuation_brace_same_column);
 golden!(parse_continuation_paren_not_deeper);
+golden!(parse_continuation_closer_closes_over);
+golden!(parse_continuation_closer_next_line);
 golden!(parse_keyword_as_name);
 // `parse_comparison_chain` (E0027) belongs to the expression parser (T1-3b).
 

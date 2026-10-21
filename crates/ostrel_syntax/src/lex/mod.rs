@@ -22,11 +22,11 @@
 //! * Blank lines and lines holding only a comment produce no `Nl`, `Indent` or
 //!   `Dedent`, and their leading whitespace is not checked (SPEC 12.2).
 //! * A logical line continues over a line end inside an open `(`, `[` or `{`
-//!   (SYNTAX 3, SPEC 12.2, D164); see [`continues_line`]. The lexer counts
-//!   open levels of all three kinds together: `(` and `[` always open one, a
-//!   `{` only in operand position ([`brace_opens_level`]), any closing
-//!   bracket closes one, and a closing bracket with nothing open changes
-//!   nothing. Matching kinds is the parser's job.
+//!   (SYNTAX 3, SPEC 12.2, D164); see [`continues_line`]. The lexer keeps the
+//!   open levels on one stack of kinds (D166): `(` and `[` always open one, a
+//!   `{` only in operand position ([`brace_opens_level`]). A closing bracket
+//!   closes the nearest open level of its own kind and every level above it;
+//!   with no open level of its kind it changes nothing.
 //! * While a level is open, a physical line continues the logical line only
 //!   if its first token stands deeper than the first token of the logical
 //!   line or is `)`, `]` or `}`. Any other line drops every open level, gets
@@ -65,6 +65,7 @@
 //! diagnostic for an `Error` token. A `;` is reported once and then acts as a
 //! line end, so the statements on both sides still parse.
 
+mod brackets;
 pub mod codes;
 mod css;
 mod literal;
@@ -73,6 +74,7 @@ mod token;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use brackets::{Brackets, bracket_of};
 pub use token::{Keyword, Token, TokenKind};
 
 use ostrel_core::{Diagnostic, FileId, Span};
@@ -153,7 +155,7 @@ pub fn lex_with<L: LiteralScan + ?Sized>(
         tokens: Vec::new(),
         diags: Vec::new(),
         indents: vec![0],
-        open: 0,
+        open: Brackets::new(),
         judge: false,
         held_end: (0, 0),
         line_first_at: 0,
@@ -258,8 +260,8 @@ struct Lexer<'a, L: ?Sized> {
     /// Stack of indentation columns of the open blocks. The first entry is
     /// column 0 and is never popped.
     indents: Vec<u32>,
-    /// Number of open brackets that continue a line.
-    open: u32,
+    /// Open levels of brackets that continue a line, by kind (D166).
+    open: Brackets<()>,
     /// A line end passed while a level was open: the next physical line with
     /// code is judged by [`Self::judge_continuation`].
     judge: bool,
@@ -294,10 +296,10 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             self.pos = '\u{FEFF}'.len_utf8();
         }
         loop {
-            if self.judge && self.open > 0 {
+            if self.judge && !self.open.is_empty() {
                 self.judge_continuation();
             }
-            if self.at_line_start && self.open == 0 {
+            if self.at_line_start && self.open.is_empty() {
                 self.line_start();
             }
             let Some(c) = self.peek() else { break };
@@ -428,7 +430,7 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
     fn line_end(&mut self, len: usize) {
         let start = self.pos;
         self.pos += len;
-        if self.open == 0 {
+        if self.open.is_empty() {
             self.judge = false;
             self.end_line(start, self.pos);
         } else {
@@ -472,7 +474,7 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         if width_of(indent) > self.logical_column() {
             return;
         }
-        self.open = 0;
+        self.open.clear();
         let (start, end) = self.held_end;
         self.end_line(start, end);
     }
@@ -535,7 +537,7 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
                 self.error(codes::SEMICOLON, start, start + 1, codes::MSG_SEMICOLON);
                 // Recovery: the `;` separates statements like a line end.
                 self.pos += 1;
-                if self.open == 0 && self.line_has_tokens && !self.in_string {
+                if self.open.is_empty() && self.line_has_tokens && !self.in_string {
                     self.push(TokenKind::Nl, start, self.pos);
                     self.line_has_tokens = false;
                     self.line_first = self.tokens.len();
@@ -569,18 +571,24 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             let before = code.next();
             brace_opens_level(before, code.next())
         };
-        if opens && continues_line(bracket) {
-            self.open = self.open.saturating_add(1);
+        if opens
+            && continues_line(bracket)
+            && let Some((k, _)) = bracket_of(kind)
+        {
+            self.open.push(k, ());
         }
         (kind, 1)
     }
 
-    /// A closing bracket for the opening `bracket`: one open level less. With
-    /// nothing open it changes nothing, so a stray closer never ends a line
-    /// early or lets a later opener leak.
+    /// A closing bracket for the opening `bracket`: closes the nearest open
+    /// level of its own kind and every level above it (D166). With no open
+    /// level of its kind it changes nothing, so a stray closer never ends a
+    /// line early or lets a later opener leak.
     fn close_bracket(&mut self, bracket: char, kind: TokenKind) -> (TokenKind, usize) {
-        if continues_line(bracket) {
-            self.open = self.open.saturating_sub(1);
+        if continues_line(bracket)
+            && let Some((k, _)) = bracket_of(kind)
+        {
+            let _ = self.open.close(k);
         }
         (kind, 1)
     }
@@ -686,18 +694,20 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
     fn string_inner(&mut self) {
         let quote = self.pos;
         let first_token = self.tokens.len();
-        let open_before = self.open;
+        let open_before = self.open.len();
         self.mark_code(quote);
         let (end, stop) = self.text(quote + 1);
         self.pos = end;
         match stop {
             TextStop::Quote => return self.push(TokenKind::Str, quote, end),
             TextStop::LineEnd => {
-                let open = self.open;
-                return self.cut_text(quote, first_token, open);
+                return self.cut_text(quote, first_token, open_before);
             }
             TextStop::Brace => self.push(TokenKind::StrHead, quote, end),
         }
+        // A closer inside the interpolation never closes a level opened
+        // before the string.
+        self.open.floor();
         let mut depth: u32 = 1;
         loop {
             let Some(c) = self.peek() else {
@@ -739,7 +749,8 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
                     self.pos = end;
                     match stop {
                         TextStop::Quote => {
-                            self.open = open_before;
+                            self.open.unfloor();
+                            self.open.truncate(open_before);
                             return self.push(TokenKind::StrTail, piece, end);
                         }
                         TextStop::Brace => self.push(TokenKind::StrMid, piece, end),
@@ -799,7 +810,7 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
     /// every other case only the line that holds the opening quote belongs to
     /// the string, and the next line is lexed as usual, so a second real fault
     /// there keeps its own E0003.
-    fn cut_text(&mut self, quote: usize, first_token: usize, open_before: u32) {
+    fn cut_text(&mut self, quote: usize, first_token: usize, open_before: usize) {
         let Some(close) = self.closing_quote_on_next_line() else {
             return self.unterminated_in(quote, first_token, open_before);
         };
@@ -861,7 +872,7 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
     /// The line end that cut the string also ends the logical line, even inside
     /// an open `(`, so a missing quote does not pull the following lines into
     /// the statement and cause follow up diagnostics.
-    fn unterminated_in(&mut self, quote: usize, first_token: usize, open_before: u32) {
+    fn unterminated_in(&mut self, quote: usize, first_token: usize, open_before: usize) {
         self.error(
             codes::UNTERMINATED_STRING,
             quote,
@@ -869,14 +880,14 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
             codes::MSG_UNTERMINATED_STRING,
         );
         self.collapse(quote, first_token, open_before);
-        self.open = 0;
+        self.open.clear();
     }
 
     /// Recovery after E0006 or E0007: skips the rest of the string without
     /// further diagnostics, counting braces from `depth`, and collapses the
     /// string into one `Error` token. Stops after the `"` that ends the string
     /// or before a line end.
-    fn skip_string(&mut self, quote: usize, first_token: usize, open_before: u32, depth: u32) {
+    fn skip_string(&mut self, quote: usize, first_token: usize, open_before: usize, depth: u32) {
         let mut depth = depth;
         while let Some(c) = self.peek() {
             if c == '\n' || (c == '\r' && self.peek_at(1) == Some('\n')) {
@@ -915,9 +926,10 @@ impl<L: LiteralScan + ?Sized> Lexer<'_, L> {
         }
     }
 
-    fn collapse(&mut self, quote: usize, first_token: usize, open_before: u32) {
+    fn collapse(&mut self, quote: usize, first_token: usize, open_before: usize) {
         self.tokens.truncate(first_token);
-        self.open = open_before;
+        self.open.unfloor();
+        self.open.truncate(open_before);
         self.push(TokenKind::Error, quote, self.pos);
     }
 

@@ -79,6 +79,16 @@ pub fn msg_unclosed(kind: crate::lex::TokenKind) -> &'static str {
         _ => MSG_UNCLOSED_PAREN,
     }
 }
+
+/// Message of [`EXPECTED`] at a closer with no open bracket of its kind on
+/// its logical line (D166).
+pub fn msg_stray(kind: crate::lex::TokenKind) -> &'static str {
+    match kind {
+        crate::lex::TokenKind::RBracket => "unmatched `]`",
+        crate::lex::TokenKind::RBrace => "unmatched `}`",
+        _ => "unmatched `)`",
+    }
+}
 /// Message of [`COMPARISON_CHAIN`].
 pub const MSG_COMPARISON_CHAIN: &str = "comparisons do not chain; write `a < b and b < c`";
 /// Message of [`UNEXPECTED_INDENT`].

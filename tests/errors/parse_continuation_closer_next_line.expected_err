@@ -1,0 +1,4 @@
+tests/errors/parse_continuation_closer_next_line.ostl:2:8: error[E0025]: unclosed `(`
+tests/errors/parse_continuation_closer_next_line.ostl:4:8: error[E0025]: unclosed `(`
+tests/errors/parse_continuation_closer_next_line.ostl:5:4: error[E0028]: unmatched `]`
+tests/errors/parse_continuation_closer_next_line.ostl:6:3: error[E0028]: unmatched `)`

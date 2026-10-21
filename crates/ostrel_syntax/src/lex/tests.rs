@@ -613,10 +613,11 @@ fn mixed_nesting_over_several_lines() {
 }
 
 #[test]
-fn a_mismatched_closer_still_closes_one_level() {
-    // The lexer does not match bracket kinds (the parser reports the
-    // mismatch). Any closer ends one level, so a typo cannot pull the rest of
-    // the file into one logical line.
+fn a_closer_closes_its_own_kind_and_every_level_above_it() {
+    // D166: the open levels are a stack of kinds. A closer with no open level
+    // of its kind changes nothing, so the level that is really open stays
+    // open and a deeper line continues it (the parser reports the open
+    // bracket, ARCHITECTURE 3.5).
     for src in [
         "a (]\n  b\n",
         "a [)\n  b\n",
@@ -625,8 +626,37 @@ fn a_mismatched_closer_still_closes_one_level() {
         "a [}\n  b\n",
     ] {
         let k = kinds(src);
-        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 2, "{src:?}: {k:?}");
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 1, "{src:?}: {k:?}");
+        assert!(!k.contains(&Indent), "{src:?}: {k:?}");
     }
+    // A closer of an open kind closes the nearest level of its kind and every
+    // level above it: nothing stays open, and a deeper line below is a block.
+    for src in [
+        "a ([)\n  b\n",
+        "a [(]\n  b\n",
+        "a = {(}\n  b\n",
+        "fn f(a: Set[Int)\n  b\n",
+        "a ([{)\n  b\n",
+    ] {
+        let k = kinds(src);
+        assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 2, "{src:?}: {k:?}");
+        assert!(k.contains(&Indent), "{src:?}: {k:?}");
+    }
+    // The nearest level of the kind, not the outermost: `)` closes the inner
+    // `(`, and the outer `(` keeps the line open.
+    let k = kinds("a ((])\n  b\nc\n");
+    assert_eq!(k.iter().filter(|&&t| t == Nl).count(), 2, "{k:?}");
+    assert!(!k.contains(&Indent), "{k:?}");
+}
+
+#[test]
+fn many_closers_of_another_kind_stay_linear() {
+    // Hostile input: a long run of openers of one kind and closers of
+    // another must not make the closer search quadratic.
+    let n = 200_000;
+    let src = format!("a {}{}\nb\n", "(".repeat(n), "]".repeat(n));
+    let k = kinds(&src);
+    assert_eq!(k.len(), 2 * n + 5, "openers, closers, a, Nl, b, Nl, Eof");
 }
 
 #[test]

@@ -1,0 +1,2 @@
+tests/errors/parse_continuation_closer_closes_over.ostl:1:12: error[E0025]: unclosed `[`
+tests/errors/parse_continuation_closer_closes_over.ostl:5:4: error[E0025]: unclosed `(`

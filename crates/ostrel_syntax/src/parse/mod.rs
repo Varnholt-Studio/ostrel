@@ -44,10 +44,15 @@
 //!   [`parse_with`], never from the shape of the tokens, so every fault the
 //!   lexer reports (an `Error` token, a tab, a jump of indentation and so on)
 //!   is covered the same way.
-//! * A `(`, `[` or `{` that is not closed on its logical line is reported
-//!   once at the outermost such bracket (E0025, D164) before anything else on
-//!   that line. The lexer ends a continuation at a line that is not deeper,
-//!   so an open bracket never takes the rest of the file.
+//! * Bracket faults of a logical line give one diagnostic, the earliest,
+//!   before anything else on that line (D166): E0025 at a `(`, `[` or `{`
+//!   still open at the line end or closed over by a closer of another kind,
+//!   E0028 at a closer with no open bracket of its kind. A closer closes the
+//!   nearest open bracket of its own kind and every bracket above it, as in
+//!   the lexer. On the directly following logical line a closer of a bracket
+//!   left open (and so already reported) is dropped without a diagnostic.
+//!   The lexer ends a continuation at a line that is not deeper, so an open
+//!   bracket never takes the rest of the file.
 //! * After `{` at the end of a block head (E0022), the matching lone `}` line
 //!   is skipped without a diagnostic.
 //!
@@ -169,6 +174,34 @@ struct Lines {
     unclosed: Vec<Option<u32>>,
     faulty: Vec<(u32, u32)>,
     steps: u64,
+    /// Token indexes, ascending, of the closers of brackets left open on the
+    /// logical line before (D166); the parser never sees them.
+    silent: Vec<u32>,
+}
+
+impl Lines {
+    /// Removes the tokens `silent` from the per token facts and renumbers
+    /// the token indexes after them, like [`Tokens::drop_kept`].
+    fn drop_silent(&mut self) {
+        if self.silent.is_empty() {
+            return;
+        }
+        let silent = std::mem::take(&mut self.silent);
+        let mut next = silent.iter().peekable();
+        let mut index = 0u32;
+        self.line_of.retain(|_| {
+            let keep = next.next_if(|&&s| s == index).is_none();
+            index = index.saturating_add(1);
+            keep
+        });
+        let shift = |at: u32| {
+            let before = silent.partition_point(|&s| s < at);
+            at.saturating_sub(u32::try_from(before).unwrap_or(u32::MAX))
+        };
+        for fault in self.unclosed.iter_mut().flatten() {
+            *fault = shift(*fault);
+        }
+    }
 }
 
 /// Parser state. [`ExprParse`] implementations use its public methods.
@@ -179,8 +212,8 @@ pub struct Parser<'a> {
     toks: Tokens<'a>,
     /// Logical line of every token, as an index into `unclosed`.
     line_of: Vec<u32>,
-    /// Per logical line: token index of the outermost `(`, `[` or `{` not
-    /// closed on it.
+    /// Per logical line: token index of its earliest bracket fault (D166),
+    /// an unclosed opener or a stray closer.
     unclosed: Vec<Option<u32>>,
     /// Byte ranges `start..end` (end exclusive) of the logical lines the
     /// lexer has already reported, sorted and disjoint.
@@ -206,8 +239,10 @@ impl<'a> Parser<'a> {
         limits: ParseLimits,
         exprs: &'a dyn ExprParse,
     ) -> Parser<'a> {
-        let toks = Tokens::new(src, file, tokens);
-        let lines = scan_lines(src, &toks, lexed);
+        let mut toks = Tokens::new(src, file, tokens);
+        let mut lines = scan_lines(src, &toks, lexed);
+        toks.drop_kept(&lines.silent);
+        lines.drop_silent();
         Parser {
             src,
             file,
@@ -402,13 +437,17 @@ impl<'a> Parser<'a> {
         tok.kind == TokenKind::Ident && self.text(tok) == word
     }
 
-    /// Reports E0025 if the rest of the current logical line has a `(`, `[`
-    /// or `{` without its closer, once, at the outermost one (D164).
+    /// Reports the earliest bracket fault of the rest of the current logical
+    /// line, if any (D166): E0025 at a `(`, `[` or `{` without its closer,
+    /// E0028 at a closer with no open bracket of its kind.
     fn check_unclosed(&mut self) -> Result<(), Stop> {
         match self.unclosed_on_line(self.pos) {
             Some(index) if index as usize >= self.pos => {
                 let at = self.toks.get(index as usize).unwrap_or(self.current());
-                Err(self.report(codes::UNCLOSED_PAREN, at, codes::msg_unclosed(at.kind)))
+                Err(match lex::bracket_of(at.kind) {
+                    Some((_, false)) => self.report(codes::EXPECTED, at, codes::msg_stray(at.kind)),
+                    _ => self.report(codes::UNCLOSED_PAREN, at, codes::msg_unclosed(at.kind)),
+                })
             }
             _ => Ok(()),
         }
@@ -1034,6 +1073,31 @@ impl<'a> Tokens<'a> {
     fn iter(&self) -> impl Iterator<Item = Token> + '_ {
         (0..self.len()).filter_map(|i| self.get(i))
     }
+
+    /// Removes the tokens at the ascending indexes `drop` (indexes into this
+    /// sequence, not into `all`).
+    fn drop_kept(&mut self, drop: &[u32]) {
+        if drop.is_empty() {
+            return;
+        }
+        let mut next = drop.iter().peekable();
+        let kept: Vec<u32> = match &self.kept {
+            Some(kept) => kept.clone(),
+            None => (0..self.all.len())
+                .filter_map(|i| u32::try_from(i).ok())
+                .collect(),
+        };
+        let mut index = 0u32;
+        let kept = kept
+            .into_iter()
+            .filter(|_| {
+                let keep = next.next_if(|&&d| d == index).is_none();
+                index = index.saturating_add(1);
+                keep
+            })
+            .collect();
+        self.kept = Some(kept);
+    }
 }
 
 /// The range `start..end`, or `end..start` if the two are swapped.
@@ -1068,7 +1132,15 @@ fn scan_lines(src: &str, toks: &Tokens<'_>, lexed: &[Diagnostic]) -> Lines {
     };
     let mut ranges: Vec<(u32, u32)> = Vec::new();
     let mut start: Option<u32> = None;
-    let mut open: Vec<u32> = Vec::new();
+    // The open brackets of the logical line, the earliest bracket fault on
+    // it, the kinds left open on the line before (outermost first) and the
+    // `{` on it that open no level (D166).
+    let mut open: lex::Brackets<u32> = lex::Brackets::new();
+    let mut fault: Option<u32> = None;
+    let mut rest: Vec<usize> = Vec::new();
+    let mut quiet_braces: u32 = 0;
+    // Stack lengths at the start of the open interpolations.
+    let mut floors: Vec<usize> = Vec::new();
     // The last two code tokens of the logical line, for `brace_opens_level`.
     let mut before: (Option<TokenKind>, Option<TokenKind>) = (None, None);
     for (index, tok) in toks.iter().enumerate() {
@@ -1076,14 +1148,47 @@ fn scan_lines(src: &str, toks: &Tokens<'_>, lexed: &[Diagnostic]) -> Lines {
         lines.line_of.push(line);
         let index = u32::try_from(index).unwrap_or(u32::MAX);
         start = Some(start.map_or(tok.span.start, |s| s.min(tok.span.start)));
-        // One stack for all three kinds, as the lexer counts its levels
-        // (D164): a closer pops the top whatever its kind, and a `{` that is
-        // not in operand position opens nothing (it is E0022 at a block head).
+        // One stack of kinds with the closing rule of the lexer (D166). A `{`
+        // that is not in operand position opens nothing (it is E0022 at a
+        // block head), and a `}` on its line is not a stray closer.
+        let mut note = |at: u32| fault = Some(fault.map_or(at, |f| f.min(at)));
+        match lex::bracket_of(tok.kind) {
+            Some((2, true)) if !lex::brace_opens_level(before.0, before.1) => {
+                quiet_braces = quiet_braces.saturating_add(1);
+            }
+            Some((kind, true)) => open.push(kind, index),
+            Some((kind, false)) => match open.close(kind) {
+                Some(over) => {
+                    if let Some(at) = over {
+                        note(at);
+                    }
+                }
+                None if kind == 2 && quiet_braces > 0 => quiet_braces -= 1,
+                // The closer of a bracket left open on the line before, which
+                // has been reported there (SPEC 12.1).
+                None if rest.last() == Some(&kind) => {
+                    rest.pop();
+                    lines.silent.push(index);
+                }
+                None => note(index),
+            },
+            None => {}
+        }
+        // An interpolation is closed in itself, as in the lexer: a closer in
+        // it never closes a bracket opened before the string, and a bracket
+        // it leaves open is unclosed at the end of the string.
         match tok.kind {
-            TokenKind::LParen | TokenKind::LBracket => open.push(index),
-            TokenKind::LBrace if lex::brace_opens_level(before.0, before.1) => open.push(index),
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
-                open.pop();
+            TokenKind::StrHead => {
+                open.floor();
+                floors.push(open.len());
+            }
+            TokenKind::StrTail => {
+                let floor = floors.pop().unwrap_or(0);
+                if let Some(at) = open.get(floor) {
+                    note(at);
+                }
+                open.unfloor();
+                open.truncate(floor);
             }
             _ => {}
         }
@@ -1091,8 +1196,13 @@ fn scan_lines(src: &str, toks: &Tokens<'_>, lexed: &[Diagnostic]) -> Lines {
             before = (Some(tok.kind), before.0);
         }
         if matches!(tok.kind, TokenKind::Nl | TokenKind::Eof) {
-            lines.unclosed.push(open.first().copied());
-            open.clear();
+            if let Some(at) = open.first() {
+                fault = Some(fault.map_or(at, |f| f.min(at)));
+            }
+            lines.unclosed.push(fault.take());
+            rest = open.take_kinds();
+            quiet_braces = 0;
+            floors.clear();
             before = (None, None);
             let first = start.unwrap_or(tok.span.start);
             let prev = ranges.last().map_or(0, |&(_, end)| end);

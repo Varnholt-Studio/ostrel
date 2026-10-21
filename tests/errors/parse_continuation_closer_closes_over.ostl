@@ -1,0 +1,6 @@
+fn f(a: Set[Int)
+  print(a)
+
+fn main()
+  f(1]
+  print(2)

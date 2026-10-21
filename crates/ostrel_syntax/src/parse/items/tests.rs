@@ -14,6 +14,7 @@ use crate::ast::{
     StmtKind, ViewNodeKind,
 };
 use crate::lex::lex;
+use crate::parse::codes;
 use crate::parse::expr::Exprs;
 use crate::parse::{MAX_DEPTH, ParseLimits, Parser, parse_with};
 use ostrel_core::{Diagnostic, FileId};
@@ -566,12 +567,28 @@ fn faults_in_function_heads() {
         codes_at(src),
         [(28, at(src, "(", 0)), (28, at(src, "=", 0))]
     );
-    // D164 (3): `)` pops the `[`, so the `(` stays open and the deeper body
-    // line continues the head; E0025 at the `(` (formerly E0028 at the `)`).
-    // ASSUMPTION (T209): this follows D164 literally; the message names the
-    // `(` although the missing closer is the `]` (FINDING to henrik).
+    // D166: `)` closes the `(` and the `[` above it, so the one diagnostic
+    // is E0025 `unclosed [` at the `[`; the head ends at the line end and the
+    // deeper body is the function's block, parsed with its own fault.
     let src = "fn f(a: Set[Int)\n  print(1)\n";
-    assert_eq!(codes_at(src), [(25, at(src, "(", 0))]);
+    assert_eq!(
+        diags(src),
+        [(25, at(src, "[", 0), codes::MSG_UNCLOSED_BRACKET.to_string())]
+    );
+    // The block below the faulty head is skipped as after any faulty head
+    // line; the next item is parsed with its own fault.
+    let src = "fn f(a: Set[Int)\n  let = 1\nfn g()\n  let = 2\n";
+    assert_eq!(
+        codes_at(src),
+        [(25, at(src, "[", 0)), (28, at(src, "=", 1))]
+    );
+    // A closer of a kind that is not open is no closer: `(` stays open and
+    // is the earliest fault; nothing for the `]`.
+    let src = "fn f(a]\n  print(1)\n";
+    assert_eq!(
+        diags(src),
+        [(25, at(src, "(", 0), codes::MSG_UNCLOSED_PAREN.to_string())]
+    );
     // With the `]` the head is fine and the body is parsed.
     let src = "fn f(a: Set[Int])\n  print(1\n  x\n";
     assert_eq!(codes_at(src), [(25, at(src, "(", 1))]);
@@ -992,4 +1009,87 @@ fn every_assignment_kind_is_built() -> R {
     assert!(matches!(m.expr(value).must()?.kind, ExprKind::Name(_)));
     assert_eq!(text(src, stmt.range), "a.b = c");
     Ok(())
+}
+
+#[test]
+fn bracket_faults_give_one_diagnostic_per_line() {
+    let unclosed = |m: &str| (25u16, m.to_string());
+    let stray = |k: &str| (28u16, format!("unmatched `{k}`"));
+    let check = |src: &str, want: Vec<(u16, u32, String)>| {
+        assert_eq!(diags(src), want, "{src:?}");
+    };
+    // Offsets of needles after the line `fn main()`.
+    let body_at = |src: &str, needle: &str, n: usize| {
+        let skip = src.find('\n').map_or(0, |i| i + 1);
+        at(src.get(skip..).unwrap_or(""), needle, n) + u32::try_from(skip).unwrap_or(0)
+    };
+    let with = |src: &str, list: Vec<((u16, String), &str, usize)>| {
+        list.into_iter()
+            .map(|((c, m), needle, n)| (c, body_at(src, needle, n), m))
+            .collect::<Vec<_>>()
+    };
+    // The closer of the reported bracket on the directly following line gives
+    // no second diagnostic; the rest of that line is parsed as usual, and a
+    // real fault on a later line keeps its own diagnostic (D166 (3)).
+    let src = "fn main()\n  print(1,\n  2)\n  let = 1\n";
+    let want = with(src, vec![(unclosed("unclosed `(`"), "(", 0)]);
+    let mut want = want;
+    want.push((
+        28,
+        at(src, "=", 0),
+        codes::msg_expected("a name after `let`", "`=`"),
+    ));
+    check(src, want);
+    // A real fault after the closer on that line is still reported.
+    let src = "fn main()\n  print(1,\n  2) +\n";
+    let found = diags(src);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(
+        found.first().map(|d| (d.0, d.1)),
+        Some((25, body_at(src, "(", 0)))
+    );
+    assert_eq!(found.get(1).map(|d| d.0), Some(28));
+    // Several brackets left open are closed in order, innermost first.
+    let src = "fn main()\n  f(g(1,\n  2))\n";
+    check(src, with(src, vec![(unclosed("unclosed `(`"), "(", 0)]));
+    // A closer of another kind than the innermost bracket left open is
+    // stray, and only the directly following line is looked at: the `)` on
+    // the line after it is stray as well.
+    let src = "fn main()\n  print(1,\n  2]\n  )\n";
+    check(
+        src,
+        with(
+            src,
+            vec![
+                (unclosed("unclosed `(`"), "(", 0),
+                (stray("]"), "]", 0),
+                (stray(")"), ")", 0),
+            ],
+        ),
+    );
+    let src = "fn main()\n  f([1,\n  2)\n";
+    check(
+        src,
+        with(
+            src,
+            vec![(unclosed("unclosed `(`"), "(", 0), (stray(")"), ")", 0)],
+        ),
+    );
+    // Per line only the earliest bracket fault is reported.
+    let src = "fn main()\n  x = a) + (b\n";
+    check(src, with(src, vec![(stray(")"), ")", 0)]));
+    let src = "fn main()\n  x = f([a)\n";
+    check(src, with(src, vec![(unclosed("unclosed `[`"), "[", 0)]));
+    let src = "fn main()\n  x = f(a] + [b\n";
+    check(src, with(src, vec![(unclosed("unclosed `(`"), "(", 0)]));
+    // An interpolation is closed in itself: a closer in it never closes a
+    // bracket outside the string, and a bracket it leaves open is unclosed.
+    let src = "fn main()\n  print(\"{)}\")\n";
+    check(src, with(src, vec![(stray(")"), ")", 0)]));
+    let src = "fn main()\n  print(\"{(}\")\n";
+    check(src, with(src, vec![(unclosed("unclosed `(`"), "(", 1)]));
+    // A block brace stays E0022 with its `}` skipped, on one line or two.
+    for src in ["fn main() {}\n", "fn main() {\n  print(1)\n}\n"] {
+        assert_eq!(codes_at(src), [(22, at(src, "{", 0))], "{src:?}");
+    }
 }
