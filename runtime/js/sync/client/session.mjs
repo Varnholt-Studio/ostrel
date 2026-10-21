@@ -17,9 +17,14 @@
 // Outcomes (5.4): an `ack` confirms every op of this replica in the batch up to its op that
 // has no `reject` of its own; a `reject` decides its op; a `defer` leaves its op and every
 // later op of the batch undecided, the session waits `retry_after_ms` and then sends again
-// from the outbox. Confirmed and rejected ops leave the outbox. Outcomes for ops that are not
-// waiting in the current batch are ignored, as the protocol says for an `Ack` of an op that is
-// no longer pending.
+// from the outbox. Confirmed and rejected ops leave the outbox.
+//
+// The server sends the outcomes of a batch in a fixed order: every `reject`, then the `defer`,
+// then the `ack` frames (D182). So a `reject` for an op that an `ack` of this session already
+// confirmed breaks the protocol: the server never stored that op. The session reports it
+// through `onReject`, so the app can roll the op back, and ends with a fault; the caller
+// reconnects and catches up. Any other outcome for an op that is not waiting in the current
+// batch is ignored, as the protocol says for an `Ack` of an op that is no longer pending.
 //
 // This part of the client opens no subscription and makes no call, so an `error`, `evict` or
 // `reset` that names a subscription, and a `snapshot` or `return`, concern no open request and
@@ -110,6 +115,8 @@ class Session {
     // The batch on the wire: its outbox entries and per OpId 'waiting', 'confirmed',
     // 'rejected' or 'deferred'.
     this.batch = null;
+    // OpIds an `ack` of this session confirmed, to catch a later `reject` of one of them (D182).
+    this.confirmed = new Set();
     this.deferTimer = null;
   }
 
@@ -182,8 +189,7 @@ class Session {
         await this.confirm(msg);
         return null;
       case 'reject':
-        await this.reject(msg);
-        return null;
+        return this.reject(msg);
       case 'defer':
         this.defer(msg);
         return null;
@@ -294,7 +300,10 @@ class Session {
     if (confirmed.length === 0) return;
     const ids = confirmed.map((entry) => entry.opId);
     await this.outbox.remove(ids);
-    ids.forEach((opId) => this.batch.state.set(opId, 'confirmed'));
+    ids.forEach((opId) => {
+      this.batch.state.set(opId, 'confirmed');
+      this.confirmed.add(opId);
+    });
     this.closeBatchIfDecided();
     await this.call('onAck', {
       op: ack.op,
@@ -304,12 +313,28 @@ class Session {
     });
   }
 
+  // Returns the session result if the reject ends the session, else null.
   async reject({ op, reason }) {
-    if (!this.waiting().some((entry) => entry.opId === op)) return;
+    if (this.confirmed.has(op)) {
+      // An `ack` came before this `reject` (D182 forbids that). The server is authoritative:
+      // the op is rejected, and the session no longer trusts the order of its outcomes.
+      this.confirmed.delete(op);
+      await this.call('onReject', { op, reason });
+      return this.end({
+        end: END.FAULT,
+        error: new WireError(
+          'Protocol',
+          `reject for op ${op}, which an ack already confirmed (D182)`,
+          'op',
+        ),
+      });
+    }
+    if (!this.waiting().some((entry) => entry.opId === op)) return null;
     await this.outbox.remove([op]);
     this.batch.state.set(op, 'rejected');
     this.closeBatchIfDecided();
     await this.call('onReject', { op, reason });
+    return null;
   }
 
   defer({ op, retry_after_ms: delay }) {

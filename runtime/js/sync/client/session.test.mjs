@@ -156,14 +156,79 @@ test('a reject decides its op; the ack confirms only the others', async () => {
     s.entries[2].opId,
   ]);
   assert.deepEqual(await pending(s), []);
-  // An outcome for an op that no longer waits changes nothing.
-  s.socket.deliver({ t: 'reject', op: s.entries[0].opId, reason: 'Denied' });
+  // An ack for an op that no longer waits changes nothing.
   s.socket.deliver(ack(s.entries[0].opId));
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(s.calls.filter((c) => c.name === 'reject').length, 1);
   assert.equal(s.calls.filter((c) => c.name === 'ack').length, 1);
   s.controller.abort();
-  await s.done;
+  assert.equal((await s.done).end, END.ABORTED);
+});
+
+test('a reject for an op an earlier ack confirmed calls onReject and ends with a fault (D182)', async () => {
+  const s = await setup({ ops: 3 });
+  await connect(s);
+  await until(() => s.socket.frames.length === 2, 'ops frame');
+  s.socket.deliver({ t: 'reject', op: s.entries[1].opId, reason: 'Denied' });
+  s.socket.deliver(ack(s.entries[2].opId));
+  await until(() => s.calls.some((c) => c.name === 'ack'), 'ack hook');
+  // The batch is decided; a late reject of a confirmed op is never ignored.
+  s.socket.deliver({ t: 'reject', op: s.entries[0].opId, reason: 'Denied' });
+  const result = await s.done;
+  assert.equal(result.end, END.FAULT);
+  assert.equal(result.error.kind, 'Protocol');
+  assert.equal(result.welcomed, true);
+  assert.equal(s.socket.closed, true);
+  assert.deepEqual(
+    s.calls.filter((c) => c.name === 'reject').map((c) => c.payload),
+    [
+      { op: s.entries[1].opId, reason: 'Denied' },
+      { op: s.entries[0].opId, reason: 'Denied' },
+    ],
+  );
+});
+
+test('an ack before the reject of an op it covers calls onReject and ends with a fault (D182)', async () => {
+  const s = await setup({ ops: 3 });
+  await connect(s);
+  await until(() => s.socket.frames.length === 2, 'ops frame');
+  // Wrong order within one batch: the cumulative ack covers op 2, then op 2 is rejected.
+  s.socket.deliver(ack(s.entries[2].opId));
+  s.socket.deliver({ t: 'reject', op: s.entries[1].opId, reason: 'Denied' });
+  const result = await s.done;
+  assert.equal(result.end, END.FAULT);
+  assert.equal(result.error.kind, 'Protocol');
+  assert.equal(s.socket.closed, true);
+  assert.deepEqual(s.calls.find((c) => c.name === 'ack').payload.confirmed, [
+    s.entries[0].opId,
+    s.entries[1].opId,
+    s.entries[2].opId,
+  ]);
+  assert.deepEqual(
+    s.calls.filter((c) => c.name === 'reject').map((c) => c.payload),
+    [{ op: s.entries[1].opId, reason: 'Denied' }],
+  );
+  // Nothing more is sent on the closed session.
+  assert.equal(s.socket.frames.length, 2);
+});
+
+test('outcomes in the order of D182, reject then defer then ack, keep the session open', async () => {
+  const s = await setup({ ops: 4 });
+  await connect(s);
+  await until(() => s.socket.frames.length === 2, 'ops frame');
+  s.socket.deliver({ t: 'reject', op: s.entries[1].opId, reason: 'Denied' });
+  s.socket.deliver({ t: 'defer', op: s.entries[3].opId, retry_after_ms: 40 });
+  s.socket.deliver(ack(s.entries[2].opId));
+  await until(() => s.calls.some((c) => c.name === 'ack'), 'ack hook');
+  assert.deepEqual(s.calls.find((c) => c.name === 'ack').payload.confirmed, [
+    s.entries[0].opId,
+    s.entries[2].opId,
+  ]);
+  assert.deepEqual((await pending(s)).map((e) => e.opId), [s.entries[3].opId]);
+  await until(() => s.socket.frames.length === 3, 'resend after the delay');
+  assert.deepEqual(s.socket.sent()[2].ops.map((o) => o.id), [s.entries[3].opId]);
+  s.controller.abort();
+  assert.equal((await s.done).end, END.ABORTED);
 });
 
 test('one batch at a time, at most ops_per_batch ops', async () => {

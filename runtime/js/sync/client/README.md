@@ -35,9 +35,14 @@ together: the tab that leads opens the socket and drains the outbox; every tab c
 * **Outcomes.** `Ack` confirms every waiting op of the batch up to its op (cumulative); its
   re-stamped HLCs of this replica move the replica clock (`outbox.observe`). `Reject` decides
   its op. Confirmed and rejected ops leave the outbox. `Defer` leaves its op and the later
-  ones in the outbox, and they are sent again after `retry_after_ms` (D108). An outcome for an
-  op that does not wait in the current batch is ignored. The leader passes every outcome to
-  the other tabs (`onAck`, `onReject` run in every tab).
+  ones in the outbox, and they are sent again after `retry_after_ms` (D108). The server sends
+  the outcomes of a batch in the order of D182 (ARCHITECTURE 5.4): every `Reject`, then the
+  `Defer`, then the `Ack` frames. A `Reject` for an op that an `Ack` of this session already
+  confirmed breaks that order: the session calls `onReject` for it (the server is
+  authoritative, the app rolls the op back) and ends with a fault, so the client reconnects
+  and catches up. It is never ignored. Any other outcome for an op that does not wait in the
+  current batch is ignored. The leader passes every outcome to the other tabs (`onAck`,
+  `onReject` run in every tab).
 * **Writes in any tab.** A tab appends to the outbox and calls `changed()`. On the leader this
   wakes the session; on a follower it posts to the leader over the BroadcastChannel.
 * **End of a session.** A closed socket, a faulty frame and the fatal codes `Protocol`,
@@ -55,9 +60,6 @@ together: the tab that leads opens the socket and drains the outbox; every tab c
 
 * The outbox stores an op as `{ model, row, body }` in its wire form (names, values in their
   JSON form); the outbox adds `id` and `hlc`. The generated client writes that form.
-* The outcomes of one batch arrive with a `Reject` before the `Ack` that would cover its op,
-  since both are queued at the release of the batch's write lock in batch order (5.4). A
-  `Reject` for an op that an earlier `Ack` already confirmed is ignored.
 * The replica clock (`seq`, HLC) lives in the outbox database, which sign out does not delete
   (5.6 deletes the data store), so a reused replica continues its `seq` (paula #348).
 * The session discards foreign entries before it reads `pending`, so the limit that
