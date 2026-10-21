@@ -1,0 +1,1 @@
+tests/errors/v0_2/name_user_beside_auth.ostl:4:6: error[E0201]: `User` is the std data type of `auth paseto`; rename this one

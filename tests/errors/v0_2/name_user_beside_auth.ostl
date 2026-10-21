@@ -1,0 +1,6 @@
+app Golden
+  auth paseto open
+
+data User
+  nick: Text
+  see if true

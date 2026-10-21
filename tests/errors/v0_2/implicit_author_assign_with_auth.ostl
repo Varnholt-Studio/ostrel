@@ -6,4 +6,4 @@ data Post
   see if true
 
 fn f(p: Post)
-  p.author = 1
+  p.author = p.author

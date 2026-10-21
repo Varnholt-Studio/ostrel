@@ -1,1 +1,1 @@
-tests/errors/v0_2/implicit_make_id.ostl:8:15: error[E0208]: `id` is an implicit field; the system sets it
+tests/errors/v0_2/implicit_make_id.ostl:8:23: error[E0208]: `id` is an implicit field; the system sets it

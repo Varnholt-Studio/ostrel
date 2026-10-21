@@ -3,7 +3,10 @@
 Each case is a pair:
 
 * `NAME.ostl`: a v0.1 program (SYNTAX 4.11) with exactly one fault. The cases of the v0.2
-  front end live in `v0_2/` (see below).
+  front end live in `v0_2/` (see below). A case may hold two faults only when the second one
+  is the point of the case, because it shows that recovery after the first fault neither hides
+  nor merges a real fault; each such case gives one diagnostic per fault and is named in the
+  section "Cases with two faults" below.
 * `NAME.expected_err`: the exact stderr the CLI must print for it, one diagnostic per line.
 
 Expected output was written by hand from the language documents, before the compiler could
@@ -27,7 +30,10 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
    triggers E0400. `ostrel check` reports E0400 to E0402 as well as `ostrel run`, because a
    script program without a valid `main` is incomplete (SPEC 12.2).
 8. Every case uses only constructs that the v0.1 parser (T1-3: items, `fn`, `let`, `if`/`else`,
-   `return`, expressions) reads, so each expected diagnostic is reachable at v0.1.
+   `return`, expressions) reads, so each expected diagnostic is reachable at v0.1. One exception:
+   a script program may hold a `style` block when the expected diagnostic comes from the lexer
+   or the parser. `style` is no v0.1 construct, but the lexer reads its body (D137, D138) and
+   reports before the checker could give E0100, so these diagnostics are reachable at v0.1.
 
 ## Diagnostic codes
 
@@ -61,6 +67,9 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0014 | `lex_invalid_utf8` | 2:18 | source is not valid UTF-8 (byte 0xFF) |
 | E0014 | `lex_invalid_utf8_truncated` | 2:14 | source is not valid UTF-8 (byte 0xE2) |
 | E0014 | `lex_bom_invalid_utf8` | 1:1 | source is not valid UTF-8 (byte 0xFF) |
+| E0015 | `lex_css_unclosed_comment` | 4:5 | unterminated `/*` comment in a `style` block; close it with `*/` |
+| E0015 | `lex_css_unclosed_comment_hides_lines` | 5:3 | unterminated `/*` comment in a `style` block; close it with `*/` |
+| E0015 | `style_comment_body_open` | 2:3 | unterminated `/*` comment in a `style` block; close it with `*/` |
 | E0020 | `parse_compound_assign` | 3:5 | Ostrel assigns with `=`; compound assignment does not exist |
 | E0020 | `parse_walrus_assign` | 2:5 | Ostrel assigns with `=`; `:=` does not exist, declare a new name with `let` |
 | E0021 | `parse_is_operator` | 3:8 | `is` is not Ostrel; to unwrap an optional write `if let y = x` |
@@ -71,6 +80,9 @@ the compiler is wrong until a reviewed change to this directory says otherwise.
 | E0026 | `parse_keyword_as_name` | 2:7 | `if` is a keyword and cannot be used as a name |
 | E0027 | `parse_comparison_chain` | 5:15 | comparisons do not chain; write `a < b and b < c` |
 | E0028 | `parse_bare_return` | 2:9 | expected a value after `return`, found end of line |
+| E0028 | `style_comment_body_block_comment` | 3:1 | expected a declaration such as `fn main()`, found `/` |
+| E0032 | `style_comment_body_closed` | 4:1 | unexpected indentation; only a block head such as `fn`, `if` or `else` opens a block |
+| E0032 | `style_comment_body_open` | 4:1 | unexpected indentation; only a block head such as `fn`, `if` or `else` opens a block |
 | E0100 | `check_float_type_v0_1` | 1:14 | type `Float` is not available in v0.1 |
 | E0100 | `check_v0_2_enum_declaration` | 4:1 | `enum` declaration is not available in v0.1 |
 | E0100 | `check_v0_2_server_fn` | 4:1 | `server fn` is not available in v0.1 |
@@ -106,7 +118,8 @@ unchanged. The goldens in `tests/errors/v0_2/` follow the contract above (exit c
 byte for byte, line format, positions, one diagnostic per fault), with two differences:
 
 * Every case is an app: its first line is `app Golden`, so it reaches the HIR front end. It has no
-  `fn main()`, because an app has no entry function and E0400 does not apply.
+  `fn main()`, because an app has no entry function and E0400 does not apply. Lexer and parser
+  diagnostics of an app are reported before name resolution, like in a script program.
 * Cases use the v0.2 grammar (`data`, `enum`, `view`, queries, `make`, rules, `serial per`).
 
 Codes and positions follow SPEC 12.6 (v1.12 to v1.16) and were written by hand from it. Message
@@ -114,14 +127,18 @@ texts are the owner's (SPEC 12.6) and are the texts of `crates/ostrel_sema/src/h
 
 | Code | Case | Position | Message |
 |---|---|---|---|
+| E0008 | `lex_style_comment_open_second_fault` | 8:12 | unexpected character `@` |
+| E0015 | `lex_style_comment_open_second_fault` | 4:3 | unterminated `/*` comment in a `style` block; close it with `*/` |
 | E0200 | `name_query_head_unknown` | 4:12 | unknown data type `Nope` |
 | E0200 | `name_rule_unknown` | 5:10 | unknown name `nope` |
 | E0200 | `name_where_unknown` | 8:19 | unknown name `nope` |
-| E0201 | `name_duplicate_top_level` | 6:4 | `f` is already declared |
+| E0201 | `name_duplicate_top_level` | 6:6 | `Post` is already declared |
 | E0201 | `name_second_app` | 2:5 | a program has one `app`; this is the second |
+| E0201 | `name_user_beside_auth` | 4:6 | `User` is the std data type of `auth paseto`; rename this one |
 | E0203 | `type_field_unknown` | 4:8 | unknown type `Integer` |
 | E0203 | `type_make_function` | 7:8 | `g` is not a type |
 | E0203 | `type_make_unknown` | 4:8 | unknown data type `Nope` |
+| E0203 | `type_user_without_auth` | 4:10 | unknown type `User`; the std `User` exists only when the `app` has `auth paseto` |
 | E0204 | `field_author_make_without_auth` | 8:15 | data type `Post` has no field `author`; every row has `author` only when the `app` has `auth paseto` |
 | E0204 | `field_author_read_without_auth` | 8:5 | data type `Post` has no field `author`; every row has `author` only when the `app` has `auth paseto` |
 | E0204 | `field_author_serial_per_without_auth` | 4:21 | data type `Post` has no field `author`; every row has `author` only when the `app` has `auth paseto` |
@@ -143,7 +160,7 @@ texts are the owner's (SPEC 12.6) and are the texts of `crates/ostrel_sema/src/h
 | E0208 | `implicit_assign_made` | 8:5 | `made` is an implicit field; the system sets it |
 | E0208 | `implicit_author_assign_with_auth` | 9:5 | `author` is an implicit field; the system sets it |
 | E0208 | `implicit_edit_rule` | 5:8 | `made` is an implicit field; the system sets it |
-| E0208 | `implicit_make_id` | 8:15 | `id` is an implicit field; the system sets it |
+| E0208 | `implicit_make_id` | 8:23 | `id` is an implicit field; the system sets it |
 | E0309 | `type_args_missing` | 4:9 | `Set` takes 1 type argument, found 0 |
 | E0309 | `type_args_on_scalar` | 4:6 | `Int` takes 0 type arguments, found 1 |
 | E0309 | `type_args_wrong_count` | 4:6 | `Map` takes 2 type arguments, found 1 |
@@ -163,10 +180,35 @@ Notes on the v0.2 cases:
   no model.
 * E0309 goldens start with `type_args_`; `type_arity` above is the call arity code E0302
   (SPEC 12.6, v1.15).
-* Not covered yet: the std `User` cases of D142 (E0203 with the `auth paseto` hint, E0201 for a
-  declared `User` beside `auth`) and the E0200 of a bare word resolved by its expected type; they
-  wait for the D142 work in `ostrel_sema`. E0306 and E0307 come from the HIR checker, which is
-  still a stub.
+* `type_user_without_auth` and `name_user_beside_auth` are the std `User` cases of D142
+  (SPEC 12.6 v1.13): without `auth` the std `User` in a type position is E0203 with the
+  `auth paseto` hint; with `auth` a declared `User` is E0201 at the name of the declaration.
+* Every case holds exactly one fault, also for the HIR checker: a write to an implicit field
+  assigns a value of the field's own type (`p.author = p.author`, `p.made = p.made`), and
+  `implicit_make_id` gives every declared field, so removing the named fault leaves a program
+  that `ostrel check` accepts. `name_duplicate_top_level` repeats a type name across two kinds
+  (`data Post`, `enum Post`), so no naming rule is touched.
+* `lex_style_comment_open_second_fault` is a lexer case in an app (two faults, see "Cases with
+  two faults" above). The table lists its two diagnostics by code; its expected file has them
+  in source order (4:3, then 8:12).
+* Not covered yet: the E0200 of a bare word resolved by its expected type, and the std `User` in
+  a query head of a program without `auth` (E0200). E0306 and E0307 come from the HIR checker,
+  which is still a stub.
+
+## Cases with two faults
+
+These cases break rule 6 on purpose: each holds two independent faults, and the expected file
+has one line per fault. A cascade from the first fault would still be a bug.
+
+* `lex_string_line_break_two_faults`: two strings cut by a line end on consecutive lines are
+  two faults with two E0003 (SPEC 12.6, recovery after a line end in a string, answer to #1098).
+* `style_comment_body_open`: an unterminated `/*` in the `style` body (E0015 at 2:3) and an
+  indented line after a column 1 line comment that ended the body (E0032 at 4:1). Each fault
+  alone gives only its own diagnostic: with the `/*` closed only E0032 remains
+  (`style_comment_body_closed`), without the indented line only E0015. The E0032 pins D138 (d).
+* `v0_2/lex_style_comment_open_second_fault`: an unterminated `/*` in a `style` body (E0015) and
+  an unexpected character after the end of that body (E0008). It shows that an open comment
+  ends at the end of the body and does not hide the rest of the file (AC-36, D137, D138).
 
 ## Interpolation depth
 

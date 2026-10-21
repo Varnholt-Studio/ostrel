@@ -4,5 +4,5 @@ data Post
   pos: Int
   see if true
 
-fn f()
-  make Post { id: "x" }
+fn f(p: Post)
+  make Post { pos: 1, id: p.id }

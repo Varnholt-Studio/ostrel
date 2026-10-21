@@ -5,4 +5,4 @@ data Post
   see if true
 
 fn f(p: Post)
-  p.made = 1
+  p.made = p.made
