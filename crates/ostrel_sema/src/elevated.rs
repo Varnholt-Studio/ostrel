@@ -12,9 +12,10 @@
 //! A client enters the server only by a `Call` of a function with a `call`
 //! rule (default deny, D8, D147). A client reachable path therefore starts at
 //! such a function and follows the functions named in bodies and `call`
-//! rules down to the elevated function. Each entry contributes its shortest
-//! path; among paths of equal length the one through earlier declarations
-//! wins, so the list is stable.
+//! rules down to the elevated function. Every entry that reaches the function
+//! is listed with one shortest witness path (D167), not every path; among
+//! paths of equal length the one through earlier declarations wins, so the
+//! list is stable.
 //!
 //! Both functions read a program that `hir::check` accepted. On any other
 //! program they still terminate and never panic, but the list may be
@@ -28,9 +29,9 @@ use crate::hir::{
     BlockId, DefId, DefKind, ExprId, ExprKind, FnDef, Program, Res, StmtKind, StrPart, Ty,
 };
 
-/// Warning: an elevated function returns rows without `see` (D99). The code
-/// is an assumption until SPEC 12.6 reserves one (question #2462).
-pub const UNFILTERED_ROWS: Code = Code::new(311);
+/// Warning E0314: an elevated function returns rows without `see` (D99,
+/// SPEC 12.6). It never changes the exit code.
+pub const UNFILTERED_ROWS: Code = Code::new(314);
 
 /// One elevated function.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -447,7 +448,7 @@ data Note
             assert_eq!(warns.len(), 1, "{result}");
             assert!(warns[0].starts_with("t.ostl:14:"), "{result}: {}", warns[0]);
             assert!(
-                warns[0].contains(": warning[E0311]: `get` returns rows without see"),
+                warns[0].contains(": warning[E0314]: `get` returns rows without see"),
                 "{}",
                 warns[0]
             );
@@ -613,5 +614,107 @@ server fn b(t: Team) -> List[Note] as system
             "{}",
             warns[0]
         );
+    }
+
+    /// D167: every client entry that reaches an elevated function is listed,
+    /// none is missing and none is invented, each with one shortest witness
+    /// path. The oracle is independent of `list`: random call graphs are
+    /// written as source, and reachability and distances come from a
+    /// Floyd-Warshall closure over the generated edges.
+    #[test]
+    fn no_client_entry_is_missing_on_random_call_graphs() {
+        const UNREACHED: usize = usize::MAX;
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |bound: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            usize::try_from(state % u64::try_from(bound).unwrap()).unwrap()
+        };
+        let mut checked_paths = 0usize;
+        for round in 0..300 {
+            let n = 2 + round % 7;
+            // 0: plain fn, 1: server fn without `call` rule, 2: entry,
+            // 3: elevated entry. Index 0 is always elevated.
+            let kinds: Vec<usize> = (0..n).map(|i| if i == 0 { 3 } else { next(4) }).collect();
+            let mut edges = vec![vec![false; n]; n];
+            let mut src = String::new();
+            for i in 0..n {
+                let head = match kinds[i] {
+                    0 => format!("fn f{i}(t: Team)\n"),
+                    1 => format!("server fn f{i}(t: Team)\n"),
+                    2 => format!("server fn f{i}(t: Team)\n  call if me in t.owners\n"),
+                    _ => format!("server fn f{i}(t: Team) as system\n  call if me in t.owners\n"),
+                };
+                src.push_str(&head);
+                let mut body = String::new();
+                for _ in 0..next(3) {
+                    let j = next(n);
+                    edges[i][j] = true;
+                    if next(3) == 0 {
+                        body.push_str(&format!("  if t.name == \"x\"\n    f{j}(t)\n"));
+                    } else {
+                        body.push_str(&format!("  f{j}(t)\n"));
+                    }
+                }
+                if body.is_empty() {
+                    body.push_str("  let z = 1\n");
+                }
+                src.push_str(&body);
+                src.push('\n');
+            }
+            let mut dist = vec![vec![UNREACHED; n]; n];
+            for i in 0..n {
+                dist[i][i] = 0;
+                for j in 0..n {
+                    if edges[i][j] && i != j {
+                        dist[i][j] = 1;
+                    }
+                }
+            }
+            for k in 0..n {
+                for i in 0..n {
+                    for j in 0..n {
+                        if dist[i][k] != UNREACHED && dist[k][j] != UNREACHED {
+                            dist[i][j] = dist[i][j].min(dist[i][k] + dist[k][j]);
+                        }
+                    }
+                }
+            }
+            let (p, _, _) = program(&src);
+            let index = |d: DefId| -> usize {
+                def_name(&p, d)
+                    .strip_prefix('f')
+                    .and_then(|k| k.parse().ok())
+                    .unwrap_or_else(|| panic!("not a generated fn: {}", def_name(&p, d)))
+            };
+            let all = list(&p);
+            let elevated: Vec<usize> = (0..n).filter(|&i| kinds[i] == 3).collect();
+            assert_eq!(
+                all.iter().map(|e| index(e.def)).collect::<Vec<_>>(),
+                elevated,
+                "{src}"
+            );
+            for e in &all {
+                let target = index(e.def);
+                let expected: Vec<usize> = (0..n)
+                    .filter(|&i| kinds[i] >= 2 && dist[i][target] != UNREACHED)
+                    .collect();
+                let starts: Vec<usize> = e.paths.iter().map(|path| index(path[0])).collect();
+                assert_eq!(starts, expected, "entries into f{target}\n{src}");
+                for path in &e.paths {
+                    let steps: Vec<usize> = path.iter().map(|d| index(*d)).collect();
+                    assert_eq!(steps.last(), Some(&target), "{steps:?}\n{src}");
+                    assert_eq!(steps.len() - 1, dist[steps[0]][target], "{steps:?}\n{src}");
+                    assert!(
+                        steps.windows(2).all(|w| edges[w[0]][w[1]]),
+                        "{steps:?} uses an edge the source does not have\n{src}"
+                    );
+                    checked_paths += 1;
+                }
+            }
+        }
+        // The generator must actually produce indirect entries.
+        assert!(checked_paths > 600, "{checked_paths}");
     }
 }

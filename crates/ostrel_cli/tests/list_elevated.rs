@@ -109,7 +109,7 @@ fn rows_without_see_are_marked_and_warned_once_per_function() {
     let stderr = text(&out.stderr);
     assert_eq!(stderr.lines().count(), 2, "{stderr}");
     assert!(
-        stderr.lines().all(|l| l.contains(": warning[E0311]: ")),
+        stderr.lines().all(|l| l.contains(": warning[E0314]: ")),
         "{stderr}"
     );
 }
@@ -129,7 +129,7 @@ fn nothing_is_listed_when_the_check_fails() {
     assert_eq!(text(&out.stdout), "");
     let stderr = text(&out.stderr);
     assert!(stderr.contains("error[E0203]"), "{stderr}");
-    assert!(!stderr.contains("E0311"), "{stderr}");
+    assert!(!stderr.contains("E0314"), "{stderr}");
     fs::remove_dir_all(dir).unwrap();
 }
 
