@@ -48,6 +48,7 @@ pub mod host;
 pub mod identity;
 pub mod key_status;
 pub mod outbound;
+pub mod schema;
 pub mod secret;
 pub mod task;
 pub mod ws;
