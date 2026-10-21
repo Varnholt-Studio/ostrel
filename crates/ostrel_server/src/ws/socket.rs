@@ -921,4 +921,18 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn a_frame_kept_after_a_cut_write_is_the_next_buffered_frame() {
+        block_on(async {
+            let (mut conn, _peer) = duplex_conn();
+            conn.ws.get_mut().output = vec![0u8; 4096];
+            conn.ws.get_mut().input.extend(client_frame(0x1, b"hi"));
+            let cut = tokio::time::timeout(Duration::from_millis(50), conn.next_frame()).await;
+            assert!(cut.is_err(), "the write must wait for the peer");
+            // The session loop asks for a buffered frame first.
+            assert!(matches!(conn.buffered(), Some(Frame::Data(d)) if d == b"hi"));
+            assert!(conn.buffered().is_none());
+        });
+    }
 }
