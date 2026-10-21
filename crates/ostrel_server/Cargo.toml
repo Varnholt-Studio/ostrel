@@ -16,6 +16,7 @@ dev-identity = []
 ostrel_core.workspace = true
 ostrel_db.workspace = true
 ostrel_vm.workspace = true
+ostrel_sync = { path = "../ostrel_sync" }
 # Allowlisted by D118, only for this crate: SHA-256 of audit arguments (D117)
 # and of replica secrets (D111).
 sha2 = { version = "0.10", default-features = false, features = ["std"] }

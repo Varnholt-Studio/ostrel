@@ -40,6 +40,7 @@ compile_error!(
 pub mod audit;
 pub mod host;
 pub mod identity;
+pub mod schema;
 pub mod secret;
 pub mod task;
 
