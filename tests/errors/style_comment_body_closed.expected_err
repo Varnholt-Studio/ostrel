@@ -1,0 +1,1 @@
+tests/errors/style_comment_body_closed.ostl:4:1: error[E0032]: unexpected indentation; only a block head such as `fn`, `if` or `else` opens a block
