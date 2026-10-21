@@ -21,23 +21,28 @@
 //! already contains k and m is filtered as well, which never shows a reader more than D126
 //! allows.
 //!
-//! Every log position must reach the fence exactly once, also positions of a transaction that
-//! was rolled back after allocating them: such a range is pushed as a [`Commit`] without ops,
-//! otherwise every later commit stays held. The fence sends nothing itself; it returns the
-//! messages in the order they must be written to the sessions. Splitting an `Ops` message into
-//! frames (D121) is the job of the encoder, which keeps the order. Rows that entered a scope
-//! (`Snapshot` rows, 5.6) are not handled here.
+//! Commits reach the fence from the log section of the process (ARCHITECTURE 5.4, D154): a
+//! transaction calls `append_ops`, commits and pushes the range `next()..=last`, from
+//! [`BroadcastFence::next`] to the last position `append_ops` returned. A transaction that rolls
+//! back pushes nothing. The positions it allocated are given again to the next transaction
+//! (memory, SQLite) or stay a gap (PostgreSQL); either way the next commit's range starts at
+//! `next()` and covers them as positions without an op. Pushing a rolled back range would be
+//! wrong: a reused position would then be refused as released and its op never sent live.
+//!
+//! The fence sends nothing itself; it returns the messages in the order they must be written to
+//! the sessions. Splitting an `Ops` message into frames (D121) is the job of the encoder, which
+//! keeps the order. Rows that entered a scope (`Snapshot` rows, 5.6) are not handled here.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::protocol::{LoggedOp, ModelId, RowId, ServerMsg, ServerSeq, SubId};
 
-/// One committed transaction of the op log, or a rolled back range of positions.
+/// One committed transaction of the op log.
 ///
 /// It covers the contiguous positions `first..=last`. `ops` are the ops it logged, in strictly
-/// increasing position inside that range; positions without an op are allowed (an empty
-/// `ops` marks a range that was allocated and rolled back).
+/// increasing position inside that range; positions without an op are allowed, for example
+/// positions a rolled back transaction left behind, which the next commit covers (D154).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Commit {
     pub first: ServerSeq,
@@ -520,7 +525,9 @@ mod tests {
             "nothing is evaluated before the gap closes"
         );
 
-        // Positions 1 and 2 were allocated by a transaction that rolled back.
+        // A range without ops is released like any other. Under D154 such a range only arises
+        // as part of a commit that covers positions a rolled back transaction left behind; the
+        // fence itself does not care why a position carries no op.
         let rolled_back = Commit {
             first: ServerSeq(1),
             last: ServerSeq(2),
